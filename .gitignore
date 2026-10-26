@@ -1,0 +1,43 @@
+# Dependencies and build/test output.
+node_modules/
+dist/
+coverage/
+playwright-report/
+test-results/
+
+# Real environment files and deployment manifests stay local.
+.env
+.env.*
+.envrc
+compose*.yaml
+compose*.yml
+
+# Runtime state may contain credentials, conversations and generated media.
+/data/
+/console-data/
+/persona/
+/backups/
+/secrets/
+/credentials/
+*.sqlite
+*.sqlite-*
+*.sqlite3*
+*.db
+*.db-*
+*.log
+*.enc
+*.key
+*.pem
+*.p12
+*.pfx
+.ssh/
+id_rsa
+id_ecdsa
+id_ed25519
+id_dsa
+
+# Local implementation/deployment notes and editor metadata.
+/IMPLEMENTATION_PLAN.md
+*.local
+*.local.*
+.DS_Store

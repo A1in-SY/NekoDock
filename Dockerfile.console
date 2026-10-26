@@ -1,0 +1,20 @@
+# The control plane contains Node.js and the built Web UI; CLI tools live in workers.
+FROM node:24.16.0-bookworm-slim AS build
+WORKDIR /app
+COPY package.json package-lock.json tsconfig.json ./
+RUN npm ci --ignore-scripts
+COPY src ./src
+COPY web ./web
+RUN npm run build:all && npm prune --omit=dev --ignore-scripts
+
+FROM node:24.16.0-bookworm-slim
+WORKDIR /app
+COPY --from=build /app/package.json ./
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/dist/src ./dist/src
+COPY --from=build /app/dist/web ./dist/web
+# Only the control plane mounts Docker's socket. Workers continue to run as node.
+ENV NODE_ENV=production CONSOLE_DATA_DIR=/console-data CONSOLE_HOST=0.0.0.0 CONSOLE_PORT=4180
+VOLUME ["/console-data"]
+EXPOSE 4180
+CMD ["node", "dist/src/console/main.js"]

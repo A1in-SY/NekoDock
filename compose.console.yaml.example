@@ -1,0 +1,52 @@
+# Copy to compose.console.yaml. Individual Bot settings are managed in the Web UI.
+name: nekodock
+services:
+  console:
+    build:
+      context: .
+      dockerfile: Dockerfile.console
+    image: nekodock-console:latest
+    init: true
+    restart: unless-stopped
+    ports:
+      # Keep the host binding on loopback for the single-admin console.
+      - "127.0.0.1:4180:4180"
+    environment:
+      CONSOLE_HOST: 0.0.0.0
+      CONSOLE_PORT: "4180"
+      CONSOLE_DATA_DIR: /console-data
+      DOCKER_SOCKET: /var/run/docker.sock
+      # Build this shared image once; all managed workers use it.
+      WORKER_IMAGE: nekodock-worker:latest
+      WORKER_NETWORK: nekodock
+      # Container-to-container URL, independent of the published host port.
+      WORKER_CONSOLE_URL: http://console:4180
+    volumes:
+      # Contains DB configuration, encrypted secrets and an independent master key.
+      - ./console-data:/console-data
+      # Control plane only. Do not add this mount to Worker containers.
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - console
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # This service defines the worker build; it is not a running bot instance.
+  # docker compose -f compose.console.yaml --profile build build worker-image
+  worker-image:
+    profiles: [build]
+    image: nekodock-worker:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+networks:
+  console:
+    # Dynamic worker containers join this same network.
+    name: nekodock
