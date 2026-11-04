@@ -42,7 +42,10 @@ const frame=Buffer.alloc(417);frame.set([0xff,0xfb,0x90,0x64]);process.stdout.wr
   assert.deepEqual(f.calls.filter(call => !call.results.length)[1]!.batch.map(message => message.messageId), ['busy-background-a', 'busy-background-b', 'idle-second']);
   f.send('busy-mentioned'); f.send('busy-mentioned');
   await f.waitFor(() => f.outgoing.length === 2 && f.read('1001', db => db.prepare('SELECT COUNT(*) AS n FROM messages').get()?.n === 5), '重复艾特只保存并提示一次');
-  assert.deepEqual(f.outgoing[1]!.params.message, [{ type: 'text', data: { text: busyReply } }]);
+  assert.deepEqual(f.outgoing[1]!.params.message, [
+    { type: 'reply', data: { id: 'busy-mentioned' } },
+    { type: 'text', data: { text: busyReply } },
+  ]);
   assert.deepEqual((await edgeCalls()).map(call => call.text), ['answer-idle-first']);
   gates['idle-second'].resolve();
   await f.waitFor(() => f.outgoing.length === 4 && f.complete(5), '当前轮结束后继续回答原艾特');
@@ -50,9 +53,9 @@ const frame=Buffer.alloc(417);frame.set([0xff,0xfb,0x90,0x64]);process.stdout.wr
   assert.deepEqual(starts.map(call => call.batch.map(message => message.messageId)), [['idle-first'], ['busy-background-a', 'busy-background-b', 'idle-second'], ['busy-mentioned']]);
   assert.ok(f.calls.every(call => !JSON.stringify(call.body).includes(busyReply)));
   assert.deepEqual((await edgeCalls()).map(call => call.text), ['answer-idle-first', 'answer-idle-second', 'answer-busy-mentioned']);
-  assert.deepEqual(f.outgoing.map(message => message.params.message[0]!.type), ['record', 'text', 'record', 'record']);
+  assert.deepEqual(f.outgoing.map(message => message.params.message[0]!.type), ['record', 'reply', 'record', 'record']);
   f.read('1001', db => {
-    for (const [table, columns] of [['messages', ['text', 'raw_json']], ['pending_batch', ['replies_json']], ['reply_requests', ['messages_json']]] as const)
+    for (const [table, columns] of [['messages', ['text', 'raw_json']], ['pending_batch', ['replies_json']], ['reply_requests', ['messages_json']], ['outgoing_history', ['text']], ['memory_ingest', ['text']]] as const)
       for (const column of columns) assert.equal(db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE ${column} LIKE ?`).get(`%${busyReply}%`)?.n, 0);
   });
   assert.doesNotMatch(bridge.logs.join('\n'), /pi-e2e-private-token|我正在想上面的消息怎么回/);

@@ -1,3 +1,4 @@
+import { prepareReplyParts, transmitReply } from './reply-delivery.js';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { BridgeStore } from './store.js';
@@ -5,7 +6,12 @@ import { prepareImageReply } from './images.js';
 import { fingerprint, logEvent } from './logging.js';
 import { isMp3Snapshot } from './audio.js';
 import type { SpeechProvider } from './tts.js';
+import type { Scheduler } from './scheduler.js';
+import type { TaskTools } from './scheduled-contract.js';
 import type { AgentRunner, CommandResult, Logger, MessageSegment, MessageSender, OutputMessage, PendingCommand, ReplyPart, ReplyTools, SegmentMessage } from './types.js';
+import type { ContextCommit } from './chat-context-contract.js';
+import { saveChatAsset } from './chat-assets.js';
+import { modelErrorReply } from './model-error-reply.js';
 
 const commandReplies: Record<CommandResult, string> = {
   help: [
@@ -22,44 +28,9 @@ const commandReplies: Record<CommandResult, string> = {
   failed: '上下文压缩失败，请稍后重试 /compact。',
 };
 
-export function splitReply(text: string, maxChars: number): string[] {
-  if (!Number.isSafeInteger(maxChars) || maxChars < 1) throw new Error('无效的回复分段长度');
-  const chars = Array.from(text);
-  const parts: string[] = [];
-  for (let i = 0; i < chars.length; i += maxChars) parts.push(chars.slice(i, i + maxChars).join(''));
-  return parts;
-}
+export { splitReply, splitMessage } from './reply-delivery.js';
 
-export function splitMessage(segments: MessageSegment[], maxChars: number): SegmentMessage[] {
-  if (!Number.isSafeInteger(maxChars) || maxChars < 1) throw new Error('无效的回复分段长度');
-  const parts: SegmentMessage[] = [];
-  let current: MessageSegment[] = [];
-  let pendingMentions: MessageSegment[] = [];
-  let charsInCurrent = 0;
-  for (const segment of segments) {
-    if (segment.type === 'at') {
-      pendingMentions.push({ ...segment });
-      continue;
-    }
-    const chars = Array.from(segment.text);
-    for (let offset = 0; offset < chars.length;) {
-      if (charsInCurrent === maxChars) {
-        parts.push({ type: 'message', segments: current });
-        current = [];
-        charsInCurrent = 0;
-      }
-      current.push(...pendingMentions);
-      pendingMentions = [];
-      const count = Math.min(maxChars - charsInCurrent, chars.length - offset);
-      current.push({ type: 'text', text: chars.slice(offset, offset + count).join('') });
-      charsInCurrent += count;
-      offset += count;
-    }
-  }
-  current.push(...pendingMentions);
-  if (current.length > 0) parts.push({ type: 'message', segments: current });
-  return parts;
-}
+export { modelErrorReply } from './model-error-reply.js';
 
 export class Processor {
   private wake: (() => void) | undefined;
@@ -68,16 +39,21 @@ export class Processor {
   private active=false;
   private activeCommand:number|null=null;
   private drainCommand:number|null=null;
-  requestDrain():void { if(this.draining)return; this.draining=true; this.drainCommand=this.activeCommand; this.notify(); }
+  private contextRecovery=true;
+  requestDrain():void { if(this.draining)return; this.draining=true; this.drainCommand=this.activeCommand; this.options.scheduler?.requestDrain();this.options.backgroundActions?.requestDrain?.();this.notify(); }
   get isProcessing():boolean { return this.active || this.options.store.peekPendingBatch()!==null; }
-  get isDrained():boolean { return this.draining && !this.active && this.options.store.peekPendingBatch()===null && this.drainCommand===null; }
+  get isDrained():boolean { return this.draining && !this.active && this.options.store.peekPendingBatch()===null && this.drainCommand===null && (!this.options.scheduler||this.options.scheduler.isDrained); }
 
   constructor(private readonly options: {
     store: BridgeStore; agent: AgentRunner; sender: MessageSender; logger: Logger;
     batchSize: number; replyMaxChars: number; retryMs: number;
-    workspace: string; imageMaxBytes: number; imageTimeoutMs: number;
+    workspace: string; imageMaxBytes: number; imageTimeoutMs: number; imageFetch?:typeof globalThis.fetch;
     speech?: SpeechProvider | null; voiceReplyEnabled?: boolean;
     voiceReplyProbability?: number; ttsMaxChars?: number; random?: () => number;
+    scheduler?:Scheduler; taskTools?:TaskTools;
+    helpText?:()=>string;
+    backgroundActions?:{readonly hasPending:boolean;runNext(signal:AbortSignal):Promise<boolean>;requestDrain?():void};
+    beforeContext?:(batch:import('./types.js').PendingBatch,signal:AbortSignal)=>Promise<void>;
   }) {}
 
   notify(): void { this.notified = true; this.wake?.(); }
@@ -105,6 +81,16 @@ export class Processor {
           } finally {this.active=false;this.activeCommand=null;}
           continue;
         }
+        if(!this.draining&&this.options.backgroundActions?.hasPending&&!store.isBusy()) {
+          this.active=true;store.setScheduledBusy(true);let executed=false;
+          try {executed=await this.options.backgroundActions.runNext(signal);} finally {store.setScheduledBusy(false);this.active=false;}
+          if(executed)continue;
+        }
+        if(!this.draining&&this.options.scheduler?.hasPending&&!store.isBusy()) {
+          this.active=true;store.setScheduledBusy(true);let executed=false;
+          try {executed=await this.options.scheduler.runNext(signal);} finally {store.setScheduledBusy(false);this.active=false;}
+          if(executed)continue;
+        }
         const batch = this.draining?store.peekPendingBatch():store.openOrCreateBatch(batchSize);
         if (!batch) {
           await new Promise<void>((resolve) => {
@@ -121,6 +107,14 @@ export class Processor {
         let replyIndex: number | undefined;
         let deliveries: ReturnType<Processor['replyTools']> | undefined;
         try {
+          if(this.contextRecovery&&agent.recoverContext) {
+            const session=store.getSessionId(),pendingIds=store.pendingContextBatchIds();
+            await agent.recoverContext(session,receipt=>{
+              const known=pendingIds.includes(receipt.batchId);
+              if(store.commitContext(receipt)&&session===null&&known&&receipt.conversationId===store.recorder.conversationId)store.setSessionId(receipt.session);
+            },pendingIds);
+          }
+          this.contextRecovery=false;
           if (batch.modelStarted || batch.replies !== null) {
             store.abandonBatch(batch.throughSeq, 'interrupted');
             logEvent(logger, 'warn', 'processor.batch.interrupted', {
@@ -129,6 +123,8 @@ export class Processor {
             });
             continue;
           }
+          await this.options.beforeContext?.(store.getBatch(batch.throughSeq),signal);
+          const context=store.prepareContext(store.getBatch(batch.throughSeq));
           store.markGenerationStarted(batch.throughSeq);
           store.recorder.append('run.started', { throughSeq: batch.throughSeq, messageIds: batch.messages.map(message => message.messageId), replyAllowed: batch.replyAllowed }, `run:${runId}:start`, { runId });
           logEvent(logger, 'info', 'processor.batch.started', {
@@ -137,16 +133,21 @@ export class Processor {
           });
           deliveries = this.replyTools(batch.throughSeq, signal, runId);
           let observedEvent = 0;
-          const result = await agent.run(store.getBatch(batch.throughSeq), store.getSessionId(), id => {
+          const result = await agent.run({...store.getBatch(batch.throughSeq),context}, store.getSessionId(), id => {
             stage = 'session_save';
             store.setSessionId(id);
             stage = 'agent';
           }, signal, deliveries.tools, event => {
+            if(event.type==='context.committed')store.commitContext(event.payload as unknown as ContextCommit);
             const sequence = ++observedEvent;
             store.recorder.append(event.type,
               { ...event.payload, ...(event.type === 'usage.recorded' ? { usageId: event.payload.usageId ?? `${runId}:${sequence}` } : {}) },
               `${runId}:${event.type}:${event.itemId ?? sequence}${event.type==='thinking.updated'?`:${sequence}`:''}`, { runId, ...(event.itemId ? { itemId: event.itemId } : {}) });
-          });
+          },this.options.taskTools);
+          // Non-persistent adapters have no Pi acknowledgement channel; their successful
+          // return is the explicit context boundary. Pi always acknowledges its file entry.
+          if(!agent.supportsContextCommits)store.commitContext({batchId:context.batchId,conversationId:context.conversationId,
+            session:store.getSessionId()??'',entryId:`adapter:${context.batchId}`,versions:context.versions});
           stage = 'reply_prepare';
           const usedTools = store.listReplyRequests(batch.throughSeq).length > 0;
           if (usedTools && result.messages.length > 0) throw new Error('Tool replies must not be repeated in the final output.');
@@ -174,10 +175,11 @@ export class Processor {
             through_seq: batch.throughSeq, cursor: batch.throughSeq, reply_count: replyCount, duration_ms: Date.now() - started,
           });
         } catch (error) {
+          this.contextRecovery=true;
           // Already accepted sends finish independently of model execution. A failed
           // execution never receives the same user input a second time.
           try { await deliveries?.flush(); } catch { /* Stored attempt markers prevent resends. */ }
-          const metadata = error as {code?:unknown;providerStatus?:unknown;message?:unknown}|null;
+          const metadata = error as {code?:unknown;providerStatus?:unknown;message?:unknown;modelFailure?:unknown}|null;
           const errorCode = typeof metadata?.code === 'string' && /^PI_[A-Z_]{1,60}$/.test(metadata.code) ? metadata.code : undefined;
           const httpStatus = typeof metadata?.providerStatus === 'number' && Number.isInteger(metadata.providerStatus)
             && metadata.providerStatus >= 400 && metadata.providerStatus <= 599 ? metadata.providerStatus : undefined;
@@ -188,6 +190,14 @@ export class Processor {
             through_seq: batch.throughSeq, stage, reply_index: replyIndex, replayed: false, error_code:errorCode,
             http_status:httpStatus, duration_ms: Date.now() - started,
           });
+          if (metadata?.modelFailure === true && batch.replyAllowed && !signal.aborted) {
+            try {
+              await this.options.sender.sendText(modelErrorReply(error), signal);
+              logEvent(logger, 'info', 'processor.model_error_reply.sent', { through_seq: batch.throughSeq, run_ref: runId });
+            } catch {
+              logEvent(logger, 'warn', 'processor.model_error_reply.failed', { through_seq: batch.throughSeq, run_ref: runId });
+            }
+          }
           try { store.abandonBatch(batch.throughSeq, signal.aborted ? 'cancelled' : 'failed', runId); }
           catch {
             // A storage outage may delay cleanup, but model_started ensures the
@@ -206,12 +216,12 @@ export class Processor {
     let failed = false;
     let failure: unknown;
     const tools: ReplyTools = {
-      send: async request => {
+      send: async (request, metadata) => {
         if (signal.aborted) throw new Error('Reply acceptance cancelled.');
         const requestId = randomUUID();
         const messageIndices: number[] = [];
         const parts = this.prepareReplies(request.messages, throughSeq, messageIndices);
-        store.appendReplyRequest(throughSeq, requestId, request.messages, parts, messageIndices);
+        store.appendReplyRequest(throughSeq, requestId, request.messages, parts, messageIndices,metadata?.toolCallId);
         logEvent(logger, 'info', 'processor.reply_tool.accepted', {
           through_seq: throughSeq, run_ref: runId, request_ref: fingerprint(requestId), message_count: request.messages.length,
         });
@@ -229,7 +239,7 @@ export class Processor {
   private async deliverPending(throughSeq: number, signal: AbortSignal, runId: string,
     progress: (stage: string, index: number) => void = () => {}): Promise<void> {
     const { store, sender, logger } = this.options;
-    const imageOptions = { workspace: this.options.workspace, maxBytes: this.options.imageMaxBytes, timeoutMs: this.options.imageTimeoutMs, logger };
+    const imageOptions = { workspace: this.options.workspace, maxBytes: this.options.imageMaxBytes, timeoutMs: this.options.imageTimeoutMs, logger,fetch:this.options.imageFetch };
     while (!signal.aborted) {
       const batch = store.getBatch(throughSeq);
       const index = batch.nextReplyIndex;
@@ -284,16 +294,14 @@ export class Processor {
         sendStarted = Date.now();
         logEvent(logger, 'info', 'processor.reply.send_started', fields);
         let receipt: Awaited<ReturnType<typeof sender.sendText>>;
-        if (typeof part === 'string') receipt = await sender.sendText(part, signal);
-        else if (part.type === 'message') receipt = await sender.sendMessage(part.segments, signal);
-        else if (part.type === 'voice') {
-          if (!sender.sendVoice || !part.file) throw new Error('Prepared voice sender unavailable');
-          receipt = await sender.sendVoice(part.file, signal);
-        } else receipt = await sender.sendImage(part.file, signal);
+        receipt = await transmitReply(part,sender,signal);
         acknowledged = true;
         logEvent(logger, 'info', 'processor.reply.sent', { ...fields, duration_ms: Date.now() - sendStarted, ...(receipt?.messageId ? { message_ref: receipt.messageId } : {}) });
         stage = 'reply_ack'; progress(stage, index);
-        const saved = store.acknowledgeReply(throughSeq, index, receipt?.messageId);
+        let assets:import('./chat-context-contract.js').ChatAsset[]|undefined;
+        if(typeof part!=='string'&&(part.type==='image'||part.type==='voice')&&part.file)try{assets=[await saveChatAsset(this.options.workspace,part.file,part.type)];}
+        catch{logEvent(logger,'warn','processor.reply.chat_media_failed',fields);}
+        const saved = store.acknowledgeReply(throughSeq, index, receipt?.messageId,assets);
         if (!saved.mediaSaved) logEvent(logger, 'warn', 'processor.reply.media_snapshot_failed', fields);
         logEvent(logger, 'info', 'processor.reply.acknowledged', fields);
       } catch (error) {
@@ -308,37 +316,7 @@ export class Processor {
   }
 
   private prepareReplies(messages: OutputMessage[], throughSeq: number, messageIndices?:number[]): ReplyPart[] {
-    const { replyMaxChars, speech, voiceReplyEnabled, sender, logger } = this.options;
-    const probability = this.options.voiceReplyProbability ?? 0.2;
-    const replies: ReplyPart[] = [];
-    for (const [messageIndex, message] of messages.entries()) {
-      const start=replies.length;
-      try {
-      if (message.type === 'image') {
-        replies.push({ type: 'image', file: message.path });
-        continue;
-      }
-      const text = message.type === 'text' ? message.text
-        : message.segments.filter(segment => segment.type === 'text').map(segment => segment.text).join('');
-      const useVoice = voiceReplyEnabled && speech && sender.sendVoice && text.trim().length > 0 && probability > 0
-        && (probability === 1 || (this.options.random ?? Math.random)() < probability);
-      if (!useVoice) {
-        if (message.type === 'text') replies.push(...splitReply(message.text, replyMaxChars));
-        else replies.push(...splitMessage(message.segments, replyMaxChars));
-        continue;
-      }
-      const parts = splitReply(text, Math.min(replyMaxChars, this.options.ttsMaxChars ?? 300));
-      if (message.type === 'message') {
-        const mentions = message.segments.filter(segment => segment.type === 'at').map(segment => ({ ...segment }));
-        if (mentions.length > 0) replies.push({ type: 'message', segments: mentions });
-      }
-      for (const text of parts) replies.push(text.trim() ? { type: 'voice', text } : text);
-      logEvent(logger, 'info', 'processor.voice.selected', {
-        through_seq: throughSeq, message_index: messageIndex, text_chars: Array.from(text).length, part_count: parts.length,
-      });
-      } finally {for(let i=start;i<replies.length;i++)messageIndices?.push(messageIndex);}
-    }
-    return replies;
+    return prepareReplyParts(messages,this.options,throughSeq,messageIndices);
   }
 
   private async processCommand(command: PendingCommand, signal: AbortSignal): Promise<void> {
@@ -386,7 +364,7 @@ export class Processor {
       if (signal.aborted) return;
       stage = 'confirmation_send';
       logEvent(logger, 'info', 'processor.command.confirmation_started', { command_id: command.id, kind: command.kind, result });
-      await sender.sendText(commandReplies[result], signal);
+      await sender.sendText(result==='help'&&this.options.helpText?this.options.helpText():commandReplies[result], signal);
       logEvent(logger, 'info', 'processor.command.confirmation_sent', { command_id: command.id, kind: command.kind, result });
       stage = 'command_ack';
       store.acknowledgeCommand(command.id);

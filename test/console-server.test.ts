@@ -29,7 +29,7 @@ test('console HTTP lifecycle authenticates, protects mutations, keeps target imm
   assert.equal((await app.inject({method:'PUT',url:`/api/bots/${bot.id}`,headers:logged,payload:{expectedRevision:1,config:{replyProbability:50}}})).statusCode,409);
   assert.equal((await app.inject(`/internal/workers/${bot.id}/config`)).statusCode,401);
   const internal={authorization:`Bearer ${db.getBot(bot.id)!.workerToken}`};
-  const snapshot=await app.inject({url:`/internal/workers/${bot.id}/config`,headers:internal});assert.equal(snapshot.statusCode,200);assert.equal(snapshot.json().env.NAPCAT_TOKEN,'secret-test-value');
+  const snapshot=await app.inject({url:`/internal/workers/${bot.id}/config`,headers:internal});assert.equal(snapshot.statusCode,200);assert.equal(snapshot.json().env.NAPCAT_TOKEN,'');assert.equal(snapshot.json().transport,'console');assert.equal(snapshot.body.includes('secret-test-value'),false);
   const heartbeat=await app.inject({method:'POST',url:`/internal/workers/${bot.id}/heartbeat`,headers:internal,payload:{revision:2,connected:true,processing:false,drained:true,conversationId:'c1',events:[{seq:1,type:'message.received',time:Date.now(),conversationId:'c1',payload:{messageId:'m1',text:'test'}}]}});
   assert.equal(heartbeat.statusCode,200,heartbeat.body);assert.equal(heartbeat.json().acknowledgedSeq,1);
   const list=await app.inject({url:'/api/bots',headers:logged});assert.equal(list.json()[0].statistics.totalMessages,1);

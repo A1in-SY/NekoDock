@@ -14,7 +14,7 @@ interface Operation { id: string; kind: 'start' | 'stop' | 'restart'; phase: 'dr
 export class Lifecycle {
   private busy = false;
   private retryAt = new Map<string, number>();
-  constructor(readonly store: LifecycleStore, readonly docker: DockerClient) {}
+  constructor(readonly store: LifecycleStore, readonly docker: DockerClient, private readonly pendingSends:(id:string)=>number=()=>0) {}
   operation(id: string): Operation | null {
     try {
       const op = JSON.parse(this.store.getSetting(`operation.${id}`) ?? 'null') as Operation | null;
@@ -27,7 +27,7 @@ export class Lifecycle {
     if (!bot) throw new Error('实例不存在');
     if (!['start', 'stop', 'restart'].includes(action)) throw new Error('实例操作无效');
     if (action !== 'stop') {
-      const collision = this.store.listBots().some(other => other.id !== id && (other.desiredState === 'running' || this.store.getRuntime(other.id).state !== 'stopped') && other.targetType === bot.targetType && other.targetId === bot.targetId && other.config.wsUrl === bot.config.wsUrl);
+      const collision = this.store.listBots().some(other => other.id !== id && (other.desiredState === 'running' || this.store.getRuntime(other.id).state !== 'stopped') && other.targetType === bot.targetType && other.targetId === bot.targetId && other.connectionId === bot.connectionId);
       if (collision) throw new Error('同一 NapCat 连接和目标已有运行实例');
     }
     this.store.setDesiredState(id, action === 'stop' ? 'stopped' : 'running');
@@ -58,7 +58,7 @@ export class Lifecycle {
     if (this.effectiveState(bot) === 'stopped') {
       if (container?.State.Running) {
         const heartbeatAfterRequest = runtime.lastHeartbeat !== null && (!op || runtime.lastHeartbeat > op.time);
-        if (!runtime.drained || !heartbeatAfterRequest || Date.now() - runtime.lastHeartbeat! >= 15000) {
+        if (!runtime.drained || !heartbeatAfterRequest || Date.now() - runtime.lastHeartbeat! >= 15000 || this.pendingSends(id)>0) {
           this.store.setRuntime(id, { state: 'stopping' }); return;
         }
         await this.docker.stop(id);

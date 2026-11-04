@@ -7,7 +7,7 @@ import { assertAccepted, dockerImage, piFixture, respond, sendReply } from './fi
 test('Pi Worker 在桥接层执行 help/new/compact，控制消息不进入模型历史', { timeout: dockerImage ? 80_000 : 45_000 }, async t => {
   let round = 0; let compactCalls = 0;
   const f = await piFixture(t, (call, response) => {
-    if (!call.batch.length) { compactCalls++; respond(call, response, 'A compact checkpoint for the isolated test conversation.'); return; }
+    if (!call.batch.length) { compactCalls++; respond(call, response, '## Recent relevant topics\nAn isolated test conversation.\n## People and references\nSynthetic participants.\n## Current facts and corrections\nNone.\n## Explicitly unfinished work\nNone.\n## Useful results and artifacts\nEarlier replies were accepted; do not repeat.'); return; }
     if (call.results.length) { assertAccepted(call); respond(call, response, 'Internal final.'); return; }
     round++; sendReply(call, response, [{ type: 'text', text: `model-reply-${round}` }]);
   });
@@ -52,5 +52,6 @@ test('Pi Worker 在桥接层执行 help/new/compact，控制消息不进入模�
   });
   const persisted = await readFile(dockerImage ? join(f.dataPath(), freshSession.replace(/^\/data\//, '')) : freshSession, 'utf8');
   const users = persisted.trim().split('\n').map(line => JSON.parse(line)).filter(entry => entry.type === 'message' && entry.message.role === 'user');
-  assert.deepEqual(users.map(entry => JSON.parse(entry.message.content[0].text).map((message: { messageId: string }) => message.messageId)), [['fresh'], ['continued']]);
+  assert.deepEqual(users.map(entry => JSON.parse(entry.message.content[0].text).messages.map((message: { messageId: string }) => message.messageId)), [['fresh'], ['continued']]);
+  assert.deepEqual(users.map(entry => JSON.parse(entry.message.content[0].text).replyTargetMessageIds), [['fresh'], ['continued']]);
 });

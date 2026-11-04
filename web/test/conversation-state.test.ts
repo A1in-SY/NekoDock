@@ -3,6 +3,44 @@ import test from "node:test";
 import type { ConsoleEvent, ConversationView } from "../../src/console/contracts.ts";
 import { conversationActivity, conversationDisplay, mergeConversationUpdate, mergeLatestConversation, mergeOlderConversation } from "../src/conversation-state.ts";
 
+test('late shared content updates its source message once and preserves a newer page snapshot', () => {
+  const initial = view([1, 2]);
+  initial.items = [
+    { seq: 1, type: 'message.received', time: 1, payload: { messageId: 'share', text: '[JSON card]' } },
+    { seq: 2, type: 'message.content.updated', time: 2, payload: { messageId: 'share', text: '[视频分享]', contents: [{ title: 'Video' }], revision: 2 } },
+  ];
+  const shown = conversationDisplay(initial);
+  assert.equal(shown.length, 1); assert.equal(shown[0]!.payload.text, '[视频分享]');
+  assert.deepEqual(shown[0]!.payload.contents, [{ title: 'Video' }]);
+  initial.items[0]!.payload = { ...initial.items[0]!.payload, contents: [{ title: 'Newer' }], contentUpdatedSeq: 3 };
+  assert.deepEqual(conversationDisplay(initial)[0]!.payload.contents, [{ title: 'Newer' }]);
+});
+
+test('nested forwarded records and late images update one real incoming message', () => {
+  const current = view([]);
+  const contents = [{ type: 'forward', path: '0', status: 'ready', nodes: [
+    { path: '0/0', senderName: 'Original speaker', segments: [
+      { type: 'text', text: '/new @999 is quoted text' },
+      { type: 'forward', path: '0/0/1', status: 'partial', error: 'One branch expired', nodes: [
+        { path: '0/0/1/0', segments: [{ type: 'image', assetId: 'cached-inner-image' }] },
+      ] },
+    ] },
+  ] }];
+  current.items = [
+    { seq: 1, type: 'message.received', time: 1, payload: { messageId: 'outer', senderName: 'Forwarder', text: '[聊天记录]', contents: [{ type: 'forward', path: '0', status: 'pending', nodes: [] }] } },
+    { seq: 2, type: 'message.content.updated', time: 2, payload: { messageId: 'outer', contents, revision: 2 } },
+    { seq: 3, type: 'message.images.updated', time: 3, payload: { messageId: 'outer', images: [{ attachmentId: 'cached-inner-image', status: 'ready', path: '/data/workspace/.qq-images/inner.png' }] } },
+  ];
+  const displayed = conversationDisplay(current);
+  assert.equal(displayed.length, 1);
+  assert.equal(displayed[0]!.payload.messageId, 'outer');
+  assert.equal(displayed[0]!.payload.senderName, 'Forwarder');
+  assert.deepEqual(displayed[0]!.payload.contents, contents);
+  assert.deepEqual(displayed[0]!.payload.images, current.items[2]!.payload.images);
+  assert.equal(displayed[0]!.seq, 1);
+  assert.equal((current.items[0]!.payload.contents as typeof contents)[0]!.status, 'pending');
+});
+
 function view(
   sequences: number[],
   nextBefore: number | null = null,
@@ -168,6 +206,59 @@ function event(seq: number, type: string, runId: string, payload: Record<string,
   return { seq, type, time: seq, runId, itemId, payload };
 }
 
+test("incoming image status updates merge into their message without a new conversation row", () => {
+  const current = view([]);
+  current.items = [
+    event(1, "message.received", "", { messageId: "photo", text: "[图片]", images: [{ attachmentId: "first", status: "pending" }] }),
+    event(2, "message.images.updated", "", { messageId: "photo", images: [{ attachmentId: "first", status: "ready", path: "/data/workspace/.qq-images/example.png" }] }),
+    event(3, "message.images.updated", "", { messageId: "photo", images: [{ attachmentId: "first", status: "expired", error: "图片缓存已过期" }] }),
+  ];
+  const rendered = conversationDisplay(current);
+  assert.equal(rendered.length, 1);
+  assert.equal(rendered[0]!.type, "message.received");
+  assert.deepEqual(rendered[0]!.payload.images, [{ attachmentId: "first", status: "expired", error: "图片缓存已过期" }]);
+  assert.deepEqual(current.items[0]!.payload.images, [{ attachmentId: "first", status: "pending" }]);
+});
+
+test("an image update retained on a newer page resolves when its older incoming message is loaded", () => {
+  const current = view([]);
+  current.items = [event(20, "message.images.updated", "", { messageId: "older-photo", images: [{ attachmentId: "first", status: "failed", error: "图片下载失败" }] })];
+  current.cursor = 20;
+  assert.deepEqual(conversationDisplay(current), []);
+  const older = view([]);
+  older.items = [event(1, "message.received", "", { messageId: "older-photo", text: "[图片]" })];
+  const merged = mergeOlderConversation(current, older)!;
+  const rendered = conversationDisplay(merged);
+  assert.equal(rendered.length, 1);
+  assert.deepEqual(rendered[0]!.payload.images, [{ attachmentId: "first", status: "failed", error: "图片下载失败" }]);
+  assert.equal(merged.cursor, 20);
+});
+
+test("image updates cannot replace a different message or add malformed attachment data", () => {
+  const current = view([]);
+  current.items = [
+    event(1, "message.received", "", { messageId: "photo", text: "[图片]", images: [] }),
+    event(2, "message.images.updated", "", { messageId: "other", images: [{ status: "ready" }] }),
+    event(3, "message.images.updated", "", { messageId: "photo", images: "invalid" }),
+  ];
+  assert.deepEqual(conversationDisplay(current)[0]!.payload.images, []);
+});
+
+test("older attachment events cannot overwrite a snapshot enriched with its latest image version", () => {
+  const current = view([]);
+  const expired = [{ attachmentId: "first", status: "expired" }];
+  current.items = [
+    event(1, "message.received", "", { messageId: "photo", images: expired, imagesUpdatedSeq: 100 }),
+    event(2, "message.images.updated", "", { messageId: "photo", images: [{ attachmentId: "first", status: "pending" }] }),
+  ];
+  assert.deepEqual(conversationDisplay(current)[0]!.payload.images, expired);
+  const ready = [{ attachmentId: "first", status: "ready", path: "/data/workspace/.qq-images/example.png" }];
+  current.items.push(event(101, "message.images.updated", "", { messageId: "photo", images: ready }));
+  const rendered = conversationDisplay(current)[0]!;
+  assert.deepEqual(rendered.payload.images, ready);
+  assert.equal(rendered.payload.imagesUpdatedSeq, 101);
+});
+
 test("thinking snapshots replace the same model message and combine model calls once per run", () => {
   const current = view([]);
   current.items = [
@@ -211,4 +302,50 @@ test("thinking content stays plain text and cumulative updates preserve the disp
   assert.equal(first.seq, second.seq);
   assert.equal(first.runId, second.runId);
   assert.equal(second.payload.text, "<script>alert(1)</script> more");
+});
+
+test("scheduled execution stays in one stable group while its visible chat replies remain in order", () => {
+  const current = view([]);
+  current.items = [
+    event(1, "schedule.run.updated", "task-run", { taskName: "Daily report", run: { id: "task-run", status: "running", deliveryStatus: "none" } }),
+    event(2, "schedule.run.event", "task-run", { eventType: "thinking.updated", eventPayload: { text: "Collect facts", status: "in_progress" } }, "thinking-1"),
+    event(3, "schedule.run.event", "task-run", { eventType: "usage.recorded", eventPayload: { input: 500 } }),
+    event(4, "reply.accepted", "task-run", { requestId: "task-reply", messages: [{ type: "text", text: "The result" }] }),
+    event(5, "schedule.run.event", "task-run", { eventType: "tool.completed", eventPayload: { tool: "send_message" } }, "tool-1"),
+    event(6, "schedule.run.updated", "task-run", { run: { id: "task-run", status: "failed", deliveryStatus: "acknowledged", acknowledgedMessages: 1 } }),
+  ];
+  const before = structuredClone(current);
+  const display = conversationDisplay(current);
+  assert.deepEqual(display.map(item => item.type), ["schedule.run.updated", "reply.accepted"]);
+  assert.equal(display[0]!.seq, 1);
+  assert.equal(display[0]!.payload.taskName, "Daily report");
+  assert.equal((display[0]!.payload.run as Record<string, unknown>).status, "failed");
+  assert.deepEqual((display[0]!.payload.events as ConsoleEvent[]).map(item => [item.type, item.itemId]), [["thinking.updated", "thinking-1"], ["tool.completed", "tool-1"]]);
+  assert.deepEqual(current, before);
+  assert.deepEqual(conversationDisplay(current), display);
+  assert.deepEqual(current.usage, before.usage);
+  assert.deepEqual(current.context, before.context);
+});
+
+test("scheduled event pages without a start still form separate execution groups", () => {
+  const current = view([]);
+  current.items = [
+    event(1, "schedule.run.event", "task-one", { eventType: "script.output", eventPayload: { text: "first" } }),
+    event(2, "schedule.run.updated", "task-two", { run: { id: "task-two", status: "completed" } }),
+    event(3, "schedule.run.updated", "task-one", { run: { id: "task-one", status: "interrupted" } }),
+  ];
+  const display = conversationDisplay(current);
+  assert.deepEqual(display.map(item => [item.runId, (item.payload.run as Record<string, unknown>).status]), [["task-one", "interrupted"], ["task-two", "completed"]]);
+  assert.equal((display[0]!.payload.events as ConsoleEvent[])[0]!.payload.text, "first");
+});
+
+test("scheduled activity follows the worker heartbeat and does not replace an active chat with a queued task", () => {
+  const current = view([]);
+  current.items = [event(1, "run.started", "chat-run"), event(2, "schedule.run.updated", "task-run", { run: { id: "task-run", status: "queued" } })];
+  assert.deepEqual(conversationActivity(current, true), { kind: "run", startedAt: 1 });
+  current.items.push(event(3, "run.completed", "chat-run"), event(4, "schedule.run.updated", "task-run", { run: { id: "task-run", status: "running", startedAt: 100 } }));
+  assert.deepEqual(conversationActivity(current, true), { kind: "run", startedAt: 100 });
+  assert.equal(conversationActivity(current, false), null);
+  current.items.push(event(5, "schedule.run.updated", "task-run", { run: { id: "task-run", status: "completed" } }));
+  assert.equal(conversationActivity(current, true), null);
 });

@@ -11,7 +11,7 @@ import type { ServerResponse } from 'node:http';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createConsole } from '../src/console/server.js';
 import { DockerClient } from '../src/console/docker.js';
-import type { ConsoleEvent, ConversationUpdate, PublicBot } from '../src/console/contracts.js';
+import type { ConsoleEvent, ConversationUpdate, PublicBot, PublicNapcatConnection } from '../src/console/contracts.js';
 import { assertAccepted, piFixture, respond, sendReply, type ModelCall } from './fixtures/pi-e2e.js';
 
 const image = process.env.BRIDGE_E2E_IMAGE;
@@ -43,7 +43,7 @@ async function thinkingReply(call: ModelCall, response: ServerResponse, visible:
   response.end();
 }
 
-test('isolated Docker managed Pi worker applies DB config and preserves real Pi session across replacement', { skip: !image, timeout: 140_000 }, async t => {
+test('isolated Docker managed Pi worker uses the Console gateway and preserves real Pi session across replacement', { skip: !image, timeout: 140_000 }, async t => {
   const directory = await mkdtemp(join(tmpdir(), 'napcat-console-managed-e2e-'));
   let round = 0, firstResponseCompleted = false, workerToken = '';
   let releaseThinking!: () => void;
@@ -98,15 +98,25 @@ test('isolated Docker managed Pi worker applies DB config and preserves real Pi 
     }
   }
   await api('/api/setup', 'POST', { password: 'isolated-e2e-admin-password' });
-  const bot = await api<PublicBot>('/api/bots', 'POST', { name: `e2e-${randomUUID()}`, targetType: 'group', targetId: '1001', config: {
-    wsUrl: f.wsUrl, napcatToken: 'managed-private-napcat-key', persona: 'First isolated persona', model: 'provider-model-1001', baseUrl: f.modelUrl, modelApiKey: 'managed-private-model-key',
+  const connection = await api<PublicNapcatConnection>('/api/napcat-connections', 'POST', {
+    name: 'Isolated shared NapCat', wsUrl: f.localWsUrl, token: 'managed-private-napcat-key',
+  });
+  assert.equal(connection.tokenConfigured, true); assert.equal('token' in connection, false);
+  const bot = await api<PublicBot>('/api/bots', 'POST', { name: `e2e-${randomUUID()}`, targetType: 'group', targetId: '1001', connectionId: connection.id, config: {
+    persona: 'First isolated persona', model: 'provider-model-1001', baseUrl: f.modelUrl, modelApiKey: 'managed-private-model-key',
     modelApi: 'openai-responses', supportsReasoning: true, allowCommands: false, allowFileWrites: false,
     reasoning: 'low', searchProvider: 'none', ttsProvider: 'none', voiceEnabled: false, replyProbability: 0,
   } });
   workerToken = consoleApp.db.getBot(bot.id)!.workerToken;
+  const snapshot = consoleApp.db.getWorkerSnapshot(bot.id);
+  assert.equal(snapshot.transport, 'console'); assert.equal(snapshot.connectionId, connection.id);
+  assert.equal(snapshot.env.NAPCAT_WS_URL, 'ws://console.invalid/'); assert.equal(snapshot.env.NAPCAT_TOKEN, '');
   owned.set(bot.id, bot.volume);
   await api(`/api/bots/${bot.id}/start`, 'POST', {});
   await until(async () => { const value = consoleApp.db.getPublicBot(bot.id)!; return value.state === 'running' && value.connected && value.appliedRevision === 1; }, 'worker initially online');
+  assert.equal(f.connections, 1); assert.deepEqual(f.authorizations, ['Bearer managed-private-napcat-key']);
+  assert.ok(f.inspections.includes('get_status')); assert.ok(f.inspections.includes('get_login_info'));
+  assert.equal(consoleApp.gateway.getConnectionStatus(connection.id).accountId, '999');
   const first = await docker.inspect(bot.id); assert.ok(first?.State.Running); assert.ok(first.Mounts?.some(mount => mount.Name === bot.volume && mount.Destination === '/data'));
   const streamAbort = new AbortController();
   const streamResponse = await fetch(`http://127.0.0.1:${port}/api/bots/${bot.id}/conversation/stream?after=0`, { headers: { cookie }, signal: streamAbort.signal });
@@ -170,8 +180,12 @@ test('isolated Docker managed Pi worker applies DB config and preserves real Pi 
   assert.deepEqual(await inspectData(), second, 'volume, real session, cursor and workspace survive replacement');
   f.send('managed-third'); await f.waitFor(() => f.outgoing.length === 3 && f.calls.length === 6, '替换容器之后继续同一个 Pi 会话');
   await until(async () => (await inspectData()).state.cursor === 3, 'third batch committed');
-  assert.equal((await inspectData()).state.session_id, initial.state.session_id); assert.equal(round, 3); assert.ok(f.connections >= 3);
+  assert.equal((await inspectData()).state.session_id, initial.state.session_id); assert.equal(round, 3);
+  assert.equal(f.connections, 1, 'Worker reload and replacement must retain the shared Console upstream connection');
   assert.ok(f.calls.every(call => call.authorization === 'Bearer managed-private-model-key'));
   await api(`/api/bots/${bot.id}/stop`, 'POST', {});
   await until(async () => !(await docker.inspect(bot.id))!.State.Running && consoleApp.db.getPublicBot(bot.id)!.state === 'stopped', 'worker safely stopped');
+  assert.equal(consoleApp.db.pendingNapcatEventCount(bot.id), 0);
+  f.send('after-managed-stop'); await delay(100);
+  assert.equal(consoleApp.db.pendingNapcatEventCount(bot.id), 0, 'manually stopped instances must not accumulate new messages');
 });

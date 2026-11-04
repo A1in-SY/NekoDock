@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import type { PublicBot } from "../../src/console/contracts";
+import { botConnectionStates } from "./connections-state";
 const paths: Record<string, string> = {
   calendar:
     "M4 5h16v16H4zM4 10h16M8 2v6M16 2v6M8 14h.01M12 14h.01M16 14h.01M8 18h.01M12 18h.01",
@@ -112,6 +113,18 @@ export function Status({ bot }: { bot: PublicBot }) {
       {labels[bot.state] || bot.state}
     </span>
   );
+}
+export function BotConnectivity({ bot, compact = false }: { bot: PublicBot; compact?: boolean }) {
+  const state = botConnectionStates(bot);
+  return <div className={"bot-connectivity " + (compact ? "compact" : "")} aria-label="实例连接状态">
+    {[
+      ["NapCat 上游", state.upstream, "WebSocket 连接到 NapCat"],
+      ["内部通道", state.transport, "实例与控制台之间的消息通道"],
+      ["消息收发", state.connected, "NapCat 在线且实例消息通道可用"],
+    ].map(([label, connected, title]) => <span key={String(label)} title={String(title) + "：" + (connected ? "已连接" : "未连接")} aria-label={String(label) + "：" + (connected ? "已连接" : "未连接")}>
+      <i className={"status-dot " + (connected ? "" : "off")} />{label}<b>{connected ? "已连接" : "未连接"}</b>
+    </span>)}
+  </div>;
 }
 export function Avatar({
   bot,

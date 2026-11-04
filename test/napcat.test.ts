@@ -25,7 +25,7 @@ test('normalization preserves IDs, sender, time, reply, raw event and readable s
   assert.equal(normalized.senderName, '群名片');
   assert.equal(normalized.time, event.time);
   assert.equal(normalized.replyTo, '-100');
-  assert.equal(normalized.text, '[引用 -100][@456]正文[图片 photo.png][custom]');
+  assert.equal(normalized.text, '[引用 -100][@456]正文[图片][custom]');
   assert.equal(normalized.trigger, false);
   assert.deepEqual(JSON.parse(normalized.rawJson), event);
   assert.equal(normalizeMessage(baseEvent({ sender: { nickname: '昵称', card: '' } }), target, 0)?.senderName, '昵称');
@@ -38,6 +38,7 @@ test('normalization filters other targets, non-message events, own messages and 
     baseEvent({ post_type: 'notice' }), baseEvent({ post_type: 'message_sent' }),
     baseEvent({ user_id: '999' }), baseEvent({ message_id: undefined }),
     baseEvent({ time: undefined }), baseEvent({ message: [{ data: {} }] }),
+    baseEvent({ message_id: 'x'.repeat(201) }),
   ];
   for (const event of rejected) assert.equal(normalizeMessage(event, target, 1), null);
   assert.equal(normalizeMessage(baseEvent({ message_type: 'private', user_id: 123 }), { type: 'private', id: '124' }, 1), null);
@@ -125,7 +126,8 @@ test('CQ strings preserve reply and mention semantics and decode entities once a
   assert.equal(normalized.replyTo, '-100');
   assert.equal(normalized.trigger, true);
   assert.match(normalized.text, /你好 & \[x\]/);
-  assert.match(normalized.text, /https:\/\/x\/\?a=1&b=2,3/);
+  assert.match(normalized.text, /\[图片\]/);
+  assert.doesNotMatch(normalized.text, /https:|a=1|b=2/);
   const escaped = normalizeMessage(baseEvent({ message: '&#91;CQ:at,qq=999&#93; &amp;#91;' }), target, 0);
   assert.equal(escaped?.trigger, false);
   assert.equal(escaped?.text, '[CQ:at,qq=999] &#91;');
@@ -165,6 +167,13 @@ test('image sources ignore malformed or non-message data without throwing', () =
   for (const raw of ['invalid', 'null', '[]', '{}', '{"message":null}', '{"message":[{"data":{}}]}']) {
     assert.deepEqual(imageSources(raw), []);
   }
+});
+
+test('ordinary image manifests have a fixed per-message bound', () => {
+  const message = Array.from({ length: 1000 }, (_, index) => ({ type: 'image', data: { url: `https://example.invalid/${index}.png` } }));
+  const sources = imageSources(JSON.stringify(baseEvent({ message })));
+  assert.equal(sources.length, 64);
+  assert.equal(sources.at(-1), 'https://example.invalid/63.png');
 });
 
 async function waitFor(condition: () => boolean): Promise<void> {
@@ -233,6 +242,49 @@ test('client authenticates, waits for connection, correlates echoes, receives ev
   assert.deepEqual(f.events, [baseEvent()]);
 });
 
+test('direct and shared text sends prepend a reply segment and keep the body literal', async t => {
+  const f = await fixture(t);
+  f.client.start();
+  const signal = new AbortController().signal;
+  const body = '请稍等 [CQ:at,qq=all]';
+  const direct = f.client.sendText(body, signal, '-100');
+  await waitFor(() => f.requests.length === 1);
+  assert.deepEqual(f.requests[0]!.params, {
+    group_id: '1001', message: [{ type: 'reply', data: { id: '-100' } }, text(body)],
+  });
+  f.sendResponse(f.requests[0]!);
+  await direct;
+  const shared = f.client.sendTo({ type: 'group', id: '1002' }, { kind: 'text', text: body, replyTo: 'quoted-message' }, signal);
+  await waitFor(() => f.requests.length === 2);
+  assert.deepEqual(f.requests[1]!.params, {
+    group_id: '1002', message: [{ type: 'reply', data: { id: 'quoted-message' } }, text(body)],
+  });
+  f.sendResponse(f.requests[1]!);
+  await shared;
+});
+
+test('direct and shared video sends use one standalone video segment', async t => {
+  const f = await fixture(t);
+  f.client.start();
+  const signal = new AbortController().signal;
+  const file = 'https://media.example/video.mp4';
+  const direct = f.client.sendVideo(file, signal);
+  await waitFor(() => f.requests.length === 1);
+  assert.deepEqual(f.requests[0]!.params, {
+    group_id: '1001', message: [{ type: 'video', data: { file } }],
+  });
+  f.sendResponse(f.requests[0]!);
+  await direct;
+  const shared = f.client.sendTo({ type: 'private', id: '2001' }, { kind: 'video', file }, signal);
+  await waitFor(() => f.requests.length === 2);
+  assert.equal(f.requests[1]!.action, 'send_private_msg');
+  assert.deepEqual(f.requests[1]!.params, {
+    user_id: '2001', message: [{ type: 'video', data: { file } }],
+  });
+  f.sendResponse(f.requests[1]!);
+  await shared;
+});
+
 test('API and connection logs retain correlation, status and timing without payloads or server reasons', async t => {
   const f = await fixture(t);
   f.client.start();
@@ -274,6 +326,55 @@ test('delivery errors distinguish explicit rejection, missing receipt and failur
   await waitFor(() => f.requests.length === 2);
   await timeout;
   assert.doesNotMatch(f.logs.join('\n'), /sensitive-provider-message/);
+});
+
+test('NapCat internal send receipt timeouts remain unconfirmed without exposing server details', async t => {
+  const f = await fixture(t);
+  f.client.start();
+  const signal = new AbortController().signal;
+  const detail = 'Error: Timeout: NTEvent serviceAndMethod:NodeIKernelMsgService/sendMsg ListenerName:NodeIKernelMsgListener/onMsgInfoListUpdate EventRet:\n{"sensitive-server-detail":true}\n';
+  for (const type of ['group', 'private'] as const) {
+    for (const field of ['message', 'wording']) {
+      const count = f.requests.length + 1;
+      const sending = assert.rejects(f.client.sendTo({ type, id: '1001' }, { kind: 'image', file: 'base64://sensitive-image' }, signal), {
+        code: 'NAPCAT_SEND_RECEIPT_TIMEOUT', deliveryStatus: 'unconfirmed', retcode: 1200,
+      });
+      await waitFor(() => f.requests.length === count);
+      f.sendResponse(f.requests[count - 1]!, { status: 'failed', retcode: 1200, [field]: detail, data: { message_id: 'unconfirmed-id' } });
+      await sending;
+    }
+  }
+  assert.equal(f.requests.length, 4);
+  assert.ok(f.logs.some(line => line.startsWith('napcat.api.timeout ') && line.includes('reason="send_receipt_timeout"')
+    && line.includes('error_code="NAPCAT_SEND_RECEIPT_TIMEOUT"') && line.includes('delivery_status="unconfirmed"') && line.includes('retcode=1200')));
+  assert.doesNotMatch(f.logs.join('\n'), /sensitive-|NodeIKernel|unconfirmed-id|base64:\/\//);
+});
+
+test('generic API errors and unrelated internal timeouts remain explicit failures', async t => {
+  const f = await fixture(t);
+  f.client.start();
+  const signal = new AbortController().signal;
+  for (const message of [
+    'sensitive-error',
+    'Timeout: uploading image',
+    'Timeout: NTEvent serviceAndMethod:NodeIKernelMsgService/getMsgs ListenerName:NodeIKernelMsgListener/onMsgInfoListUpdate EventRet:{}',
+    'Timeout: NTEvent serviceAndMethod:NodeIKernelMsgService/sendMsg ListenerName:NodeIKernelMsgListener/onOtherEvent EventRet:{}',
+    'Timeout: NTEvent serviceAndMethod:NodeIKernelMsgService/sendMsg ListenerName:NodeIKernelMsgListener/onMsgInfoListUpdateOther EventRet:{}',
+  ]) {
+    const count = f.requests.length + 1;
+    const sending = assert.rejects(f.client.sendImage('base64://synthetic-image', signal), {
+      code: 'NAPCAT_API_REJECTED', deliveryStatus: 'failed', retcode: 1200,
+    });
+    await waitFor(() => f.requests.length === count);
+    f.sendResponse(f.requests[count - 1]!, { status: 'failed', retcode: 1200, message });
+    await sending;
+  }
+  const probe = assert.rejects(f.client.inspect('get_status', signal), { code: 'NAPCAT_API_REJECTED', deliveryStatus: 'failed' });
+  await waitFor(() => f.requests.length === 6);
+  f.sendResponse(f.requests[5]!, { status: 'failed', retcode: 1200,
+    message: 'Timeout: NTEvent serviceAndMethod:NodeIKernelMsgService/sendMsg ListenerName:NodeIKernelMsgListener/onMsgInfoListUpdate EventRet:{}' });
+  await probe;
+  assert.doesNotMatch(f.logs.join('\n'), /sensitive-|NodeIKernel/);
 });
 
 test('private send uses send_private_msg and only ok plus zero retcode confirms success', async t => {
@@ -481,20 +582,20 @@ test('voice replies reject failed ACKs, support cancellation and ignore cancelle
   assert.doesNotMatch(f.logs.join('\n'), /base64:\/\/|private voice error/);
 });
 
-test('image sends use the shared timeout and reconnect flow and accept no stale acknowledgement', async t => {
+test('image sends time out independently and accept no stale acknowledgement', async t => {
   const f = await fixture(t, { actionTimeoutMs: 50 });
   f.client.start();
   const signal = new AbortController().signal;
   const timedOut = assert.rejects(f.client.sendImage('base64://Zmlyc3Q=', signal), /timed out/);
   await waitFor(() => f.requests.length === 1);
   await timedOut;
-  await waitFor(() => f.connections.length === 2);
+  assert.equal(f.connections.length, 1);
   const sending = f.client.sendImage('base64://bmV4dA==', signal);
   await waitFor(() => f.requests.length === 2);
   let imageDone = false;
   void sending.then(() => { imageDone = true; });
   f.sendResponse(f.requests[0]!);
-  f.connections[1]!.send(JSON.stringify(baseEvent()));
+  f.connections[0]!.send(JSON.stringify(baseEvent()));
   await waitFor(() => f.events.length === 1);
   assert.equal(imageDone, false);
   f.sendResponse(f.requests[1]!);
@@ -516,20 +617,20 @@ test('pending sends reject on disconnect and new sends work after reconnect', as
   await next;
 });
 
-test('API timeout terminates the socket and reconnects before the next send', async t => {
+test('API timeout keeps the shared socket available for the next send', async t => {
   const f = await fixture(t, { actionTimeoutMs: 50 });
   f.client.start();
   const timedOut = assert.rejects(f.client.sendText('timeout', new AbortController().signal), /timed out/);
   await waitFor(() => f.requests.length === 1);
   await timedOut;
-  await waitFor(() => f.connections.length === 2);
-  assert.equal(f.connections[0]!.readyState, WebSocket.CLOSED);
+  assert.equal(f.connections.length, 1);
+  assert.equal(f.connections[0]!.readyState, WebSocket.OPEN);
   const next = f.client.sendText('after timeout', new AbortController().signal);
   await waitFor(() => f.requests.length === 2);
   let nextDone = false;
   void next.then(() => { nextDone = true; });
   f.sendResponse(f.requests[0]!);
-  f.connections[1]!.send(JSON.stringify(baseEvent()));
+  f.connections[0]!.send(JSON.stringify(baseEvent()));
   await waitFor(() => f.events.length === 1);
   assert.equal(nextDone, false);
   f.sendResponse(f.requests[1]!);

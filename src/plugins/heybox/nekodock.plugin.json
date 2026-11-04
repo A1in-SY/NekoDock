@@ -1,0 +1,26 @@
+{
+  "kind": "nekodock-plugin",
+  "id": "heybox",
+  "name": "小黑盒游戏增强",
+  "description": "解析游戏分享，补充游戏资料并生成游戏卡片。",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "entries": { "console": "./index.js", "runner": "./runner.js" },
+  "capabilities": ["content-enrichment"],
+  "resourceTypes": ["game"],
+  "commands": [],
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "enhance": { "type": "boolean", "title": "游戏上下文增强", "default": true, "group": "游戏" },
+      "autoCard": { "type": "boolean", "title": "自动发送游戏卡片", "default": true, "group": "游戏" },
+      "showPrices": { "type": "boolean", "title": "卡片展示价格", "description": "价格保留商店、地区和优惠条件；不可用时省略。", "default": true, "group": "游戏" },
+      "maxMiB": { "type": "integer", "title": "单张图片上限（MiB）", "minimum": 1, "maximum": 16, "default": 10, "group": "资源限制" },
+      "timeoutSeconds": { "type": "integer", "title": "处理超时（秒）", "minimum": 10, "maximum": 300, "default": 60, "group": "资源限制" },
+      "waitSeconds": { "type": "integer", "title": "上下文等待解析（秒）", "minimum": 0, "maximum": 15, "default": 3, "group": "资源限制" },
+      "cacheMaxMiB": { "type": "integer", "title": "媒体缓存上限（MiB）", "minimum": 16, "maximum": 4096, "default": 512, "group": "资源限制" },
+      "cacheHours": { "type": "integer", "title": "媒体缓存时长（小时）", "minimum": 1, "maximum": 168, "default": 24, "group": "资源限制" },
+      "cookie": { "type": "string", "title": "小黑盒 Cookie（可选）", "description": "匿名访问通常可用，仅在确需网页登录状态时填写。", "secret": true, "group": "访问" }
+    }
+  }
+}

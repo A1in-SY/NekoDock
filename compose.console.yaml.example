@@ -21,15 +21,47 @@ services:
       WORKER_NETWORK: nekodock
       # Container-to-container URL, independent of the published host port.
       WORKER_CONSOLE_URL: http://console:4180
+      # Generated automatically; the runner receives only its scoped credential.
+      CONSOLE_PLUGIN_RUNNER_TOKEN_FILE: /plugin-bootstrap/runner.token
     volumes:
       # Contains DB configuration, encrypted secrets and an independent master key.
       - ./console-data:/console-data
       # Control plane only. Do not add this mount to Worker containers.
       - /var/run/docker.sock:/var/run/docker.sock
+      - plugin-bootstrap:/plugin-bootstrap
     networks:
       - console
     extra_hosts:
       - host.docker.internal:host-gateway
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Shared downloader. Per-instance plugin settings remain in the Console DB.
+  plugin-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.plugin-runner
+    image: nekodock-plugin-runner:latest
+    init: true
+    restart: unless-stopped
+    depends_on: [console]
+    environment:
+      CONSOLE_URL: http://console:4180
+      PLUGIN_RUNNER_TOKEN_FILE: /plugin-bootstrap/runner.token
+      PLUGIN_RUNNER_WORKDIR: /runner-work
+    volumes:
+      - plugin-bootstrap:/plugin-bootstrap:ro
+      - plugin-runner-work:/runner-work
+    networks: [console]
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    cpus: 1.0
+    mem_limit: 512m
+    pids_limit: 128
     stop_grace_period: 30s
     logging:
       driver: json-file
@@ -50,3 +82,7 @@ networks:
   console:
     # Dynamic worker containers join this same network.
     name: nekodock
+
+volumes:
+  plugin-bootstrap:
+  plugin-runner-work:

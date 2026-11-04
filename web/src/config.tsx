@@ -6,6 +6,9 @@ import type {
 } from "../../src/console/contracts";
 import { api, errorText } from "./api";
 import { Icon, Notice } from "./ui";
+import { canSelectConnection, canSwitchConnection, instanceSettings } from "./connections-state";
+import type { ConnectionView } from "./connections-state";
+import { canRunNetworkProbe, describeNetworkProbe, type NetworkProbe } from "./network-probe-state";
 
 type Settings = PublicBot["config"];
 type Section =
@@ -14,6 +17,8 @@ type Section =
   | "persona"
   | "search"
   | "voice"
+  | "network"
+  | "memory"
   | "advanced";
 const sections: [Section, string, string][] = [
   ["general", "bots", "基本设置"],
@@ -21,20 +26,27 @@ const sections: [Section, string, string][] = [
   ["persona", "document", "人格设定"],
   ["search", "globe", "网络搜索"],
   ["voice", "mic", "语音回复"],
+  ["network", "network", "网络代理"],
+  ["memory", "database", "长期记忆"],
   ["advanced", "sliders", "高级设置"],
 ];
 export function Configuration({
   bot,
+  connections,
+  connectionsError,
   onSaved,
   notify,
 }: {
   bot: PublicBot;
+  connections: ConnectionView[];
+  connectionsError: string;
   onSaved: (bot: PublicBot) => Promise<void>;
   notify: (text: string, error?: boolean) => void;
 }) {
   const [section, setSection] = useState<Section>("general");
   const [draft, setDraft] = useState<Settings>({ ...bot.config });
   const [name, setName] = useState(bot.name);
+  const [connectionId, setConnectionId] = useState(bot.connectionId);
   const [description, setDescription] = useState(bot.description);
   const [secrets, setSecrets] = useState<
     Partial<Record<SecretField, string | null>>
@@ -44,17 +56,25 @@ export function Configuration({
     name: bot.name,
     description: bot.description,
     config: bot.config,
+    connectionId: bot.connectionId,
   });
   const [pending, setPending] = useState(false);
   const [error, setError] = useState("");
+  const [probe, setProbe] = useState<NetworkProbe | null>(null);
+  const [probeStarting, setProbeStarting] = useState(false);
+  const [probeError, setProbeError] = useState("");
+  const selectedConnection = connections.find(connection => connection.id === connectionId);
+  const connectionAllowed = connectionId === bot.connectionId || Boolean(selectedConnection && canSelectConnection(bot, selectedConnection, connections));
   const dirty =
     name !== saved.name ||
+    connectionId !== saved.connectionId ||
     description !== saved.description ||
     JSON.stringify(draft) !== JSON.stringify(saved.config) ||
     Object.keys(secrets).length > 0;
   const reset = () => {
     setDraft({ ...bot.config });
     setName(bot.name);
+    setConnectionId(bot.connectionId);
     setDescription(bot.description);
     setSecrets({});
     setRevision(bot.desiredRevision);
@@ -62,6 +82,7 @@ export function Configuration({
       name: bot.name,
       description: bot.description,
       config: bot.config,
+      connectionId: bot.connectionId,
     });
     setError("");
   };
@@ -69,12 +90,14 @@ export function Configuration({
     if (!dirty) {
       setDraft({ ...bot.config });
       setName(bot.name);
+      setConnectionId(bot.connectionId);
       setDescription(bot.description);
       setRevision(bot.desiredRevision);
       setSaved({
         name: bot.name,
         description: bot.description,
         config: bot.config,
+        connectionId: bot.connectionId,
       });
     }
   }, [bot.desiredRevision]);
@@ -84,6 +107,37 @@ export function Configuration({
     window.addEventListener("beforeunload", warn);
     return () => window.removeEventListener("beforeunload", warn);
   }, [dirty]);
+  useEffect(() => {
+    if (!probe || probe.status !== "pending") return;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = async () => {
+      try {
+        const value = await api<NetworkProbe>(
+          `/api/bots/${encodeURIComponent(bot.id)}/network-probe?probeId=${encodeURIComponent(probe.id)}`,
+          { signal: controller.signal },
+        );
+        if (controller.signal.aborted) return;
+        setProbe(value);
+        if (value.status === "pending") timer = setTimeout(() => void poll(), 1000);
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          setProbeError(errorText(error));
+          setProbe(null);
+        }
+      }
+    };
+    timer = setTimeout(() => void poll(), 500);
+    return () => { controller.abort(); clearTimeout(timer); };
+  }, [bot.id, probe?.id, probe?.status]);
+  const runProbe = async () => {
+    if (!canRunNetworkProbe(bot) || probeStarting || probe?.status === "pending") return;
+    setProbeStarting(true); setProbeError(""); setProbe(null);
+    try {
+      setProbe(await api<NetworkProbe>(`/api/bots/${encodeURIComponent(bot.id)}/network-probe`, { method: "POST", body: "{}" }));
+    } catch (error) { setProbeError(errorText(error)); }
+    finally { setProbeStarting(false); }
+  };
   const patch = <K extends keyof Settings>(key: K, value: Settings[K]) => {
     setDraft((old) => ({ ...old, [key]: value }));
     setError("");
@@ -188,7 +242,7 @@ export function Configuration({
   );
   const toggle = (
     label: string,
-    key: "supportsImages" | "supportsReasoning" | "allowCommands" | "allowFileWrites",
+    key: "supportsImages" | "supportsReasoning" | "allowCommands" | "allowFileWrites" | "taskCreatorOnly" | "proxyEnabled" | "proxyForTools" | "memoryEnabled" | "memoryDailyEnabled" | "memoryAfterCompaction",
     hint: string,
   ) => (
     <div className="switch-row" key={key}>
@@ -227,7 +281,7 @@ export function Configuration({
     setPending(true);
     setError("");
     try {
-      const config: Record<string, unknown> = { ...draft, ...secrets };
+      const config = instanceSettings({ ...draft, ...secrets });
       const updated = await api<PublicBot>(
         "/api/bots/" + encodeURIComponent(bot.id),
         {
@@ -235,6 +289,7 @@ export function Configuration({
           body: JSON.stringify({
             name: name.trim(),
             description: description.trim(),
+            connectionId,
             config,
             expectedRevision: revision,
           }),
@@ -242,6 +297,7 @@ export function Configuration({
       );
       setDraft({ ...updated.config });
       setName(updated.name);
+      setConnectionId(updated.connectionId);
       setDescription(updated.description);
       setSecrets({});
       setRevision(updated.desiredRevision);
@@ -249,6 +305,7 @@ export function Configuration({
         name: updated.name,
         description: updated.description,
         config: updated.config,
+        connectionId: updated.connectionId,
       });
       await onSaved(updated);
     } catch (error) {
@@ -318,14 +375,15 @@ export function Configuration({
           <hr className="form-divider" />
           <h3 className="form-subtitle">NapCat 连接</h3>
           <div className="form-grid">
-            {field(
-              "WebSocket 地址",
-              "wsUrl",
-              "填写 NapCat WebSocket 服务端地址。",
-              "text",
-              true,
-            )}
-            {secret("访问 Token", "napcatToken")}
+            <div className="form-field full">
+              <label htmlFor="f-connection">共享连接</label>
+              <select id="f-connection" value={connectionId} disabled={!canSwitchConnection(bot)} onChange={event => setConnectionId(event.target.value)} required>
+                <option value="">请选择 NapCat 连接</option>
+                {connections.map(connection => <option key={connection.id} value={connection.id} disabled={!canSelectConnection(bot, connection, connections)}>{connection.name}{connection.enabled ? "" : " · 已停用"}{connection.id !== bot.connectionId && !canSelectConnection(bot, connection, connections) ? " · 不可切换" : ""}</option>)}
+              </select>
+              <small className="field-hint">地址、Token 和连接参数在 <a href="#connections">NapCat 连接</a> 中统一管理。{canSwitchConnection(bot) ? "只能切换到已验证为同一 QQ 账号的启用连接；使用其他 QQ 账号请新建实例。" : "完全停止实例后，才能切换到已验证为同一 QQ 账号的启用连接。"}</small>
+              {connectionsError && <span className="field-error">{connectionsError}</span>}
+            </div>
           </div>
           <Notice>
             {bot.targetType === "group"
@@ -387,11 +445,34 @@ export function Configuration({
               { min: 1, step: 1 },
             )}
           </div>
+          <div className="form-grid">{field("压缩保留近期历史 · tokens", "compactKeepRecentTokens", "默认 20000；必须小于压缩阈值。", "number", false, {min:1,step:1})}{field("压缩摘要输出上限 · tokens", "compactSummaryMaxTokens", "默认 4000；不能超过模型最大输出量。", "number", false, {min:1,step:1})}</div>
           <Notice>
             每个实例维护独立会话。模型与人格配置在当前轮结束后应用；需要空会话时使用 /new。
           </Notice>
         </>
       );
+      break;
+    case "memory":
+      body = <>
+        <h2>长期记忆</h2><p className="config-intro">独立的后台整理器保存事实、偏好和经历，主会话按需读取。</p>
+        {toggle("启用长期记忆", "memoryEnabled", "关闭后停止整理和召回，已有记忆继续保留。")}
+        {draft.memoryEnabled && <>
+          {toggle("每日定时整理", "memoryDailyEnabled", "每天按选定时区整理新增聊天；停机错过后合并补跑。")}
+          {draft.memoryDailyEnabled && <div className="form-grid">{field("每日时间", "memoryDailyTime", "24 小时制。", "time")}{field("调度时区", "memoryTimezone", "IANA 时区，例如 Asia/Shanghai。")}</div>}
+          {toggle("会话压缩后整理", "memoryAfterCompaction", "主会话成功压缩后异步整理，不增加主会话忙碌时间。")}
+          <div className="form-grid">{field("召回预算 · tokens", "memoryRecallTokens", "每轮最多 8 条相关记忆，空间不足时进一步缩减。", "number", false, {min:1,max:16000,step:1})}</div>
+          <hr className="form-divider"/><h3 className="form-subtitle">整理模型</h3><div className="form-grid">
+            {field("模型 ID", "memoryModel", "留空复用当前对话模型；整理使用独立提示词、工具和运行上下文。", "text", true)}
+            {field("API Base URL", "memoryBaseUrl", "留空复用当前对话服务地址，协议沿用实例选择。", "url", true)}
+            {secret("整理 API Key", "memoryApiKey")}
+          </div><Notice>未单独填写密钥时复用对话模型密钥。后台整理不发送 QQ 消息，也不占用主会话的处理状态。</Notice>
+          <hr className="form-divider"/><h3 className="form-subtitle">语义检索</h3><div className="form-grid">
+            {select("Embedding 服务商", "memoryEmbeddingProvider", [["none","关闭 · 使用中文关键词检索"],["openai-compatible","OpenAI-compatible"]], "只启用一种语义检索服务。", true)}
+            {draft.memoryEmbeddingProvider !== "none" && <>{field("Embedding Base URL", "memoryEmbeddingBaseUrl", "服务需提供 embeddings 接口。", "url", true)}{field("Embedding 模型", "memoryEmbeddingModel", "选择支持聊天语言的模型。", "text", true)}{secret("Embedding API Key", "memoryEmbeddingApiKey")}</>}
+          </div>
+        </>}
+        <Notice>普通聊天中的“记住”“更正”“忘记”会在下一次整理时更新长期记忆。管理与查看来源请进入实例的“记忆”页面。</Notice>
+      </>;
       break;
     case "persona":
       body = (
@@ -590,10 +671,10 @@ export function Configuration({
                 {field(
                   "音频大小上限 · MiB",
                   "ttsMaxMiB",
-                  "限制合成音频大小。",
+                  "限制合成音频大小，单条语音最多 16 MiB。",
                   "number",
                   false,
-                  { min: 1 },
+                  { min: 1, max: 16 },
                 )}
               </div>
               <Notice>
@@ -603,6 +684,39 @@ export function Configuration({
               </Notice>
             </>
           )}
+        </>
+      );
+      break;
+    case "network":
+      body = (
+        <>
+          <h2>网络代理</h2>
+          <p className="config-intro">为当前实例的模型、搜索、语音和图片下载设置 HTTP(S) 代理。</p>
+          {toggle("启用网络代理", "proxyEnabled", "关闭后使用直连；已填写的代理设置会保留。")}
+          {draft.proxyEnabled && <>
+            <div className="form-grid">
+              {field("代理地址", "proxyUrl", "例如 http://host.docker.internal:7890。地址从 Worker 容器内解析，宿主机端口须允许容器访问。", "url", true)}
+              {secret("代理用户名", "proxyUsername")}
+              {secret("代理密码", "proxyPassword")}
+              <div className="form-field full">
+                <label htmlFor="f-proxyNoProxy">绕过代理</label>
+                <textarea id="f-proxyNoProxy" rows={5} value={draft.proxyNoProxy.replace(/,/g, "\n")} onChange={event => patch("proxyNoProxy", event.target.value)} spellCheck={false} />
+                <small className="field-hint">每行填写一个主机、域名或 IP，可附端口。例如 localhost、.example.com、192.0.2.1:8080；命中时直接连接。</small>
+              </div>
+            </div>
+            {toggle("命令与脚本继承代理", "proxyForTools", "为终端命令和定时脚本提供代理环境变量。第三方库需支持环境变量；Playwright 浏览器须显式设置代理。")}
+            <Notice>支持 HTTP 和 HTTPS 代理，HTTPS 网站可经 HTTP 代理的 CONNECT 通道访问。代理失败时不自动改为直连。Console 与 NapCat 的连接独立运行。</Notice>
+          </>}
+          <hr className="form-divider" />
+          <h3 className="form-subtitle">连通性检测</h3>
+          <p className="config-intro">由当前 Worker 检测已生效的配置版本 {bot.appliedRevision}。检测不使用未保存的更改，也不生成模型回复或发送 QQ 消息。</p>
+          <button type="button" className="btn" disabled={!canRunNetworkProbe(bot) || probeStarting || probe?.status === "pending"} onClick={() => void runProbe()}>
+            <Icon name="activity" />{probeStarting || probe?.status === "pending" ? "正在检测…" : "检测当前生效配置"}
+          </button>
+          {!canRunNetworkProbe(bot) && <p className="field-hint">启动实例后可检测。</p>}
+          {probe && <p className={probe.result?.ok ? "field-hint" : probe.status === "pending" ? "field-hint" : "field-error"} role="status">{describeNetworkProbe(probe, bot.appliedRevision)}</p>}
+          {probeError && <p className="field-error" role="alert">{probeError}</p>}
+          <p className="field-hint">连通性正常仅表示已收到目标的 HTTP 响应，不代表模型鉴权、生成效果或大请求传输正常。</p>
         </>
       );
       break;
@@ -616,6 +730,7 @@ export function Configuration({
           <h3 className="form-subtitle">工具权限</h3>
           {toggle("允许写入文件", "allowFileWrites", "允许模型通过文件工具修改当前实例的工作目录。")}
           {toggle("允许终端命令", "allowCommands", "允许以 node 用户权限运行容器内命令；命令可访问该用户有权限的文件。")}
+          {toggle("仅定时任务创建者可编辑", "taskCreatorOnly", "开启后，仅创建者可通过聊天修改、暂停、恢复或删除任务；控制台管理不受影响。")}
           <hr className="form-divider" />
           <div className="form-grid">
             {field(
@@ -643,14 +758,6 @@ export function Configuration({
               { min: 1 },
             )}
             {field(
-              "发送动作超时 · 秒",
-              "actionTimeout",
-              "等待 NapCat 返回发送确认的时间。",
-              "number",
-              false,
-              { min: 1 },
-            )}
-            {field(
               "控制队列退避间隔 · 秒",
               "retrySeconds",
               "指令确认或存储清理错误后的等待时间；不重试模型或普通回复。",
@@ -659,28 +766,52 @@ export function Configuration({
               { min: 1 },
             )}
             {field(
-              "断线重连间隔 · 秒",
-              "reconnectSeconds",
-              "NapCat 连接断开后的重连间隔。",
-              "number",
-              false,
-              { min: 1 },
-            )}
-            {field(
               "图片大小上限 · MiB",
               "imageMaxMiB",
-              "限制接收并交给模型的单张图片大小。",
+              "限制接收和发送的图片大小，单张图片最多 16 MiB。",
               "number",
               false,
-              { min: 1 },
+              { min: 1, max: 16 },
             )}
             {field(
               "图片下载超时 · 秒",
               "imageTimeout",
-              "读取消息图片的最长等待时间。",
+              "单次图片下载及当前批次等待图片准备的时间上限。",
               "number",
               false,
               { min: 1 },
+            )}
+            {field(
+              "图片缓存保留 · 天",
+              "imageCacheDays",
+              "Worker 本地图片的保留期限；压缩上下文和 /new 不会立即删除图片。",
+              "number",
+              false,
+              { min: 1, step: 1 },
+            )}
+            {field(
+              "图片缓存容量 · MiB",
+              "imageCacheMaxMiB",
+              "当前实例的 Worker 图片缓存上限；清理时保护尚未消费及正在使用的图片。",
+              "number",
+              false,
+              { min: 1, step: 1 },
+            )}
+            {field(
+              "图片中转保留 · 小时",
+              "imageTransitHours",
+              "Console 等待 Worker 保存图片的最长时间，Worker 离线时仍及时下载原图。",
+              "number",
+              false,
+              { min: 1, step: 1 },
+            )}
+            {field(
+              "图片中转容量 · MiB",
+              "imageTransitMaxMiB",
+              "当前实例在 Console 的中转缓存上限；Worker 确认落盘后释放快照。",
+              "number",
+              false,
+              { min: 1, step: 1 },
             )}
           </div>
         </>
@@ -752,7 +883,7 @@ export function Configuration({
             </button>
             <button
               className="btn primary"
-              disabled={!dirty || pending || revision !== bot.desiredRevision}
+              disabled={!dirty || pending || !connectionId || !connectionAllowed || revision !== bot.desiredRevision}
               onClick={() => void save()}
             >
               <Icon name="check" />

@@ -9,9 +9,73 @@ import { PiRunner, piEnvironment, piFailure, validatePiSession, type PiRunnerOpt
 import { createPiTools, shellEnvironment, workspacePath } from '../src/pi-tools.js';
 import type { PendingBatch, ReplyToolRequest, RunObservation } from '../src/types.js';
 import { decodeModelCall, respond } from './fixtures/pi-e2e.js';
+import { assertModelImage, largeModelImage } from './fixtures/model-image.js';
 
-const batch = (text = 'hello', replyAllowed = true): PendingBatch => ({ throughSeq: 1, messages: [{ seq: 1, messageId: 'm1', senderId: '123', senderName: 'A', time: 123, text, replyTo: null, trigger: true, rawJson: '{}' }], replyAllowed, replies: null, nextReplyIndex: 0 });
+const batch = (text = 'hello', replyAllowed = true): PendingBatch => ({ throughSeq: 1, messages: [{ seq: 1, messageId: 'm1', senderId: '123', senderName: 'A', time: 123, text, replyTo: null, trigger: replyAllowed, rawJson: '{}' }], replyAllowed, replies: null, nextReplyIndex: 0 });
+
+test('Pi task management validates the current requesting message and returns a persisted receipt',async()=>{
+ const changes:unknown[]=[];
+ const f=await fixture((_input,response,count)=>completion(response,count===1?[{name:'create_scheduled_task',arguments:{sourceMessageId:'m1',task:{name:'Morning',kind:'model',instructions:'Say good morning.',schedule:{kind:'cron',expression:'0 8 * * *'}}}}]:count===2?[{name:'send_message',arguments:{messages:[{type:'text',text:'Saved task example.'}]}}]:'done'));
+ try {
+  await f.runner.run(batch(),null,()=>{},new AbortController().signal,{send:async()=>({accepted:true})},undefined,{manage:async(request,id)=>{assert.ok(id);changes.push(request);return {id:'task-example',revision:1};}});
+  assert.equal(changes.length,1);assert.match(JSON.stringify(f.requests[1]),/task-example/);
+  assert.ok(f.requests[0]!.tools.some((tool:any)=>tool.function.name==='create_scheduled_task'));
+ }finally{await f.close();}
+});
+
+test('Pi rejects task management attributed to historical or background messages',async()=>{
+ let changes=0;
+ const f=await fixture((_input,response,count)=>completion(response,count===1?[{name:'delete_scheduled_task',arguments:{sourceMessageId:'old-message',taskId:'task-example',expectedRevision:1}}]:count===2?[{name:'send_message',arguments:{messages:[{type:'text',text:'Unable to delete.'}]}}]:'done'));
+ try {
+  await f.runner.run(batch(),null,()=>{},new AbortController().signal,{send:async()=>({accepted:true})},undefined,{manage:async()=>{changes++;return {};}});
+  assert.equal(changes,0);assert.match(JSON.stringify(f.requests[1]),/current reply-target/);
+ }finally{await f.close();}
+});
+
+test('resumed Pi sessions receive the current instance task creator policy in tool descriptions', async () => {
+ const f=await fixture((_input,response,count)=>completion(response,count%2===1?[{name:'send_message',arguments:{messages:[{type:'text',text:'Policy fixture reply.'}]}}]:'done'));
+ let session:string|null=null;
+ try {
+  for(const [index,taskCreatorOnly] of [true,false,true].entries()) {
+   const runner=new PiRunner({...f.options,taskCreatorOnly});
+   await runner.run(batch(),session,id=>{session=id;},new AbortController().signal,{send:async()=>({accepted:true})},undefined,{manage:async()=>({})});
+   const definitions=f.requests[index*2]!.tools.filter((tool:any)=>tool.function.name.endsWith('scheduled_task')||tool.function.name==='list_scheduled_tasks');
+   assert.equal(definitions.length,4);
+   for(const tool of definitions) {
+    if(taskCreatorOnly)assert.match(tool.function.description,/Only the creator/);
+    else assert.doesNotMatch(tool.function.description,/Only the creator|creator may|creator-only/);
+   }
+  }
+ }finally{await f.close();}
+});
+
+test('Pi scheduled execution uses a fresh session and preserves state/send effects before a later provider failure',async()=>{
+ const f=await fixture((_input,response,count)=>{
+  if(count===1||count===6)completion(response,[{name:'send_message',arguments:{messages:[{type:'text',text:'ordinary chat'}]}}]);
+  else if(count===3)completion(response,[{name:'save_task_state',arguments:{expectedVersion:0,data:{observation:'verified checkpoint'}}}]);
+  else if(count===4)completion(response,[{name:'send_message',arguments:{messages:[{type:'text',text:'scheduled result'}]}}]);
+  else if(count===5){response.writeHead(524,{'content-type':'application/json'});response.end(JSON.stringify({error:{message:'origin_response_timeout',type:'provider_error'}}));}
+  else completion(response,'done');
+ });
+ let saved:unknown;let sent=0;
+ try {
+  await f.run();const mainSession=f.session;
+  const input:import('../src/scheduled-contract.js').ScheduledInput={kind:'scheduled_task',task:{id:'task-example',name:'Report',instructions:'scheduled-only-instruction'},context:{taskState:{version:0,data:{},updatedAt:null,sourceRunId:null}},invocation:{runId:'scheduled-run',scheduledAt:new Date().toISOString(),startedAt:new Date().toISOString(),timezone:'Asia/Shanghai'}};
+  await assert.rejects(f.runner.runScheduled(input,{send:async()=>{sent++;return {accepted:true};},saveState:async(data)=>{saved=data;return {version:1,data,updatedAt:Date.now(),sourceRunId:'scheduled-run'};}},new AbortController().signal),/PI_EXECUTION_FAILED/);
+  assert.deepEqual(saved,{observation:'verified checkpoint'});assert.equal(sent,1);assert.equal(f.session,mainSession);
+  assert.doesNotMatch(JSON.stringify(f.requests[2]!.messages.filter((message:any)=>message.role!=='system')),/ordinary chat/);
+  const names=f.requests[2]!.tools.map((tool:any)=>tool.function.name);assert.ok(names.includes('save_task_state'));assert.ok(!names.includes('create_scheduled_task'));
+  await f.run(batch('follow-up'));assert.doesNotMatch(await readFile(mainSession!,'utf8'),/scheduled-only-instruction|verified checkpoint/);
+ }finally{await f.close();}
+});
 type Request = Record<string, any>;
+function userTexts(request: Request): string[] {
+  return (request.input ?? request.messages).filter((message: any) => message.role === 'user').map((message: any) =>
+    typeof message.content === 'string' ? message.content : message.content.filter((part: any) => ['text', 'input_text'].includes(part.type)).map((part: any) => part.text).join(''));
+}
+function storedUsers(text: string): Array<{ id: string; message: { content: Array<{ type: string; text?: string }> } }> {
+  return text.trim().split('\n').map(line => JSON.parse(line)).filter(entry => entry.type === 'message' && entry.message.role === 'user');
+}
 function completion(response: ServerResponse, content: string | Array<{ name: string; arguments: unknown }>, options: { finish?: string; tokens?: number; cached?: number } = {}) {
   response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
   const emit = (choices: unknown[], usage?: unknown) => response.write(`data: ${JSON.stringify({ id: 'test', object: 'chat.completion.chunk', created: 123, model: 'test-model', choices, ...(usage ? { usage } : {}) })}\n\n`);
@@ -56,8 +120,13 @@ test('Pi SDK persists a new session, executes accepted replies before final, res
     assert.match(JSON.stringify(f.requests[0]!.messages), /You are Test Persona/);
     const names = f.requests[0]!.tools.map((tool: any) => tool.function.name);
     assert.ok(names.includes('send_message')); assert.ok(names.includes('read')); assert.ok(!names.includes('bash')); assert.ok(!names.includes('write'));
-    await f.run(batch('second')); assert.equal(f.calls.length, 2); assert.equal(f.requests.length, 4);
+    const originalInput = userTexts(f.requests[0]!)[0]!;
+    const second = batch('second'); second.messages[0]!.messageId = 'm2';
+    await f.run(second); assert.equal(f.calls.length, 2); assert.equal(f.requests.length, 4);
     assert.match(JSON.stringify(f.requests[2]!.messages), /hello A/);
+    const resumedInputs = userTexts(f.requests[2]!);
+    assert.equal(resumedInputs[0], originalInput, 'Resuming must retain the exact prior user text for prefix reuse');
+    assert.deepEqual(resumedInputs.map(text => JSON.parse(text).replyTargetMessageIds), [['m1'], ['m2']]);
     assert.ok(!f.logs.join('\n').includes('test-secret-key'));
     const stored = await readFile(f.session!, 'utf8'); assert.match(stored, /"role":"user"/); assert.match(stored, /"toolName":"send_message"/);
   } finally { await f.close(); }
@@ -68,12 +137,72 @@ test('Pi append-only batches persist context without model requests or tools', a
   try {
     await f.run(batch('background', false)); assert.equal(f.requests.length, 0); assert.equal(f.calls.length, 0); assert.ok(f.session);
     const stored = await readFile(f.session!, 'utf8'); assert.match(stored, /background/); assert.ok(!stored.includes('"role":"assistant"'));
+    const input = JSON.parse(storedUsers(stored)[0]!.message.content[0]!.text!);
+    assert.deepEqual(Object.keys(input), ['messages', 'replyTargetMessageIds']);
+    assert.deepEqual(input.messages.map((message: { messageId: string }) => message.messageId), ['m1']);
+    assert.deepEqual(input.replyTargetMessageIds, [], 'Background-only input must not carry a pending reply target');
+  } finally { await f.close(); }
+});
+
+test('Pi keeps mixed background and multiple current targets ordered in both provider APIs', async t => {
+  for (const api of ['openai-responses', 'openai-completions'] as const) await t.test(api, async () => {
+    const path = api === 'openai-responses' ? '/v1/responses' : '/v1/chat/completions';
+    const f = await fixture((body, response, count) => respond(decodeModelCall(path, undefined, body), response,
+      count % 2 ? [{ name: 'send_message', arguments: { messages: [{ type: 'text', text: 'answer current targets' }] } }] : 'done'), { api });
+    try {
+      const input = batch(); input.throughSeq = 4;
+      input.messages = [
+        { ...input.messages[0]!, seq: 1, messageId: 'older-image', senderId: '101', senderName: 'Earlier speaker', time: 100, text: 'earlier topic', trigger: false },
+        { ...input.messages[0]!, seq: 2, messageId: 'question-a', senderId: '201', senderName: 'Speaker A', time: 3700, text: 'current question A', trigger: true },
+        { ...input.messages[0]!, seq: 3, messageId: 'context-between', senderId: '101', senderName: 'Earlier speaker', time: 3701, text: 'relevant clarification', replyTo: 'question-a', trigger: false },
+        { ...input.messages[0]!, seq: 4, messageId: 'question-b', senderId: '202', senderName: 'Speaker B', time: 3702, text: 'current question B', trigger: true },
+      ];
+      await f.run(input);
+      const serialized = userTexts(f.requests[0]!)[0]!; const prompt = JSON.parse(serialized);
+      assert.deepEqual(Object.keys(prompt), ['messages', 'replyTargetMessageIds']);
+      assert.deepEqual(prompt.messages, input.messages.map(({ messageId, senderId, senderName, time, text, replyTo }) => ({ messageId, senderId, senderName, time, text, replyTo })));
+      assert.deepEqual(prompt.replyTargetMessageIds, ['question-a', 'question-b']);
+      assert.ok(serialized.indexOf('"replyTargetMessageIds"') > serialized.indexOf('current question B'), 'Variable target IDs must follow all message content');
+      assert.doesNotMatch(serialized, /"trigger"|"replyAllowed"|"rawJson"/);
+      assert.deepEqual(decodeModelCall(path, undefined, f.requests[0]!).replyTargetMessageIds, ['question-a', 'question-b']);
+      const wire = f.requests[0]!;
+      const system = [wire.instructions ?? '', ...(wire.input ?? wire.messages).filter((message: any) => ['system', 'developer'].includes(message.role))
+        .map((message: any) => typeof message.content === 'string' ? message.content : JSON.stringify(message.content))].join('\n');
+      assert.match(system, /replyTargetMessageIds.*latest target list identifies the messages to answer now/s);
+      assert.match(system, /Do not treat older target lists as a backlog/);
+      assert.doesNotMatch(system, /question-a|question-b|older-image|context-between/, 'Per-turn target IDs must not rewrite the stable system prompt');
+    } finally { await f.close(); }
+  });
+});
+
+test('Pi resume preserves background envelopes and legacy user arrays without rewriting history', async () => {
+  const f = await fixture((_input, response, count) => completion(response, count % 2
+    ? [{ name: 'send_message', arguments: { messages: [{ type: 'text', text: 'current reply' }] } }] : 'done'));
+  try {
+    await f.run(batch('background context', false));
+    const first = storedUsers(await readFile(f.session!, 'utf8'))[0]!;
+    const legacyText = JSON.stringify([{ messageId: 'legacy-input', senderId: '301', senderName: 'Earlier speaker', time: 50, text: 'legacy background', replyTo: null }]);
+    const manager = SessionManager.open(f.session!, join(f.home, 'sessions'), f.workspace);
+    manager.appendMessage({ role: 'user', content: [{ type: 'text', text: legacyText }], timestamp: 50_000 });
+    const before = storedUsers(await readFile(f.session!, 'utf8'));
+    const current = batch('a current question'); current.messages[0]!.messageId = 'current-input';
+    await f.run(current);
+    const received = userTexts(f.requests[0]!);
+    assert.equal(received[0], first.message.content[0]!.text);
+    assert.equal(received[1], legacyText);
+    assert.deepEqual(JSON.parse(received[0]!).replyTargetMessageIds, []);
+    assert.deepEqual(JSON.parse(received[2]!).replyTargetMessageIds, ['current-input']);
+    const after = storedUsers(await readFile(f.session!, 'utf8'));
+    assert.deepEqual(after.slice(0, before.length), before, 'Persisted user entries must remain unchanged after resume');
   } finally { await f.close(); }
 });
 
 test('Pi final text alone never sends QQ and fails the required-reply turn', async () => {
   const f = await fixture((_input, response) => completion(response, 'This is final text.'));
-  try { await assert.rejects(f.run(), /PI_NO_REPLY/); assert.equal(f.calls.length, 0); assert.equal(f.requests.length, 1); }
+  try { await assert.rejects(f.run(), error => {
+    assert.match((error as Error).message, /PI_NO_REPLY/);
+    assert.notEqual((error as {modelFailure?:boolean}).modelFailure, true); return true;
+  }); assert.equal(f.calls.length, 0); assert.equal(f.requests.length, 1); }
   finally { await f.close(); }
 });
 
@@ -83,7 +212,10 @@ test('Pi does not retry HTTP errors or output length stops', async t => {
       if (failure === 'length') completion(response, 'too long', { finish: 'length' });
       else { response.writeHead(failure === 'overflow' ? 400 : 503, { 'content-type': 'application/json' }); response.end(JSON.stringify({ error: { message: failure === 'overflow' ? 'maximum context length exceeded' : 'temporarily unavailable', type: 'server_error' } })); }
     });
-    try { await assert.rejects(f.run(), /PI_EXECUTION_FAILED/); assert.equal(f.requests.length, 1); assert.equal(f.calls.length, 0); }
+    try { await assert.rejects(f.run(), error => {
+      assert.match((error as Error).message, /PI_EXECUTION_FAILED/);
+      assert.equal((error as {modelFailure?:boolean}).modelFailure === true, failure !== 'length'); return true;
+    }); assert.equal(f.requests.length, 1); assert.equal(f.calls.length, 0); }
     finally { await f.close(); }
   });
 });
@@ -92,9 +224,48 @@ test('Pi timeout and external cancellation end the child without leaving a model
   for (const reason of ['timeout', 'cancel']) await t.test(reason, async () => {
     const f = await fixture((_input, response) => { response.writeHead(200, { 'content-type': 'text/event-stream' }); response.write(': waiting\n\n'); }, { timeoutMs: reason === 'timeout' ? 800 : 15_000 });
     const abort = new AbortController(); const timer = reason === 'cancel' ? setTimeout(() => abort.abort(), 800) : undefined;
-    try { await assert.rejects(f.run(batch(), abort.signal), reason === 'timeout' ? /PI_TIMEOUT/ : /PI_ABORTED/); assert.ok(f.requests.length <= 1); }
+    try { await assert.rejects(f.run(batch(), abort.signal), error => {
+      assert.match((error as Error).message, reason === 'timeout' ? /PI_TIMEOUT/ : /PI_ABORTED/);
+      assert.equal((error as {modelFailure?:boolean}).modelFailure === true, reason === 'timeout'); return true;
+    }); assert.ok(f.requests.length <= 1); }
     finally { clearTimeout(timer); await f.close(); }
   });
+});
+
+test('Pi identifies provider connection, stream and content-filter failures in both APIs', async t => {
+  for (const api of ['openai-completions', 'openai-responses'] as const) {
+    for (const failure of ['connection', 'stream', 'content_filter']) await t.test(`${api}: ${failure}`, async () => {
+      const f = await fixture((_input, response) => {
+        if (failure === 'connection') { response.destroy(); return; }
+        if (failure === 'stream') {
+          response.writeHead(200, { 'content-type': 'text/event-stream' });
+          response.write(api === 'openai-responses'
+            ? 'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_failed_stream","status":"in_progress","output":[]}}\n\n'
+            : 'data: {"id":"failed-stream","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"partial"},"finish_reason":null}]}\n\n');
+          setTimeout(() => response.destroy(), 30); return;
+        }
+        if (api === 'openai-completions') { completion(response, '', {finish:'content_filter'}); return; }
+        response.writeHead(200, { 'content-type': 'text/event-stream' });
+        response.end('event: response.incomplete\ndata: {"type":"response.incomplete","response":{"id":"resp_filtered","status":"incomplete","output":[],"incomplete_details":{"reason":"content_filter"}}}\n\n');
+      }, {api});
+      try {
+        await assert.rejects(f.run(), error => {
+          assert.match((error as Error).message, /PI_EXECUTION_FAILED/);
+          assert.equal((error as {modelFailure?:boolean}).modelFailure, true); return true;
+        });
+        assert.equal(f.requests.length, 1); assert.equal(f.calls.length, 0);
+      } finally { await f.close(); }
+    });
+  }
+});
+
+test('Pi does not identify local session callbacks or invalid sessions as provider failures', async () => {
+  const f = await fixture((_input, response) => completion(response, 'unused'));
+  const localFailure = (error: unknown) => { assert.notEqual((error as {modelFailure?:boolean}).modelFailure, true); return true; };
+  try {
+    await assert.rejects(f.runner.run(batch(), null, () => { throw new Error('Session persistence fixture failed.'); }, new AbortController().signal), localFailure);
+    await assert.rejects(f.runner.run(batch(), join(f.dir, 'missing-session.jsonl'), () => {}, new AbortController().signal), localFailure);
+  } finally { await f.close(); }
 });
 
 test('Pi tool file permissions reject lexical and symlink escapes; write switches remove mutation tools', async () => {
@@ -122,7 +293,7 @@ test('Pi child and terminal environments never inherit model/console credentials
 
 test('Pi SDK keeps normal threshold compaction and manual compact adds no user message', async () => {
   const f = await fixture((input, response, count) => {
-    if (!input.tools?.length) completion(response, '## Goal\nRemember earlier context.\n## Progress\nReply accepted.');
+    if (!input.tools?.length) completion(response, '## Recent relevant topics\nEarlier chat.\n## People and references\nA (123).\n## Current facts and corrections\nNone.\n## Explicitly unfinished work\nNone.\n## Useful results and artifacts\nReply accepted; do not repeat.');
     else completion(response, count === 1 ? [{ name: 'send_message', arguments: { messages: [{ type: 'text', text: 'done' }] } }] : 'Internal completion.', { tokens: 8500 });
   }, { contextWindow: 12000, compactLimit: 8000, maxOutputTokens: 1000 });
   try {
@@ -184,8 +355,71 @@ test('Pi SDK passes incoming images only when model vision is enabled', async t 
       const user = f.requests[0]!.messages.find((message: any) => message.role === 'user');
       const imageCount = Array.isArray(user.content) ? user.content.filter((part: any) => part.type === 'image_url').length : 0;
       assert.equal(imageCount, supportsImages ? 1 : 0);
+      if (supportsImages) assert.equal(user.content.find((part: any) => part.type === 'image_url').image_url.url,
+        `data:image/png;base64,${image}`, 'Small images retain their original bytes.');
+      const prompt = JSON.parse(userTexts(f.requests[0]!)[0]!);
+      assert.deepEqual(prompt.replyTargetMessageIds, ['m1']);
+      assert.match(prompt.messages[0].images[0].path, /\.qq-images\/[a-f\d]{64}\.png$/);
     } finally { await f.close(); }
   });
+});
+
+test('Pi compresses incoming image bytes before the legacy input is persisted', async () => {
+  const original = largeModelImage();
+  const f = await fixture((_input, response, count) => completion(response, count % 2 ? [
+    { name: 'send_message', arguments: { messages: [{ type: 'text', text: 'Image received.' }] } },
+  ] : 'done'), { imageFetch: async () => new Response(new Uint8Array(original)) });
+  try {
+    const input = batch();
+    input.messages[0]!.rawJson = JSON.stringify({ message: [
+      { type: 'image', data: { url: 'https://example.invalid/image.png' } },
+    ] });
+    await f.run(input);
+    const user = f.requests[0]!.messages.find((message: any) => message.role === 'user');
+    const images = user.content.filter((part: any) => part.type === 'image_url');
+    assert.equal(images.length, 1);
+    await assertModelImage(images[0].image_url.url);
+    assert.ok(images[0].image_url.url.length < original.toString('base64').length);
+    const envelope = JSON.parse(userTexts(f.requests[0]!)[0]!);
+    assert.deepEqual(await readFile(envelope.messages[0].images[0].path), original,
+      'Compression preserves the cached original image.');
+    const session = (await readFile(f.session!, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+    const saved = session.find(entry => entry.type === 'message' && entry.message.role === 'user')
+      .message.content.find((part: any) => part.type === 'image');
+    assert.equal(`data:${saved.mimeType};base64,${saved.data}`, images[0].image_url.url);
+  } finally { await f.close(); }
+});
+
+test('Pi omits an undecodable legacy image while preserving the user text and cached original', async () => {
+  const original = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  const f = await fixture((_input, response, count) => completion(response, count % 2 ? [
+    { name: 'send_message', arguments: { messages: [{ type: 'text', text: 'The image is unavailable, but the message was received.' }] } },
+  ] : 'done'), { imageFetch: async () => new Response(new Uint8Array(original)) });
+  try {
+    const text = 'Please answer this text even if the attached image is unavailable.';
+    const input = batch(text);
+    input.messages[0]!.rawJson = JSON.stringify({ message: [
+      { type: 'text', data: { text } },
+      { type: 'image', data: { url: 'https://example.invalid/corrupt-image.png' } },
+    ] });
+    await f.run(input);
+    assert.equal(f.calls.length, 1, 'An undecodable image must not prevent a normal reply.');
+    assert.equal(f.requests.length, 2);
+    for (const request of f.requests) {
+      assert.doesNotMatch(JSON.stringify(request.messages), /data:image\//);
+      const envelope = JSON.parse(userTexts(request)[0]!);
+      assert.ok(envelope.messages[0].text.startsWith(text), 'The full user text must survive alongside attachment markers.');
+      const image = envelope.messages[0].images[0];
+      assert.equal(image.status, 'failed');
+      assert.equal(image.error, 'Image content is unavailable for this input.');
+      assert.deepEqual(await readFile(image.path), original, 'Failed preparation must preserve the cached original bytes.');
+    }
+    const stored = storedUsers(await readFile(f.session!, 'utf8'))[0]!.message.content;
+    assert.equal(stored.filter((part: any) => part.type === 'image').length, 0);
+    const saved = JSON.parse(stored.find((part: any) => part.type === 'text')!.text!);
+    assert.ok(saved.messages[0].text.startsWith(text));
+    assert.equal(saved.messages[0].images[0].status, 'failed');
+  } finally { await f.close(); }
 });
 
 test('Pi SDK uses bash with filtered environment and a cancelled turn kills shell descendants', async () => {
@@ -313,7 +547,12 @@ test('Pi threshold summary failure ends the turn without another generation or r
   }, { contextWindow: 12000, compactLimit: 8000, maxOutputTokens: 1000 });
   try {
     await f.run(batch('old context '.repeat(3000), false)); await f.run(batch('more context '.repeat(3000), false));
-    await assert.rejects(f.run(), /PI_EXECUTION_FAILED/);
+    await assert.rejects(f.run(), error => {
+      assert.match((error as Error).message, /PI_EXECUTION_FAILED/);
+      assert.match((error as Error).message, /503/);
+      assert.match((error as Error).message, /summary unavailable/);
+      assert.equal((error as {modelFailure?:boolean}).modelFailure, true); return true;
+    });
     assert.deepEqual(kinds, ['agent', 'summary']); assert.equal(f.calls.length, 1);
     assert.equal(f.events.filter(event => event.type === 'compact.failed').length, 1);
   } finally { await f.close(); }
@@ -326,7 +565,8 @@ test('Pi requires explicit model and base URL for generation and compact, while 
       await f.run(batch('background', false)); assert.ok(f.session);
       const prior = await readFile(f.session!, 'utf8');
       const configurationError = (error: unknown) => {
-        assert.equal((error as { code?: string }).code, 'PI_CONFIGURATION_REQUIRED'); return true;
+        assert.equal((error as { code?: string }).code, 'PI_CONFIGURATION_REQUIRED');
+        assert.notEqual((error as {modelFailure?:boolean}).modelFailure, true); return true;
       };
       await assert.rejects(f.run(), configurationError);
       await assert.rejects(f.runner.compact(f.session!, new AbortController().signal), configurationError);

@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { assertAccepted, busyReply, deferred, dockerImage, piFixture, respond, sendReply } from './fixtures/pi-e2e.js';
+import { modelErrorReply } from '../src/processor.js';
+const providerErrorReply = modelErrorReply(new Error('PI_EXECUTION_FAILED: bridge API error (503): {"type":"server_error"}'));
 
 test('Pi 长任务中途回复、多次工具调用、final 不重复发送，失败批次只尝试一次', { timeout: dockerImage ? 90_000 : 60_000 }, async t => {
   const result = deferred(); const finish = deferred(); t.after(() => { result.resolve(); finish.resolve(); });
@@ -32,7 +34,10 @@ test('Pi 长任务中途回复、多次工具调用、final 不重复发送，�
   assert.equal(f.read('1001', db => db.prepare('SELECT cursor FROM instance_state WHERE id=1').get()?.cursor), 0);
   f.send('follow-up', 'follow-up', true, '1001', '502');
   await f.waitFor(() => f.outgoing.length === 2, '运行中应接收新消息并发出等待提示');
-  assert.equal(f.outgoing[1]?.params.message[0]?.data.text, busyReply);
+  assert.deepEqual(f.outgoing[1]?.params.message, [
+    { type: 'reply', data: { id: 'follow-up' } },
+    { type: 'text', data: { text: busyReply } },
+  ]);
   assert.equal(f.calls.filter(call => !call.results.length).length, 1, '不能并发执行下一批');
   result.resolve();
   await f.waitFor(() => f.outgoing.length === 3 && f.calls.length === 3, '结束前应再次发出带艾特的结果');
@@ -52,19 +57,51 @@ test('Pi 长任务中途回复、多次工具调用、final 不重复发送，�
     f.send(failureId);
     await f.waitFor(() => f.calls.some(call => call.batch.at(-1)?.messageId === failureId && call.results.length > 0), '真实 Pi 应收到 accepted=true，而不是投递状态');
     cursor++; await f.waitFor(() => f.complete(cursor), '失败批次应结束并推进游标');
-    assert.equal(f.outgoing.length, before + 1, '发送及媒体准备失败都不补发；下一有效分段仍应发送');
-    assert.equal(f.outgoing.at(-1)?.params.message[0]?.data.text, failure === 'model' ? 'before-model-exit' : failure === 'image' ? 'after-missing-image' : failure === 'napcat' ? 'rejected-private-fixture' : 'unconfirmed-private-fixture');
-    if (failure === 'ack') await f.waitFor(() => f.connections === 2 && f.napcat.clients.size === 1, '回执超时后应重新连接');
+    const expected = failure === 'model' ? 2 : 1;
+    assert.equal(f.outgoing.length, before + expected, '模型失败额外发送一次提示；发送及媒体准备失败保持原有行为');
+    assert.equal(f.outgoing[before]?.params.message[0]?.data.text, failure === 'model' ? 'before-model-exit' : failure === 'image' ? 'after-missing-image' : failure === 'napcat' ? 'rejected-private-fixture' : 'unconfirmed-private-fixture');
+    if (failure === 'model') assert.equal(f.outgoing.at(-1)?.params.message[0]?.data.text, providerErrorReply);
+    if (failure === 'ack') {
+      assert.equal(f.connections, 1, '单次回执超时应保留共享连接');
+      assert.equal(f.napcat.clients.size, 1);
+    }
     const healthy = `healthy-${failure}`; f.send(healthy); cursor++;
     await f.waitFor(() => f.complete(cursor), '下一批应继续处理且不重放前一批');
-    assert.equal(f.outgoing.length, before + 2); assert.equal(f.outgoing.at(-1)?.params.message[0]?.data.text, healthy);
+    assert.equal(f.outgoing.length, before + expected + 1); assert.equal(f.outgoing.at(-1)?.params.message[0]?.data.text, healthy);
   }
   const initial = f.calls.filter(call => call.results.length === 0).map(call => call.batch.at(-1)?.messageId);
   assert.deepEqual(initial, ['task', 'follow-up', ...['model', 'image', 'napcat', 'ack'].flatMap(kind => [`failure-${kind}`, `healthy-${kind}`])]);
   assert.equal(f.calls.filter(call => call.batch.at(-1)?.messageId === 'failure-model').length, 2, '供应商失败不能自动 HTTP 重试或重新生成');
+  assert.ok(f.calls.every(call => !JSON.stringify(call.body).includes(providerErrorReply)), '错误提示不进入后续模型输入');
   const logs = bridge.logs.join('\n');
   assert.match(logs, /processor\.batch\.failed .*replayed=false/);
   assert.match(logs, /processor\.reply\.failed .*stage="image_prepare"/);
   assert.match(logs, /processor\.reply\.failed .*status="unconfirmed"/);
   assert.doesNotMatch(logs, /pi-e2e-private-token|fake-provider-key-|找到关键限制|比较结果已经确认|unconfirmed-private-fixture|rejected-private-fixture|missing-private-fixture/);
+});
+
+test('initial model request failure sends one notice without adding it to chat context', { timeout: dockerImage ? 60_000 : 30_000 }, async t => {
+  const f = await piFixture(t, async (call, response) => {
+    if (call.batch.at(-1)?.messageId === 'model-error') {
+      response.writeHead(503, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ error: { message: 'fixture provider unavailable', type: 'server_error' } })); return;
+    }
+    if (call.results.length) respond(call, response, 'Done.');
+    else sendReply(call, response, [{ type: 'text', text: 'healthy follow-up' }]);
+  });
+  await f.start(); await f.waitFor(() => f.napcat.clients.size === 1, 'Worker 应连接模拟 NapCat');
+  f.send('model-error');
+  await f.waitFor(() => f.complete(1), '模型报错后应提示并结束批次');
+  assert.equal(f.calls.length, 1);
+  assert.deepEqual(f.outgoing.map(message => message.params.message), [[{ type: 'text', data: { text: providerErrorReply } }]]);
+  assert.match(providerErrorReply, /503/);
+  f.read('1001', db => {
+    for (const [table, column] of [['messages', 'text'], ['chat_messages', 'text'], ['outgoing_history', 'text'], ['console_events', 'payload_json']])
+      assert.equal(db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE ${column} LIKE ?`).get(`%${providerErrorReply}%`)?.n, 0, table);
+  });
+  f.send('follow-up');
+  await f.waitFor(() => f.complete(2), '后续消息应正常处理');
+  assert.equal(f.outgoing.length, 2);
+  assert.equal(f.outgoing[1]?.params.message[0]?.data.text, 'healthy follow-up');
+  assert.ok(f.calls.every(call => !JSON.stringify(call.body).includes(providerErrorReply)));
 });

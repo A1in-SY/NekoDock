@@ -24,6 +24,8 @@ test('Docker media proxy is restricted to labeled bot regular files and validate
  await new Promise<void>(resolve=>server.listen(socketPath,resolve));const docker=new DockerClient({socketPath,image:'unused',network:'unused',consoleUrl:'unused'});
  try{
   await assert.rejects(docker.media(id,'/etc/passwd'),/路径/);const media=await docker.media(id,`/data/console-media/${filename}`);assert.equal(media.mime,'image/png');assert.deepEqual(media.bytes,bytes);
+  assert.deepEqual((await docker.media(id,`/data/workspace/.qq-images/${filename}`)).bytes,bytes);
+  for(const path of [`/data/workspace/.qq-images/../${filename}`,`/data/workspace/other/${filename}`,`/data/workspace/.qq-images/${'a'.repeat(64)}.mp3`])await assert.rejects(docker.media(id,path),/路径/);
   type='2';await assert.rejects(docker.media(id,`/data/console-media/${filename}`),/普通文件/);
   type='0';mimeValid=false;await assert.rejects(docker.media(id,`/data/console-media/${filename}`),/格式/);
   label='someone-else';await assert.rejects(docker.media(id,`/data/console-media/${filename}`),/不属于/);

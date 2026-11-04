@@ -41,6 +41,7 @@ test('/new changes conversation and explicitly moves messages received after the
   const current=store.recorder.conversationId;assert.notEqual(current,old);assert.equal(store.getSessionId(),null);
   const moved=store.recorder.pending(100).find(event=>event.type==='conversation.messages_moved')!;
   assert.equal(moved.conversationId,current);assert.deepEqual(moved.payload.messageIds,['2']);
+  assert.ok(moved.seq<store.recorder.pending(100).find(event=>event.type==='conversation.started'&&event.conversationId===current)!.seq);
   assert.equal(store.recorder.pending(100).filter(event=>event.type==='message.received').length,2);
   store.insert({...message('compact'),command:'compact',text:'/compact'});
   assert.equal(store.recorder.conversationId,current);

@@ -1,9 +1,10 @@
-# The control plane contains Node.js and the built Web UI; CLI tools live in workers.
+# The control plane serves the API and Web UI; platform download tools run separately.
 FROM node:24.16.0-bookworm-slim AS build
 WORKDIR /app
 COPY package.json package-lock.json tsconfig.json ./
 RUN npm ci --ignore-scripts
 COPY src ./src
+COPY scripts ./scripts
 COPY web ./web
 RUN npm run build:all && npm prune --omit=dev --ignore-scripts
 

@@ -3,10 +3,18 @@ import WebSocket from 'ws';
 import { isMp3Snapshot } from './audio.js';
 import { isSegmentMessage } from './messages.js';
 import { logEvent } from './logging.js';
+import type { NapcatOutgoingMessage } from './transport-protocol.js';
+import { INCOMING_IMAGE_MAX_COUNT } from './incoming-image-contract.js';
+import { parseCoreCommand } from './plugins/core/commands.js';
 import type { BridgeCommand, IncomingMessage, Logger, MessageSegment, MessageSender, SendReceipt, Target } from './types.js';
 
 type JsonObject = Record<string, unknown>;
 interface Segment { type: string; data: JsonObject }
+
+function textSegments(text: string, replyTo?: string): Segment[] {
+  if (replyTo !== undefined && (typeof replyTo !== 'string' || !replyTo)) throw new Error('Invalid outgoing reply message ID');
+  return [...(replyTo === undefined ? [] : [{ type: 'reply', data: { id: replyTo } }]), { type: 'text', data: { text } }];
+}
 
 function sendFailure(error: Error, code: string, deliveryStatus: 'failed' | 'unconfirmed', retcode?: number) {
   return Object.assign(error, { code, deliveryStatus, ...(retcode !== undefined ? { retcode } : {}) });
@@ -14,16 +22,24 @@ function sendFailure(error: Error, code: string, deliveryStatus: 'failed' | 'unc
 
 const sendFailureCodes: Record<string, string> = {
   api_rejected: 'NAPCAT_API_REJECTED', response_timeout: 'NAPCAT_RESPONSE_TIMEOUT',
+  send_receipt_timeout: 'NAPCAT_SEND_RECEIPT_TIMEOUT',
   aborted: 'NAPCAT_SEND_CANCELLED', disconnected: 'NAPCAT_CONNECTION_LOST',
   stopped: 'NAPCAT_CLIENT_STOPPED', send_failed: 'NAPCAT_SEND_FAILED',
 };
+
+function sendReceiptTimedOut(action: string, packet: JsonObject): boolean {
+  if (action !== 'send_group_msg' && action !== 'send_private_msg') return false;
+  // A send can reach QQ before NapCat times out waiting for its local receipt event.
+  const timeout = /\bTimeout:\s*NTEvent\s+serviceAndMethod:\s*NodeIKernelMsgService\/sendMsg\s+ListenerName:\s*NodeIKernelMsgListener\/onMsgInfoListUpdate(?:\s|$)/u;
+  return [packet.message, packet.wording].some(detail => typeof detail === 'string' && timeout.test(detail));
+}
 
 function object(value: unknown): JsonObject | null {
   return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as JsonObject : null;
 }
 
 function identifier(value: unknown): string | null {
-  if (typeof value === 'string' && value.length > 0) return value;
+  if (typeof value === 'string' && value.length > 0 && value.length <= 200) return value;
   return typeof value === 'number' && Number.isSafeInteger(value) ? String(value) : null;
 }
 
@@ -38,7 +54,7 @@ function decodeEntities(value: string): string {
   })[entity] ?? entity);
 }
 
-function parseSegments(value: unknown): Segment[] | null {
+export function parseSegments(value: unknown): Segment[] | null {
   if (Array.isArray(value)) {
     const segments: Segment[] = [];
     for (const item of value) {
@@ -66,7 +82,7 @@ function parseSegments(value: unknown): Segment[] | null {
   return segments;
 }
 
-function isSticker(segment: Segment): boolean {
+export function isSticker(segment: Segment): boolean {
   return ['face', 'mface', 'bface', 'sface'].includes(segment.type)
     || (segment.type === 'image' && (
       string(segment.data.sub_type ?? segment.data.subtype) === '1'
@@ -74,6 +90,12 @@ function isSticker(segment: Segment): boolean {
       || string(segment.data.emoji_id).length > 0
       || string(segment.data.emoji_package_id).length > 0
     ));
+}
+
+export function portableImageSource(segment: Segment): string | null {
+  const {url, file} = segment.data;
+  return httpSource(url) ?? httpSource(file)
+    ?? (typeof file === 'string' && file.startsWith('base64://') ? file : null);
 }
 
 function httpSource(value: unknown): string | null {
@@ -90,13 +112,14 @@ export function imageSources(rawJson: string): string[] {
   try { event = object(JSON.parse(rawJson)); } catch { return []; }
   const segments = parseSegments(event?.message);
   if (!segments) return [];
-  return segments.flatMap(segment => {
-    if (segment.type !== 'image' || isSticker(segment)) return [];
-    const { url, file } = segment.data;
-    const source = httpSource(url) ?? httpSource(file)
-      ?? (typeof file === 'string' && file.startsWith('base64://') ? file : null);
-    return source === null ? [] : [source];
-  });
+  const sources: string[] = [];
+  for (const segment of segments) {
+    if (segment.type !== 'image' || isSticker(segment)) continue;
+    const source = portableImageSource(segment);
+    if (source !== null) sources.push(source);
+    if (sources.length >= INCOMING_IMAGE_MAX_COUNT) break;
+  }
+  return sources;
 }
 
 function hasContent(segment: Segment): boolean {
@@ -108,10 +131,7 @@ function bridgeCommand(segments: Segment[], selfId: string | null): BridgeComman
   if (segments.some(segment => segment.type !== 'text' && segment.type !== 'reply'
     && !(segment.type === 'at' && selfId !== null && identifier(segment.data.qq) === selfId))) return undefined;
   const text = segments.filter(segment => segment.type === 'text').map(segment => string(segment.data.text)).join('').trim();
-  if (text === '/new') return 'new';
-  if (text === '/compact') return 'compact';
-  if (text === '/help') return 'help';
-  return undefined;
+  return parseCoreCommand(text);
 }
 
 function segmentText(segment: Segment): string {
@@ -120,6 +140,8 @@ function segmentText(segment: Segment): string {
   if (type === 'at') return `[@${string(data.qq)}]`;
   if (type === 'reply') return `[引用 ${string(data.id ?? data.seq)}]`;
   if (isSticker(segment)) return `[表情包 ${string(data.summary ?? data.id ?? data.emoji_id ?? data.file)}]`;
+  if (type === 'image') return '[图片]';
+  if (type === 'forward' || type === 'node') return '[聊天记录]';
   const labels: Record<string, string> = {
     image: '图片', record: '语音', video: '视频', file: '文件', forward: '转发',
     json: 'JSON', xml: 'XML', markdown: 'Markdown', dice: '骰子', rps: '猜拳',
@@ -127,6 +149,15 @@ function segmentText(segment: Segment): string {
   const detail = [data.name ?? data.summary ?? data.title, data.url ?? data.file ?? data.id ?? data.text ?? data.data]
     .map(string).filter(Boolean).join(' ');
   return `[${labels[type] ?? type}${detail ? ` ${detail}` : ''}]`;
+}
+
+/** Presentation and model input use stable attachments rather than signed image URLs. */
+export function incomingMessageText(rawJson: string): string | null {
+  try {
+    const event = object(JSON.parse(rawJson));
+    const segments = parseSegments(event?.message);
+    return segments ? segments.map(segmentText).join('') : null;
+  } catch { return null; }
 }
 
 /** Preserve every matching incoming message; trigger only controls whether a batch may answer. */
@@ -179,11 +210,13 @@ export interface NapCatClientOptions {
   reconnectMs: number;
   actionTimeoutMs: number;
   onEvent: (event: unknown) => void;
+  onConnectionChange?: (connected: boolean) => void;
 }
 
 interface PendingAction {
+  action: string;
   socket: WebSocket;
-  finish: (error?: Error, reason?: string, retcode?: number, messageId?: string) => void;
+  finish: (error?: Error, reason?: string, retcode?: number, data?: unknown) => void;
 }
 
 interface ConnectionWaiter {
@@ -224,6 +257,7 @@ export class NapCatClient implements MessageSender {
     for (const pending of [...this.pending.values()]) pending.finish(new Error('NapCat client stopped'), 'stopped');
     const socket = this.socket;
     this.socket = null;
+    this.options.onConnectionChange?.(false);
     if (!socket || socket.readyState === WebSocket.CLOSED) return;
     await new Promise<void>(resolve => {
       socket.once('close', () => resolve());
@@ -231,12 +265,16 @@ export class NapCatClient implements MessageSender {
     });
   }
 
-  async sendText(text: string, signal: AbortSignal): Promise<SendReceipt> {
-    return this.sendSegments([{ type: 'text', data: { text } }], signal);
+  async sendText(text: string, signal: AbortSignal, replyTo?: string): Promise<SendReceipt> {
+    return this.sendSegments(textSegments(text, replyTo), signal);
   }
 
   async sendImage(file: string, signal: AbortSignal): Promise<SendReceipt> {
     return this.sendSegments([{ type: 'image', data: { file, sub_type: 0 } }], signal);
+  }
+
+  async sendVideo(file: string, signal: AbortSignal): Promise<SendReceipt> {
+    return this.sendSegments([{ type: 'video', data: { file } }], signal);
   }
 
   async sendVoice(file: string, signal: AbortSignal): Promise<SendReceipt> {
@@ -252,14 +290,50 @@ export class NapCatClient implements MessageSender {
       : { type: 'text', data: { text: segment.text } }), signal);
   }
 
-  private async sendSegments(segments: Segment[], signal: AbortSignal): Promise<SendReceipt> {
-    const started = Date.now();
-    const deadline = Date.now() + this.options.actionTimeoutMs;
-    const { target, logger } = this.options;
+  /** Shared gateways choose the destination from their authenticated instance binding. */
+  async sendTo(target: Target, message: NapcatOutgoingMessage, signal: AbortSignal, deadline?: number): Promise<SendReceipt> {
+    let segments: Segment[];
+    if (message.kind === 'text') segments = textSegments(message.text, message.replyTo);
+    else if (message.kind === 'image') segments = [{ type: 'image', data: { file: message.file, sub_type: 0 } }];
+    else if (message.kind === 'video') segments = [{ type: 'video', data: { file: message.file } }];
+    else if (message.kind === 'voice') {
+      if (!isMp3Snapshot(message.file)) throw new Error('Invalid outgoing voice snapshot');
+      segments = [{ type: 'record', data: { file: message.file } }];
+    } else {
+      if (target.type !== 'group' || !isSegmentMessage({ type: 'message', segments: message.segments })) throw new Error('Invalid outgoing message segments');
+      segments = message.segments.map(segment => segment.type === 'at'
+        ? { type: 'at', data: { qq: segment.userId } } : { type: 'text', data: { text: segment.text } });
+    }
+    return this.sendSegments(segments, signal, target, deadline);
+  }
+
+  async inspect(action: 'get_status' | 'get_login_info', signal: AbortSignal): Promise<unknown> {
+    return this.request(action, {}, signal, Date.now() + this.options.actionTimeoutMs, 0);
+  }
+
+  async getForwardMessage(resourceId: string, signal: AbortSignal, deadline: number): Promise<unknown> {
+    if (!resourceId || resourceId.length > 200) throw new Error('Invalid forward resource.');
+    return this.request('get_forward_msg', { message_id: resourceId }, signal, deadline, 0);
+  }
+
+  async downloadMediaProbe(url: string, signal: AbortSignal): Promise<unknown> {
+    return this.request('download_file', { url, thread_count: 1, headers: [] }, signal, Date.now() + this.options.actionTimeoutMs, 0);
+  }
+
+  private async sendSegments(segments: Segment[], signal: AbortSignal, target = this.options.target, deadline = Date.now() + this.options.actionTimeoutMs): Promise<SendReceipt> {
     const action = target.type === 'group' ? 'send_group_msg' : 'send_private_msg';
+    const data = await this.request(action, { [target.type === 'group' ? 'group_id' : 'user_id']: target.id, message: segments }, signal, deadline, segments.length);
+    const messageId = object(data)?.message_id;
+    return typeof messageId === 'string' || typeof messageId === 'number' ? { messageId: String(messageId) } : {};
+  }
+
+  private async request(action: string, params: JsonObject, signal: AbortSignal, deadline: number, segmentCount: number): Promise<unknown> {
+    const started = Date.now();
+    const { logger } = this.options;
     let socket: WebSocket;
     try {
-      socket = await this.waitForConnection(signal, this.options.actionTimeoutMs);
+      socket = await this.waitForConnection(signal, Math.max(0, deadline - Date.now()));
+      if (Date.now() >= deadline) throw new Error('NapCat send deadline expired');
       if (signal.aborted) throw aborted();
       if (!this.running || socket !== this.socket || socket.readyState !== WebSocket.OPEN) {
         throw new Error('NapCat connection lost before send');
@@ -270,41 +344,37 @@ export class NapCatClient implements MessageSender {
       logEvent(logger, 'warn', 'napcat.api.failed', {
         action, stage: 'connection', reason: signal.aborted ? 'aborted' : this.running ? 'unavailable' : 'stopped',
         error_code: failure.code, delivery_status: failure.deliveryStatus,
-        segment_count: segments.length, pending_count: this.pending.size, duration_ms: Date.now() - started,
+        segment_count: segmentCount, pending_count: this.pending.size, duration_ms: Date.now() - started,
       });
       throw failure;
     }
     const echo = randomUUID();
     const request = JSON.stringify({
       action,
-      params: {
-        [target.type === 'group' ? 'group_id' : 'user_id']: target.id,
-        message: segments,
-      },
+      params,
       echo,
     });
-    return new Promise<SendReceipt>((resolve, reject) => {
+    return new Promise<unknown>((resolve, reject) => {
       const onAbort = () => finish(aborted(), 'aborted');
       const timer = setTimeout(() => {
         finish(new Error('NapCat API response timed out; send outcome unknown'), 'response_timeout');
-        socket.terminate();
       }, Math.max(0, deadline - Date.now()));
-      const finish = (error?: Error, reason?: string, retcode?: number, messageId?:string) => {
+      const finish = (error?: Error, reason?: string, retcode?: number, data?: unknown) => {
         if (!this.pending.delete(echo)) return;
         clearTimeout(timer);
         signal.removeEventListener('abort', onAbort);
         const failure = error ? sendFailure(error, sendFailureCodes[reason ?? ''] ?? 'NAPCAT_SEND_UNCONFIRMED',
           reason === 'api_rejected' ? 'failed' : 'unconfirmed', retcode) : undefined;
-        logEvent(logger, error ? 'warn' : 'info', reason === 'response_timeout' ? 'napcat.api.timeout' : error ? 'napcat.api.failed' : 'napcat.api.succeeded', {
-          echo, action, stage: 'send', reason, retcode, segment_count: segments.length,
+        logEvent(logger, error ? 'warn' : 'info', reason === 'response_timeout' || reason === 'send_receipt_timeout' ? 'napcat.api.timeout' : error ? 'napcat.api.failed' : 'napcat.api.succeeded', {
+          echo, action, stage: 'send', reason, retcode, segment_count: segmentCount,
           error_code: failure?.code, delivery_status: failure?.deliveryStatus,
           pending_count: this.pending.size, duration_ms: Date.now() - started,
         });
-        if (failure) reject(failure); else resolve(messageId?{messageId}:{});
+        if (failure) reject(failure); else resolve(data);
       };
-      this.pending.set(echo, { socket, finish });
+      this.pending.set(echo, { action, socket, finish });
       signal.addEventListener('abort', onAbort, { once: true });
-      logEvent(logger, 'info', 'napcat.api.send_started', { echo, action, segment_count: segments.length, pending_count: this.pending.size });
+      logEvent(logger, 'info', 'napcat.api.send_started', { echo, action, segment_count: segmentCount, pending_count: this.pending.size });
       try {
         socket.send(request, error => {
           if (error) finish(new Error('NapCat API send failed; send outcome unknown'), 'send_failed');
@@ -361,6 +431,7 @@ export class NapCatClient implements MessageSender {
         duration_ms: Date.now() - started, pending_count: this.pending.size, waiter_count: this.waiters.size,
       });
       for (const waiter of [...this.waiters]) waiter.resolve(socket);
+      this.options.onConnectionChange?.(true);
     });
     socket.on('message', data => {
       if (!this.running || this.socket !== socket) return;
@@ -378,11 +449,14 @@ export class NapCatClient implements MessageSender {
       if (typeof packet.echo === 'string') {
         const pending = this.pending.get(packet.echo);
         if (pending?.socket === socket) {
-          pending.finish(packet.status === 'ok' && packet.retcode === 0
-            ? undefined : new Error(`NapCat API request failed (retcode ${typeof packet.retcode === 'number' ? packet.retcode : 'unknown'})`),
-          packet.status === 'ok' && packet.retcode === 0 ? undefined : 'api_rejected',
+          const succeeded = packet.status === 'ok' && packet.retcode === 0;
+          const receiptTimeout = !succeeded && sendReceiptTimedOut(pending.action, packet);
+          pending.finish(succeeded ? undefined : receiptTimeout
+            ? new Error('NapCat send receipt timed out; send outcome unknown')
+            : new Error(`NapCat API request failed (retcode ${typeof packet.retcode === 'number' ? packet.retcode : 'unknown'})`),
+          succeeded ? undefined : receiptTimeout ? 'send_receipt_timeout' : 'api_rejected',
           typeof packet.retcode === 'number' && Number.isFinite(packet.retcode) ? packet.retcode : undefined,
-          typeof object(packet.data)?.message_id==='number'||typeof object(packet.data)?.message_id==='string'?String(object(packet.data)!.message_id):undefined);
+          packet.data);
           return;
         }
       }
@@ -406,6 +480,7 @@ export class NapCatClient implements MessageSender {
       }
       if (this.socket !== socket) return;
       this.socket = null;
+      this.options.onConnectionChange?.(false);
       if (this.running) this.scheduleReconnect();
     });
   }

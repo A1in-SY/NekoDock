@@ -21,12 +21,13 @@ const queued: IncomingMessage = {
 function fixture(t: TestContext, options: {
   target?: Target;
   probability?: number;
-  sendText?: (text: string, signal: AbortSignal) => Promise<void>;
+  sendText?: (text: string, signal: AbortSignal, replyTo?: string) => Promise<void>;
 } = {}) {
   const selectedTarget = options.target ?? target;
   const store = new BridgeStore(':memory:', selectedTarget);
   const controller = new AbortController();
   const sent: string[] = [];
+  const replyIds: Array<string | undefined> = [];
   const logs: string[] = [];
   let notifications = 0;
   let randomCalls = 0;
@@ -34,16 +35,19 @@ function fixture(t: TestContext, options: {
   const inputOptions = {
     target: selectedTarget, randomReplyProbability: options.probability ?? 1, store,
     processor: { notify() { notifications++; } },
-    sender: { sendText: options.sendText ?? (async (value: string, signal: AbortSignal) => {
+    sender: { sendText(value: string, signal: AbortSignal, replyTo?: string) {
+      replyIds.push(replyTo);
+      if (options.sendText) return options.sendText(value, signal, replyTo);
       assert.equal(signal, controller.signal);
       sent.push(value);
-    }) },
+      return Promise.resolve();
+    } },
     logger: { info: (value: string) => logs.push(value), warn: (value: string) => logs.push(value), error: (value: string) => logs.push(value) },
     signal: controller.signal,
     random: () => { randomCalls++; return 0.1; },
   };
   return {
-    store, sent, logs, inputOptions,
+    store, sent, replyIds, logs, inputOptions,
     handle: (input: unknown) => handleIncomingEvent(input, inputOptions),
     get notifications() { return notifications; },
     get randomCalls() { return randomCalls; },
@@ -88,13 +92,14 @@ test('idle group messages preserve normal probability sampling and mention repli
   assert.equal(idleMention.store.openOrCreateBatch(50)?.messages[0]?.trigger, true);
 });
 
-test('busy direct mention queues the actual message and sends the fixed text outside stored conversation', async t => {
+test('busy direct mention quotes the triggering message and keeps the notice outside stored conversation', async t => {
   const f = fixture(t);
   f.store.insert(queued);
   const input = event(2, { message: '[CQ:reply,id=42][CQ:at,qq=999]private-incoming-body' });
   f.handle(input);
   await nextTurn();
   assert.deepEqual(f.sent, ['我正在想上面的消息怎么回，你等会哦']);
+  assert.deepEqual(f.replyIds, ['2'], '引用本次艾特消息，而不是它引用的消息 42');
   const messages = f.store.openOrCreateBatch(50)!.messages;
   assert.equal(messages.length, 2);
   assert.equal(messages[1]?.trigger, true);
@@ -116,6 +121,7 @@ test('busy mention replays, other groups, own messages and escaped mentions neve
   f.handle(event(6, { message: '&#91;CQ:at,qq=999&#93;' }));
   await nextTurn();
   assert.deepEqual(f.sent, [busyReply]);
+  assert.deepEqual(f.replyIds, ['2']);
   assert.equal(f.notifications, 3);
   assert.deepEqual(f.store.openOrCreateBatch(50)?.messages.map(message => [message.messageId, message.trigger]), [
     ['1', true], ['2', true], ['5', false], ['6', false],
@@ -141,6 +147,7 @@ test('commands stay outside conversation and only explicit busy group mentions g
   f.handle(event(3, { message: [at('999'), text(' /compact')] }));
   await nextTurn();
   assert.deepEqual(f.sent, [busyReply]);
+  assert.deepEqual(f.replyIds, ['3']);
   assert.equal(f.notifications, 2);
   assert.equal(f.store.getPendingCommand()?.kind, 'help');
   assert.deepEqual(f.store.openOrCreateBatch(50)?.messages.map(message => message.messageId), ['1']);
@@ -155,6 +162,7 @@ test('slow busy acknowledgement does not block later message persistence', async
   f.handle(event(2, { message: [at('999'), text('问一下')] }));
   f.handle(event(3));
   assert.deepEqual(sent, [busyReply]);
+  assert.deepEqual(f.replyIds, ['2']);
   assert.equal(f.notifications, 2);
   assert.deepEqual(f.store.openOrCreateBatch(50)?.messages.map(message => message.messageId), ['1', '2', '3']);
   release();
@@ -171,6 +179,7 @@ test('busy acknowledgement failure is sanitized and never rejects or stops the o
     f.store.insert(queued);
     assert.doesNotThrow(() => f.handle(event(2, { message: [at('999'), text('问一下')] })));
     await nextTurn();
+    assert.deepEqual(f.replyIds, ['2']);
     f.handle(event(3));
     assert.equal(f.inputOptions.signal.aborted, false);
     assert.equal(f.notifications, 2);

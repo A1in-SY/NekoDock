@@ -58,15 +58,15 @@ export function loadWebSearchConfig(env: NodeJS.ProcessEnv = process.env): WebSe
   };
 }
 
-export function createWebSearchProvider(config: WebSearchConfig): WebSearchProvider | null {
-  return config.provider === 'none' ? null : new TavilyProvider(config);
+export function createWebSearchProvider(config: WebSearchConfig, requestFetch?:typeof globalThis.fetch): WebSearchProvider | null {
+  return config.provider === 'none' ? null : new TavilyProvider(config,requestFetch);
 }
 
 const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 type TavilyConfig = Extract<WebSearchConfig, { provider: 'tavily' }>;
 
 class TavilyProvider implements WebSearchProvider {
-  constructor(private readonly config: TavilyConfig) {}
+  constructor(private readonly config: TavilyConfig,private readonly requestFetch?:typeof globalThis.fetch) {}
 
   async search(request: WebSearchRequest, signal: AbortSignal): Promise<WebSearchResult> {
     if (!isRecord(request) || typeof request.query !== 'string' || !request.query.trim()) {
@@ -158,7 +158,7 @@ class TavilyProvider implements WebSearchProvider {
     const combined = AbortSignal.any([signal, timeout.signal]);
     try {
       combined.throwIfAborted();
-      const response = await fetch(`${this.config.baseUrl}${path}`, {
+      const response = await (this.requestFetch??fetch)(`${this.config.baseUrl}${path}`, {
         method: 'POST',
         redirect: 'manual',
         headers: {

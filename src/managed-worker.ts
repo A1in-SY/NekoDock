@@ -9,6 +9,8 @@ import type { ConversationRecorder } from './conversation-recorder.js';
 import type { Logger } from './types.js';
 import type { WorkerControl, WorkerHeartbeat, WorkerSnapshot } from './console/contracts.js';
 import { logEvent } from './logging.js';
+import { directFetch } from './network.js';
+import type { NetworkProbeCommand, NetworkProbeResult } from './network-probe.js';
 
 export interface ManagedIdentity {url:string;botId:string;token:string;dataDir:string;}
 export interface WorkerRuntime {
@@ -16,9 +18,13 @@ export interface WorkerRuntime {
   readonly connected:boolean;
   readonly processing:boolean;
   readonly drained:boolean;
+  readonly transportConnected?:boolean;
+  readonly upstreamConnected?:boolean;
+  readonly qqOnline?:boolean;
   requestDrain():void;
   stop(beforeStoreClose?:()=>Promise<void>):Promise<void>;
   done:Promise<void>;
+  probeNetwork?(signal:AbortSignal):Promise<NetworkProbeResult>;
 }
 export type RuntimeFactory=(config:Config,signal:AbortSignal)=>WorkerRuntime;
 
@@ -34,7 +40,7 @@ export function managedIdentity(env:NodeJS.ProcessEnv):ManagedIdentity|null {
 function snapshot(value:unknown,identity:ManagedIdentity):WorkerSnapshot {
   if(!value||typeof value!=='object')throw new Error('Invalid worker snapshot.');
   const s=value as WorkerSnapshot;
-  if(s.botId!==identity.botId||!Number.isSafeInteger(s.revision)||s.revision<1||!s.target||
+  if(s.botId!==identity.botId||s.transport!=='console'||typeof s.connectionId!=='string'||!s.connectionId||!Number.isSafeInteger(s.revision)||s.revision<1||!s.target||
     !['group','private'].includes(s.target.type)||!(/^[1-9]\d*$/.test(s.target.id))||typeof s.persona!=='string'||
     !s.env||typeof s.env!=='object'||Object.values(s.env).some(value=>typeof value!=='string'))throw new Error('Invalid worker snapshot.');
   if(s.env.TARGET_TYPE!==s.target.type||s.env.TARGET_ID!==s.target.id)throw new Error('Worker snapshot target mismatch.');
@@ -59,11 +65,18 @@ export async function cachedSnapshot(identity:ManagedIdentity):Promise<WorkerSna
 }
 
 export async function workerRequest(identity:ManagedIdentity,path:string,body?:unknown,signal?:AbortSignal):Promise<unknown> {
-  const response=await fetch(`${identity.url}/internal/workers/${encodeURIComponent(identity.botId)}/${path}`,{
+  const response=await directFetch(`${identity.url}/internal/workers/${encodeURIComponent(identity.botId)}/${path}`,{
     method:body===undefined?'GET':'POST',headers:{authorization:`Bearer ${identity.token}`,...(body===undefined?{}:{'content-type':'application/json'})},
     ...(body===undefined?{}:{body:JSON.stringify(body)}),signal:signal?AbortSignal.any([signal,AbortSignal.timeout(5000)]):AbortSignal.timeout(5000),
   });
-  if(!response.ok)throw new Error(`Management request failed (${response.status}).`);
+  if(!response.ok) {
+    if(path==='tasks/manage'&&response.status===400) {
+      const denied='任务只允许创建者修改或删除，请通过控制台管理其他任务';
+      const result=await response.json().catch(()=>null) as {error?:unknown}|null;
+      if(result?.error===denied)throw new Error(denied);
+    }
+    throw new Error(`Management request failed (${response.status}).`);
+  }
   return response.json();
 }
 export async function loadManagedSnapshot(identity:ManagedIdentity,signal?:AbortSignal,allowCache=true):Promise<WorkerSnapshot> {
@@ -130,6 +143,9 @@ export function uploadWorkerEvents(identity:ManagedIdentity,recorder:Conversatio
 export async function runManagedWorker(identity:ManagedIdentity,env:NodeJS.ProcessEnv,logger:Logger,signal:AbortSignal,factory:RuntimeFactory):Promise<void> {
   let current=await loadManagedSnapshot(identity,signal);
   let runtime=factory(await materializeSnapshot(identity,current,env),signal);
+  const probeController=new AbortController();
+  const abortProbes=()=>probeController.abort();signal.addEventListener('abort',abortProbes,{once:true});
+  const probes=runtime.probeNetwork?pollNetworkProbes(identity,()=>({revision:current.revision,runtime}),logger,probeController.signal):Promise.resolve();
   let eventUpload=uploadWorkerEvents(identity,runtime.store.recorder,logger);
   let operation:WorkerControl|null=null;
   let runtimeError=false;
@@ -164,5 +180,26 @@ export async function runManagedWorker(identity:ManagedIdentity,env:NodeJS.Proce
       }
       try {await delay(5000,undefined,{signal});}catch{break;}
     }
-  }finally{try{await runtime.stop(()=>eventUpload.close());}finally{await eventUpload.close();}}
+  }finally{probeController.abort();signal.removeEventListener('abort',abortProbes);await probes;try{await runtime.stop(()=>eventUpload.close());}finally{await eventUpload.close();}}
+}
+
+/** Diagnostics have a separate control channel and never enter the chat scheduler. */
+export async function pollNetworkProbes(identity:ManagedIdentity,current:()=>{revision:number;runtime:WorkerRuntime},logger:Logger,signal:AbortSignal):Promise<void> {
+  while(!signal.aborted) {
+    try {
+      const snapshot=current();
+      const value=await workerRequest(identity,`network-probe?revision=${snapshot.revision}`,undefined,signal) as {probe:NetworkProbeCommand|null};
+      if(value?.probe) {
+        const job=value.probe;
+        if(typeof job.id!=='string'||!/^[a-zA-Z0-9-]{1,80}$/u.test(job.id)||job.revision!==snapshot.revision)throw new Error('Invalid network diagnostic.');
+        const now=current();
+        const result=now.runtime!==snapshot.runtime||!snapshot.runtime.probeNetwork
+          ?{ok:false,code:'REVISION_CHANGED',durationMs:0} as NetworkProbeResult
+          :await snapshot.runtime.probeNetwork(signal);
+        await workerRequest(identity,'network-probe',{id:job.id,revision:job.revision,result},signal);
+        logEvent(logger,result.ok?'info':'warn','network.probe.completed',{revision:job.revision,code:result.code,duration_ms:result.durationMs,mode:result.route,status:result.status});
+      }
+    }catch {/* A failed diagnostic cannot interrupt management, generation or delivery. */}
+    try{await delay(1000,undefined,{signal});}catch{break;}
+  }
 }

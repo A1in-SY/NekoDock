@@ -10,10 +10,16 @@ import {
 import type { FormEvent, ReactNode } from "react";
 import type { BotSettings, PublicBot } from "../../src/console/contracts";
 import { api, errorText, post } from "./api";
-import { Avatar, Empty, ErrorBox, fmt, Icon, Notice, Status } from "./ui";
+import { Avatar, BotConnectivity, Empty, ErrorBox, fmt, Icon, Notice, Status } from "./ui";
 import { Configuration } from "./config";
+import { Connections } from "./connections";
+import { instanceSettings } from "./connections-state";
+import type { ConnectionView } from "./connections-state";
 import { Conversation } from "./conversation";
 import { Logs } from "./logs";
+import { Tasks } from "./tasks";
+import { Memory } from "./memory";
+import { PluginCatalog, InstancePlugins } from "./plugins";
 const Monitor = lazy(() =>
   import("./monitor").then((module) => ({ default: module.Monitor })),
 );
@@ -39,23 +45,25 @@ class MonitorBoundary extends Component<
 }
 
 type Route = {
-  page: "overview" | "monitor" | "logs" | "bot";
+  page: "overview" | "connections" | "plugins" | "monitor" | "logs" | "bot";
   id?: string;
-  tab: "chat" | "config" | "logs";
+  tab: "chat" | "config" | "logs" | "tasks" | "memory" | "plugins";
 };
 function route(): Route {
   const p = location.hash.slice(1).split("/");
   return {
     page:
-      p[0] === "monitor"
-        ? "monitor"
-        : p[0] === "logs"
-          ? "logs"
-          : p[0] === "bot"
-            ? "bot"
-            : "overview",
+      p[0] === "plugins" ? "plugins" : p[0] === "connections"
+        ? "connections"
+        : p[0] === "monitor"
+          ? "monitor"
+          : p[0] === "logs"
+            ? "logs"
+            : p[0] === "bot"
+              ? "bot"
+              : "overview",
     id: p[1],
-    tab: p[2] === "config" ? "config" : p[2] === "logs" ? "logs" : "chat",
+    tab: p[2] === "config" ? "config" : p[2] === "logs" ? "logs" : p[2] === "tasks" ? "tasks" : p[2] === "memory" ? "memory" : p[2] === "plugins" ? "plugins" : "chat",
   };
 }
 const botUrl = (bot: PublicBot, tab = "chat") =>
@@ -67,6 +75,8 @@ export function App() {
   const [authError, setAuthError] = useState("");
   const [bots, setBots] = useState<PublicBot[]>([]);
   const [loadError, setLoadError] = useState("");
+  const [connections, setConnections] = useState<ConnectionView[]>([]);
+  const [connectionsError, setConnectionsError] = useState("");
   const [loaded, setLoaded] = useState(false);
   const [current, setCurrent] = useState<Route>(route);
   const [creating, setCreating] = useState(false);
@@ -106,6 +116,14 @@ export function App() {
       }
     }
   }, []);
+  const loadConnections = useCallback(async () => {
+    try {
+      const data = await api<ConnectionView[]>("/api/napcat-connections");
+      if (alive.current) { setConnections(data); setConnectionsError(""); }
+    } catch (error) {
+      if (alive.current) setConnectionsError(errorText(error));
+    }
+  }, []);
   useEffect(() => {
     let active = true;
     const run = async () => {
@@ -130,6 +148,7 @@ export function App() {
     const expired = () => {
       setAuth("login");
       setBots([]);
+      setConnections([]);
       setLoaded(false);
     };
     window.addEventListener("session-expired", expired);
@@ -146,6 +165,7 @@ export function App() {
   useEffect(() => {
     if (auth !== "ready") return;
     void loadBots();
+    void loadConnections();
     let timer: ReturnType<typeof setTimeout> | null = null;
     const events = new EventSource("/api/stream");
     const refresh = () => {
@@ -153,6 +173,7 @@ export function App() {
       timer = setTimeout(() => {
         timer = null;
         void loadBots();
+        void loadConnections();
       }, 350);
     };
     events.addEventListener("change", refresh);
@@ -163,7 +184,7 @@ export function App() {
       setStreamOnline(false);
       if (timer) clearTimeout(timer);
     };
-  }, [auth, loadBots]);
+  }, [auth, loadBots, loadConnections]);
   const act = async (bot: PublicBot, action: "start" | "stop" | "restart") => {
     setPending((p) => new Set(p).add(bot.id));
     try {
@@ -191,6 +212,7 @@ export function App() {
       await post("/api/logout");
       setAuth("login");
       setBots([]);
+      setConnections([]);
       setLoaded(false);
     } catch (error) {
       notify(errorText(error), true);
@@ -245,6 +267,8 @@ export function App() {
             <span className="nav-label">实例总览</span>
             <span className="count">{bots.length}</span>
           </a>
+          <a className={"nav-item " + (current.page === "connections" ? "active" : "")} href="#connections" title="NapCat 连接"><Icon name="network" /><span className="nav-label">NapCat 连接</span></a>
+          <a className={"nav-item " + (current.page === "plugins" ? "active" : "")} href="#plugins" title="插件"><Icon name="spark" /><span className="nav-label">插件</span></a>
           <a
             className={
               "nav-item " + (current.page === "monitor" ? "active" : "")
@@ -484,6 +508,8 @@ export function App() {
               </div>
             </>
           )}
+          {current.page === "connections" && <Connections connections={connections} bots={bots} error={connectionsError} reload={loadConnections} notify={notify} />}
+          {current.page === "plugins" && <PluginCatalog />}
           {current.page === "monitor" && (
             <MonitorBoundary>
               <Suspense fallback={<Empty title="正在加载监控…" />}>
@@ -552,11 +578,15 @@ export function App() {
                     </button>
                   </div>
                 </div>
+                <BotConnectivity bot={bot} />
                 <nav className="detail-tabs" aria-label="实例页面">
                   {(
                     [
                       ["chat", "chat", "当前会话"],
                       ["config", "sliders", "实例配置"],
+                      ["tasks", "calendar", "定时任务"],
+                      ["memory", "database", "记忆"],
+                      ["plugins", "spark", "插件"],
                       ["logs", "document", "日志"],
                     ] as const
                   ).map(([tab, icon, label]) => (
@@ -581,6 +611,8 @@ export function App() {
                   <Configuration
                     key={bot.id}
                     bot={bot}
+                    connections={connections}
+                    connectionsError={connectionsError}
                     onSaved={async (updated) => {
                       setBots((all) =>
                         all.map((b) => (b.id === updated.id ? updated : b)),
@@ -589,6 +621,12 @@ export function App() {
                     }}
                     notify={notify}
                   />
+                ) : current.tab === "plugins" ? (
+                  <InstancePlugins key={bot.id} bot={bot} notify={notify} />
+                ) : current.tab === "memory" ? (
+                  <Memory key={bot.id} bot={bot} notify={notify} />
+                ) : current.tab === "tasks" ? (
+                  <Tasks key={bot.id} bot={bot} notify={notify} />
                 ) : current.tab === "logs" ? (
                   <Logs key={bot.id} botId={bot.id} />
                 ) : (
@@ -610,6 +648,8 @@ export function App() {
       {creating && (
         <CreateDrawer
           bots={bots}
+          connections={connections}
+          connectionsError={connectionsError}
           onClose={() => setCreating(false)}
           onCreated={(bot) => {
             setBots((all) => [...all, bot]);
@@ -681,6 +721,7 @@ function BotCard({
           <Status bot={b} />
         </div>
       </div>
+      <BotConnectivity bot={b} compact />
       <div className="card-meta">
         <div>
           <span className="meta-label">当前模型</span>
@@ -883,10 +924,14 @@ function Login({
 }
 function CreateDrawer({
   bots,
+  connections,
+  connectionsError,
   onClose,
   onCreated,
 }: {
   bots: PublicBot[];
+  connections: ConnectionView[];
+  connectionsError: string;
   onClose: () => void;
   onCreated: (bot: PublicBot) => void;
 }) {
@@ -895,6 +940,7 @@ function CreateDrawer({
   const [targetType, setTargetType] = useState<"group" | "private">("group");
   const [targetId, setTargetId] = useState("");
   const [template, setTemplate] = useState("");
+  const [connectionId, setConnectionId] = useState(() => connections.find(connection => connection.enabled)?.id || "");
   const [defaults, setDefaults] = useState<BotSettings | null>(null);
   const [error, setError] = useState("");
   const [pending, setPending] = useState(false);
@@ -929,6 +975,7 @@ function CreateDrawer({
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     if (!defaults) return;
+    if (!connectionId) { setError("请选择 NapCat 连接"); return; }
     if (!/^[1-9]\d*$/.test(targetId)) {
       setError("请填写有效的群号或 QQ 号");
       return;
@@ -944,7 +991,8 @@ function CreateDrawer({
         description: description.trim(),
         targetType,
         targetId,
-        config,
+        connectionId,
+        config: instanceSettings(config || defaults),
         ...(template ? { copyFrom: template } : {}),
       });
       onCreated(result);
@@ -1007,6 +1055,15 @@ function CreateDrawer({
                   onChange={(e) => setDescription(e.target.value)}
                   placeholder="这个 Bot 用来做什么？"
                 />
+              </div>
+              <div className="form-field full">
+                <label htmlFor="create-connection">NapCat 连接 <span className="required">*</span></label>
+                <select id="create-connection" required value={connectionId} onChange={event => setConnectionId(event.target.value)}>
+                  <option value="">请选择连接</option>
+                  {connections.map(connection => <option key={connection.id} value={connection.id} disabled={!connection.enabled}>{connection.name}{connection.enabled ? "" : " · 已停用"}</option>)}
+                </select>
+                <small className="field-hint">{connections.length ? "多个实例可共享同一个 NapCat 连接。" : <>尚未添加连接。<a href="#connections" onClick={onClose}>先添加 NapCat 连接</a>。</>}</small>
+                {connectionsError && <span className="field-error">{connectionsError}</span>}
               </div>
               <div className="form-field full">
                 <label htmlFor="create-type">绑定会话类型</label>
@@ -1086,7 +1143,7 @@ function CreateDrawer({
             <button
               className="btn primary"
               type="submit"
-              disabled={pending || !defaults}
+              disabled={pending || !defaults || !connectionId}
             >
               <Icon name="plus" />
               {pending ? "创建中…" : "创建实例"}

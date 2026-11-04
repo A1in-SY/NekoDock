@@ -5,6 +5,7 @@ WORKDIR /app
 COPY package.json package-lock.json tsconfig.json ./
 RUN npm ci --ignore-scripts
 COPY src ./src
+COPY scripts ./scripts
 RUN npm run build && npm prune --omit=dev --ignore-scripts
 
 FROM node:24.16.0-bookworm-slim

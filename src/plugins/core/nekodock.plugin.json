@@ -1,0 +1,34 @@
+{
+  "kind": "nekodock-plugin",
+  "id": "core",
+  "name": "内置指令",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "entries": {
+    "console": "./index.js"
+  },
+  "capabilities": [
+    "commands"
+  ],
+  "resourceTypes": [],
+  "commands": [
+    {
+      "name": "/new",
+      "description": "重置会话，跳过此前待处理消息；保留聊天记录和工作目录文件。",
+      "executor": "worker",
+      "contextPolicy": "control"
+    },
+    {
+      "name": "/compact",
+      "description": "压缩当前上下文，保留会话。",
+      "executor": "worker",
+      "contextPolicy": "control"
+    },
+    {
+      "name": "/help",
+      "description": "查看当前实例可用的指令及功能。",
+      "executor": "worker",
+      "contextPolicy": "control"
+    }
+  ]
+}

@@ -5,6 +5,11 @@ import { DatabaseSync } from 'node:sqlite';
 import { isMp3Snapshot } from './audio.js';
 import { isSegmentMessage } from './messages.js';
 import type { BridgeCommand, CommandResult, IncomingMessage, OutputMessage, PendingBatch, PendingCommand, ReplyPart, ReplyRequestRecord, StoredMessage, Target } from './types.js';
+import type { TaskChatMessage } from './scheduled-contract.js';
+import type { CachedIncomingImage } from './incoming-image-contract.js';
+import { ChatStore } from './chat-store.js';
+import type { ChatAsset, ChatContextMessage, ContextCommit, ContextSubmission, PluginChatReply } from './chat-context-contract.js';
+import type { ForwardSnapshot } from './forward-contract.js';
 
 type StateRow = {
   target_type: string;
@@ -40,6 +45,7 @@ type ReplyRequestRow = {
   start_index: number;
   end_index: number;
   send_started: number;
+  tool_call_id?: string | null;
 };
 
 type CommandRow = {
@@ -53,7 +59,9 @@ type CommandRow = {
 export class BridgeStore {
   private readonly db: DatabaseSync;
   private closed = false;
+  private scheduledBusy=false;
   recorder!: ConversationRecorder;
+  private chats!: ChatStore;
 
   constructor(filePath: string, target: Target) {
     if (filePath !== ':memory:') mkdirSync(dirname(filePath), { recursive: true });
@@ -84,6 +92,11 @@ export class BridgeStore {
           trigger INTEGER NOT NULL CHECK (trigger IN (0, 1)),
           raw_json TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS outgoing_history (
+          id TEXT PRIMARY KEY,time INTEGER NOT NULL,text TEXT NOT NULL,message_id TEXT,conversation_id TEXT NOT NULL,task_id TEXT,context_consumed INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS outgoing_history_time ON outgoing_history(time);
+        CREATE INDEX IF NOT EXISTS messages_time ON messages(time);
         CREATE TABLE IF NOT EXISTS pending_batch (
           id INTEGER PRIMARY KEY CHECK (id = 1),
           through_seq INTEGER NOT NULL,
@@ -105,6 +118,8 @@ export class BridgeStore {
         this.initializeCommandSchema();
         this.initializeReplySchema();
         this.recorder = new ConversationRecorder(this.db,filePath===':memory:'?undefined:join(dirname(filePath),'console-media'));
+        this.chats = new ChatStore(this.db);
+        this.backfillChatMessages();
       });
     } catch (error) {
       this.db.close();
@@ -135,6 +150,7 @@ export class BridgeStore {
           time:message.time*1000,replyTo:message.replyTo,trigger:message.trigger,legacy:false,
           messageSeq:Number(this.db.prepare('SELECT seq FROM messages WHERE message_id=?').get(message.messageId)!.seq),
         },`incoming:${message.messageId}`,{time:message.time*1000,itemId:message.messageId});
+        this.chats.incoming(toStoredMessage(this.db.prepare('SELECT * FROM messages WHERE message_id=?').get(message.messageId) as MessageRow),this.recorder.conversationId);
       }
       return true;
     });
@@ -159,6 +175,7 @@ export class BridgeStore {
       this.db.prepare('DELETE FROM reply_part_sources').run();
       this.db.prepare('DELETE FROM reply_attempts').run();
       this.recorder.reset(command.through_seq,id);
+      this.chats.movePending((this.db.prepare('SELECT message_id FROM messages WHERE seq>?').all(command.through_seq) as Array<{message_id:string}>).map(row=>row.message_id),this.recorder.conversationId);
       this.db.prepare("UPDATE control_commands SET result = 'new' WHERE id = ?").run(id);
     });
   }
@@ -223,7 +240,92 @@ export class BridgeStore {
     return this.readState().cursor;
   }
 
+  getMessage(messageId: string): StoredMessage | null {
+    const row = this.db.prepare('SELECT * FROM messages WHERE message_id=?').get(messageId) as MessageRow | undefined;
+    return row ? toStoredMessage(row) : null;
+  }
+
+  getMessageConversation(messageId: string): string | null {
+    const source=this.db.prepare('SELECT seq FROM messages WHERE message_id=?').get(messageId);
+    // A message received after a queued /new has not acquired its final ownership yet.
+    if(source&&this.db.prepare("SELECT 1 FROM control_commands WHERE kind='new' AND done=0 AND through_seq<? LIMIT 1").get(Number(source.seq)))return null;
+    return this.chats.forQQ(messageId)?.conversationId ?? null;
+  }
+  chatMessageForQQ(messageId: string): ChatContextMessage | null { return this.chats.forQQ(messageId); }
+  getChatMessage(chatMessageId: string): ChatContextMessage | null { return this.chats.get(chatMessageId); }
+  prepareContext(batch: PendingBatch): ContextSubmission {
+    return this.transaction(()=>this.chats.prepare(batch.messages,this.recorder.conversationId,this.getSessionId()));
+  }
+  pendingContextBatchIds(): string[] { return this.chats.pendingBatches(this.recorder.conversationId); }
+  commitContext(receipt: ContextCommit): boolean { return this.transaction(()=>this.chats.commit(receipt)); }
+  forwardSnapshot(messageId: string): ForwardSnapshot | null { return this.chats.forwardSnapshot(messageId); }
+  recordForwardContent(snapshot: ForwardSnapshot): boolean {
+    return this.transaction(()=>{
+      const changed=this.chats.forwards(snapshot);
+      if(changed)this.recordForwardUpdate(snapshot.messageId);
+      return changed;
+    });
+  }
+  failPendingForwards(messageId: string): boolean {
+    return this.transaction(()=>{
+      const changed=this.chats.failPendingForwards(messageId);
+      if(changed)this.recordForwardUpdate(messageId);
+      return changed;
+    });
+  }
+  private recordForwardUpdate(messageId: string): void {
+    const message=this.chats.forQQ(messageId)!;
+    this.recorder.append('message.content.updated',{messageId,text:message.text,revision:message.revision,contents:message.contents},
+      `forward:${messageId}:${message.revision}`,{conversationId:message.conversationId,itemId:messageId});
+  }
+  applyEnrichment(messageId: string, pluginId: string, contents: unknown[], revision = 1): boolean {
+    return this.transaction(()=>{
+      const changed=this.chats.enrich(messageId,pluginId,contents,revision);
+      if(changed){const message=this.chats.forQQ(messageId)!;this.recorder.append('message.content.updated',{
+        messageId,text:message.text,revision:message.revision,contents:message.contents,pluginId},`enrichment:${messageId}:${pluginId}:${revision}`,{conversationId:message.conversationId,itemId:messageId});}
+      return changed;
+    });
+  }
+  mergeEnrichment(messageId:string,pluginId:string,content:unknown,resourceRevision:number):boolean {
+    return this.transaction(()=>{
+      const changed=this.chats.mergeEnrichment(messageId,pluginId,content,resourceRevision);
+      if(changed){const message=this.chats.forQQ(messageId)!;this.recorder.append('message.content.updated',{
+        messageId,text:message.text,revision:message.revision,contents:message.contents,pluginId},
+        `resource-enrichment:${messageId}:${pluginId}:${message.revision}`,{conversationId:message.conversationId,itemId:messageId});}
+      return changed;
+    });
+  }
+  recordPluginReply(reply: PluginChatReply): boolean {
+    return this.transaction(()=>{
+      const inserted=this.chats.pluginReply(reply);
+      if(inserted){
+        this.db.prepare('INSERT OR IGNORE INTO outgoing_history(id,time,text,message_id,conversation_id,task_id) VALUES(?,?,?,?,?,?)')
+          .run(reply.id,(reply.time??Date.now()/1000)*1000,reply.text,reply.qqMessageId??null,reply.conversationId,`plugin:${reply.pluginId}`);
+        this.recorder.append('plugin.message.sent',{id:reply.id,messageId:reply.qqMessageId,text:reply.text,assets:reply.assets,
+          pluginId:reply.pluginId,sourceMessageId:reply.sourceMessageId,replyTo:reply.replyTo===undefined?reply.sourceMessageId:reply.replyTo},`plugin-reply:${reply.id}`,{conversationId:reply.conversationId,time:(reply.time??Date.now()/1000)*1000,itemId:reply.qqMessageId??reply.id});
+      }
+      return inserted;
+    });
+  }
+
+  isMessagePending(messageId: string): boolean {
+    return !!this.db.prepare('SELECT 1 FROM messages WHERE message_id=? AND seq>(SELECT cursor FROM instance_state WHERE id=1)').get(messageId);
+  }
+
+  recordIncomingImages(messageId: string, images: CachedIncomingImage[]): void {
+    this.transaction(()=>{
+      this.chats.images(messageId, images);
+      const incoming = this.db.prepare("SELECT conversation_id FROM console_events WHERE event_key=?").get(`incoming:${messageId}`);
+      const moved = this.db.prepare(`SELECT conversation_id FROM console_events e WHERE type='conversation.messages_moved'
+        AND EXISTS(SELECT 1 FROM json_each(e.payload_json,'$.messageIds') WHERE value=?) ORDER BY seq DESC LIMIT 1`).get(messageId);
+      if (!incoming) return;
+      this.recorder.append('message.images.updated', { messageId, images }, undefined,
+        { itemId: messageId, conversationId: String(moved?.conversation_id ?? incoming.conversation_id) });
+    });
+  }
+
   isBusy(): boolean {
+    if(this.scheduledBusy)return true;
     // Include queued work before the processing loop opens its first batch.
     const row = this.db.prepare(`
       SELECT EXISTS (SELECT 1 FROM pending_batch)
@@ -232,6 +334,35 @@ export class BridgeStore {
           WHERE seq > (SELECT cursor FROM instance_state WHERE id = 1) AND trigger = 1) AS busy
     `).get();
     return row?.busy === 1;
+  }
+
+  setScheduledBusy(value:boolean):void {this.scheduledBusy=value;}
+  senderForMessage(id:string):string|null {return (this.db.prepare('SELECT sender_id FROM messages WHERE message_id=?').get(id)?.sender_id as string|undefined)??null;}
+  recordTaskReply(id:string,text:string,taskId:string,conversationId:string,messageId?:string,assets:ChatAsset[]=[]):void {
+    this.transaction(()=>{
+      this.db.prepare('INSERT OR IGNORE INTO outgoing_history(id,time,text,message_id,conversation_id,task_id) VALUES(?,?,?,?,?,?)')
+        .run(id,Date.now(),text,messageId??null,conversationId,taskId);
+      this.chats.outgoing(id,text,conversationId,'scheduled',messageId,assets);
+    });
+  }
+  takeExternalMessages():TaskChatMessage[] {
+    return this.transaction(()=>{
+      const rows=this.db.prepare('SELECT * FROM outgoing_history WHERE task_id IS NOT NULL AND context_consumed=0 AND conversation_id=? ORDER BY time,id').all(this.recorder.conversationId) as Array<{id:string;time:number;text:string;message_id:string|null}>;
+      // Compatibility read only: production context consumption is acknowledged by Pi.
+      return rows.slice(0,30).map(row=>({id:row.message_id??row.id,senderId:'self',senderName:'Assistant',time:row.time,text:row.text.slice(0,4000),replyTo:null,role:'assistant'}));
+    });
+  }
+  readTaskChat(from:number,to:number,includeBotReplies:boolean,limit:number,excludeTaskId=''):{messages:TaskChatMessage[];availableCount:number} {
+    const start=Math.ceil(from/1000),end=Math.ceil(to/1000);
+    const users=this.db.prepare('SELECT * FROM messages WHERE time>=? AND time<? ORDER BY time DESC,seq DESC LIMIT ?').all(start,end,limit) as MessageRow[];
+    const replies=includeBotReplies?this.db.prepare('SELECT * FROM outgoing_history WHERE time>=? AND time<? AND (task_id IS NULL OR task_id<>?) ORDER BY time DESC,id DESC LIMIT ?').all(from,to,excludeTaskId,limit) as Array<{id:string;time:number;text:string;message_id:string|null}>:[];
+    const availableCount=Number(this.db.prepare('SELECT COUNT(*) AS n FROM messages WHERE time>=? AND time<?').get(start,end)!.n)
+      +(includeBotReplies?Number(this.db.prepare('SELECT COUNT(*) AS n FROM outgoing_history WHERE time>=? AND time<? AND (task_id IS NULL OR task_id<>?)').get(from,to,excludeTaskId)!.n):0);
+    const details=(id:string,fallback:string)=>{const chat=this.chats.get(id);return {text:chat?.text??fallback,
+      ...(chat?.assets?.length?{assets:chat.assets}:{}),...(chat?.contents?.length?{contents:chat.contents}:{})};};
+    const messages:TaskChatMessage[]=[...users.map(row=>({id:row.message_id,senderId:row.sender_id,senderName:row.sender_name,time:row.time*1000,...details(`in:${row.message_id}`,row.text),replyTo:row.reply_to,role:'user' as const})),
+      ...replies.map(row=>({id:row.message_id??row.id,senderId:'self',senderName:'Assistant',time:row.time,...details(`out:${row.id}`,row.text),replyTo:this.chats.get(`out:${row.id}`)?.replyTo??null,role:'assistant' as const}))];
+    messages.sort((a,b)=>a.time-b.time||a.id.localeCompare(b.id));return {messages:messages.slice(-limit),availableCount};
   }
 
   peekPendingBatch(): PendingBatch | null { return this.readBatch(); }
@@ -326,7 +457,7 @@ export class BridgeStore {
 
   getReplyRequest(throughSeq: number, requestId: string): ReplyRequestRecord | null {
     const row = this.db.prepare(`
-      SELECT request_id, messages_json, start_index, end_index, send_started FROM reply_requests
+      SELECT request_id, messages_json, start_index, end_index, send_started, tool_call_id FROM reply_requests
       WHERE through_seq = ? AND request_id = ?
     `).get(throughSeq, requestId) as ReplyRequestRow | undefined;
     return row ? toReplyRequest(row) : null;
@@ -334,13 +465,13 @@ export class BridgeStore {
 
   listReplyRequests(throughSeq: number): ReplyRequestRecord[] {
     const rows = this.db.prepare(`
-      SELECT request_id, messages_json, start_index, end_index, send_started FROM reply_requests
+      SELECT request_id, messages_json, start_index, end_index, send_started, tool_call_id FROM reply_requests
       WHERE through_seq = ? ORDER BY start_index, rowid
     `).all(throughSeq) as ReplyRequestRow[];
     return rows.map(toReplyRequest);
   }
 
-  appendReplyRequest(throughSeq: number, requestId: string, messages: OutputMessage[], parts: ReplyPart[], messageIndices?:number[]): ReplyRequestRecord {
+  appendReplyRequest(throughSeq: number, requestId: string, messages: OutputMessage[], parts: ReplyPart[], messageIndices?:number[], toolCallId?:string): ReplyRequestRecord {
     if (typeof requestId !== 'string' || !requestId.trim()) throw new Error('Reply request ID must not be empty.');
     if (!Array.isArray(messages) || messages.length === 0 || messages.some(message => !isOutputMessage(message))) {
       throw new Error('Reply request messages must contain text or images or segment messages.');
@@ -363,12 +494,12 @@ export class BridgeStore {
       const endIndex = startIndex + parts.length;
       this.db.prepare('UPDATE pending_batch SET replies_json = ? WHERE id = 1').run(JSON.stringify([...replies, ...parts]));
       this.db.prepare(`
-        INSERT INTO reply_requests (through_seq, request_id, messages_json, start_index, end_index)
-        VALUES (?, ?, ?, ?, ?)
-      `).run(throughSeq, requestId, encoded, startIndex, endIndex);
+        INSERT INTO reply_requests (through_seq, request_id, messages_json, start_index, end_index,tool_call_id)
+        VALUES (?, ?, ?, ?, ?,?)
+      `).run(throughSeq, requestId, encoded, startIndex, endIndex,toolCallId??null);
       this.saveReplySources(throughSeq,startIndex,parts.length,messageIndices);
       this.recorder.append('reply.accepted',{requestId,messages},`reply:${throughSeq}:${requestId}`,{itemId:requestId});
-      return { requestId, messages: JSON.parse(encoded) as OutputMessage[], startIndex, endIndex, sendStarted: false };
+      return { requestId, messages: JSON.parse(encoded) as OutputMessage[], startIndex, endIndex, sendStarted: false,...(toolCallId?{toolCallId}:{}) };
     });
   }
 
@@ -431,7 +562,7 @@ export class BridgeStore {
     });
   }
 
-  acknowledgeReply(throughSeq: number, index: number, messageId?: string): { mediaSaved: boolean } {
+  acknowledgeReply(throughSeq: number, index: number, messageId?: string, chatAssets?: ChatAsset[]): { mediaSaved: boolean } {
     let mediaSaved = true;
     this.transaction(() => {
       const pending = this.requireBatch(throughSeq);
@@ -453,6 +584,12 @@ export class BridgeStore {
       }
       this.recorder.append('delivery.acknowledged',{deliveryId:`${throughSeq}:${index}`,requestId:request?.requestId ?? `final:${throughSeq}`,
         partIndex:index,...(source?{logicalMessageIndex:Number(source.message_index)}:{}),kind:typeof part==='string'?'text':part.type,normal:true,...(messageId?{messageId}:{}),...(mediaPath?{mediaPath}:{})},`ack:${throughSeq}:${index}`);
+      const text=typeof part==='string'?part:part.type==='voice'?part.text:part.type==='image'?'[image]':part.segments.map(segment=>segment.type==='text'?segment.text:`@${segment.userId}`).join('');
+      this.db.prepare('INSERT OR IGNORE INTO outgoing_history(id,time,text,message_id,conversation_id,task_id,context_consumed) VALUES(?,?,?,?,?,NULL,1)')
+        .run(`chat:${throughSeq}:${index}`,Date.now(),text,messageId??null,this.recorder.conversationId);
+      const assets:ChatAsset[]=chatAssets??(mediaPath&&typeof part!=='string'&&(part.type==='image'||part.type==='voice')?[{id:`chat-media:${throughSeq}:${index}`,type:part.type,path:mediaPath,status:'ready'}]:[]);
+      this.chats.outgoing(`chat:${throughSeq}:${index}`,text,this.recorder.conversationId,'model',messageId,assets,undefined,undefined,Date.now()/1000,
+        {toolCallId:request?.toolCallId,logicalMessageIndex:source?Number(source.message_index):undefined,partIndex:index});
     });
     return { mediaSaved };
   }
@@ -526,6 +663,29 @@ export class BridgeStore {
     this.db.prepare('DELETE FROM reply_attempts WHERE through_seq=?').run(throughSeq);
   }
 
+  private backfillChatMessages(): void {
+    const session=this.getSessionId(),cursor=this.getCursor();
+    for(const row of this.db.prepare('SELECT * FROM messages ORDER BY seq').all() as MessageRow[]) {
+      if(this.chats.get(`in:${row.message_id}`))continue;
+      const incoming=this.db.prepare('SELECT conversation_id FROM console_events WHERE event_key=?').get(`incoming:${row.message_id}`);
+      const moved=this.db.prepare(`SELECT conversation_id FROM console_events WHERE type='conversation.messages_moved'
+        AND EXISTS(SELECT 1 FROM json_each(payload_json,'$.messageIds') WHERE value=?) ORDER BY seq DESC LIMIT 1`).get(row.message_id);
+      this.chats.incoming(toStoredMessage(row),String(moved?.conversation_id??incoming?.conversation_id??this.recorder.conversationId));
+      // Historical input is not replayed on upgrade; later revisions and exact references remain available.
+      if(session && row.seq<=cursor)this.chats.baseline(`in:${row.message_id}`,session);
+    }
+    const outgoing=this.db.prepare('SELECT * FROM outgoing_history ORDER BY time,id').all() as Array<{id:string;time:number;text:string;message_id:string|null;conversation_id:string;task_id:string|null;context_consumed:number}>;
+    for(const row of outgoing) {
+      if(this.chats.get(`out:${row.id}`))continue;
+      const origin=row.task_id?.startsWith('plugin:')?'plugin':row.task_id?'scheduled':'model';
+      const event=row.message_id?this.db.prepare("SELECT payload_json FROM console_events WHERE type='delivery.acknowledged' AND json_extract(payload_json,'$.messageId')=? ORDER BY seq DESC LIMIT 1").get(row.message_id):undefined;
+      let assets:ChatAsset[]=[];
+      if(event)try{const payload=JSON.parse(String(event.payload_json));if(payload.mediaPath && ['image','voice'].includes(payload.kind))assets=[{id:`media:${row.id}`,type:payload.kind,path:payload.mediaPath,status:'ready'}];}catch{/* Old presentation records may not contain media metadata. */}
+      this.chats.outgoing(row.id,row.text,row.conversation_id,origin,row.message_id??undefined,assets,undefined,origin==='plugin'?row.task_id!.slice(7):undefined,row.time/1000);
+      if(session && row.context_consumed)this.chats.baseline(`out:${row.id}`,session);
+    }
+  }
+
   private initializeReplySchema(): void {
     this.db.exec('CREATE TABLE IF NOT EXISTS reply_part_sources(through_seq INTEGER NOT NULL,part_index INTEGER NOT NULL,message_index INTEGER NOT NULL,PRIMARY KEY(through_seq,part_index))');
     const columns = this.db.prepare('PRAGMA table_info(pending_batch)').all();
@@ -553,6 +713,7 @@ export class BridgeStore {
       send_started INTEGER NOT NULL DEFAULT 0 CHECK (send_started IN (0, 1)),
       PRIMARY KEY (through_seq, request_id)
     )`);
+    if(!this.db.prepare('PRAGMA table_info(reply_requests)').all().some(column=>column.name==='tool_call_id'))this.db.exec('ALTER TABLE reply_requests ADD COLUMN tool_call_id TEXT');
   }
 
   private initializeCommandSchema(): void {
@@ -611,6 +772,7 @@ function toReplyRequest(row: ReplyRequestRow): ReplyRequestRecord {
     startIndex: row.start_index,
     endIndex: row.end_index,
     sendStarted: row.send_started === 1,
+    ...(row.tool_call_id?{toolCallId:row.tool_call_id}:{}),
   };
 }
 

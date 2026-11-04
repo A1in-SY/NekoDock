@@ -16,7 +16,7 @@ test('Pi Worker 贯通共享 NapCat、独立群聊、图片收发、批次艾特
     const round = (rounds.get(target) ?? 0) + 1; rounds.set(target, round);
     if (target === '1001' && round === 1) await gate.promise;
     const replies: unknown[] = target === '1001' && round === 2
-      ? call.batch.map(message => ({ type: 'message', segments: [{ type: 'at', userId: message.senderId }, { type: 'text', text: `${target}-reply-${round}-${message.messageId}` }] }))
+      ? call.batch.filter(message => call.replyTargetMessageIds.includes(message.messageId)).map(message => ({ type: 'message', segments: [{ type: 'at', userId: message.senderId }, { type: 'text', text: `${target}-reply-${round}-${message.messageId}` }] }))
       : [{ type: 'text', text: `${target}-reply-${round}` }];
     if (target === '1001' && round === 1) replies.push({ type: 'image', path: 'generated.png' });
     sendReply(call, response, replies);
@@ -40,17 +40,23 @@ test('Pi Worker 贯通共享 NapCat、独立群聊、图片收发、批次艾特
   f.send('own-g2', 'own message must be ignored', true, '1002', '999');
   f.send('wrong-target', 'unbound group must be ignored', true, '9999');
   f.broadcast({ ...f.event('wrong-type'), message_type: 'private' });
-  await f.waitFor(() => f.outgoing.some(message => message.params.message[0]?.data.text === busyReply), '忙碌艾特应立即提示');
+  await f.waitFor(() => f.outgoing.some(message => message.params.message.some(segment => segment.type === 'text' && segment.data.text === busyReply)), '忙碌艾特应立即提示');
+  assert.deepEqual(f.outgoing.find(message => message.params.message.some(segment => segment.type === 'text' && segment.data.text === busyReply))?.params.message, [
+    { type: 'reply', data: { id: 'g1-second' } },
+    { type: 'text', data: { text: busyReply } },
+  ]);
   gate.resolve();
   await f.waitFor(() => f.complete(4) && f.complete(1, '1002'), '两实例应完成各自批次');
   const starts = f.calls.filter(call => call.results.length === 0);
   const group1 = starts.filter(call => call.body.model === 'provider-model-1001');
   const group2 = starts.filter(call => call.body.model === 'provider-model-1002');
   assert.deepEqual(group1.map(call => call.batch.map(message => message.messageId)), [['g1-context', 'g1-first'], ['g1-busy', 'g1-second']]);
-  assert.deepEqual(Object.keys(group1[0]!.batch[0]!).sort(), ['images', 'messageId', 'replyTo', 'senderId', 'senderName', 'text', 'time']);
+  assert.deepEqual(group1.map(call => call.replyTargetMessageIds), [['g1-first'], ['g1-second']]);
+  assert.deepEqual(Object.keys(group1[0]!.batch[0]!).sort(), ['assets', 'chatMessageId', 'images', 'messageId', 'origin', 'replyTo', 'revision', 'role', 'senderId', 'senderName', 'sequence', 'text', 'time']);
   assert.equal(group1[0]!.images.length, 1); assert.equal(group1[0]!.images[0], `data:image/png;base64,${pngBase64}`, 'Pi 必须把真实图片字节传给供应商');
   assert.deepEqual(group1[1]!.batch.map(message => [message.senderId, message.text]), [['501', 'user-A-question-1-while-busy'], ['502', '[@999]user-B-question-2-while-busy']]);
   assert.deepEqual(group2[0]!.batch.map(message => message.messageId), ['g2-first']);
+  assert.deepEqual(group2[0]!.replyTargetMessageIds, ['g2-first']);
   assert.ok(!JSON.stringify(group2[0]!.body).includes('context-before-mention'), '实例历史不可串用');
   for (const call of f.calls) {
     const target = String(call.body.model).replace('provider-model-', '');
@@ -59,10 +65,9 @@ test('Pi Worker 贯通共享 NapCat、独立群聊、图片收发、批次艾特
     assert.doesNotMatch(JSON.stringify(call.batch), /"trigger"|"replyAllowed"|我正在想上面的消息怎么回/);
   }
   const textReplies = () => f.outgoing.flatMap(message => message.params.message.filter(segment => segment.type === 'text').map(segment => [String(message.params.group_id), segment.data.text]));
-  assert.deepEqual(textReplies().filter(([, text]) => text !== busyReply).sort(), [['1001', '1001-reply-1'], ['1001', '1001-reply-2-g1-busy'], ['1001', '1001-reply-2-g1-second'], ['1002', '1002-reply-1']]);
+  assert.deepEqual(textReplies().filter(([, text]) => text !== busyReply).sort(), [['1001', '1001-reply-1'], ['1001', '1001-reply-2-g1-second'], ['1002', '1002-reply-1']]);
   assert.deepEqual(f.outgoing.flatMap(message => message.params.message.filter(segment => segment.type === 'image').map(segment => segment.data.file)), [`base64://${pngBase64}`]);
   assert.deepEqual(f.outgoing.filter(message => message.params.message.some(segment => segment.type === 'at')).map(message => message.params.message), [
-    [{ type: 'at', data: { qq: '501' } }, { type: 'text', data: { text: '1001-reply-2-g1-busy' } }],
     [{ type: 'at', data: { qq: '502' } }, { type: 'text', data: { text: '1001-reply-2-g1-second' } }],
   ]);
   const session = f.read('1001', db => String(db.prepare('SELECT session_id FROM instance_state WHERE id=1').get()?.session_id));

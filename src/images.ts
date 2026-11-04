@@ -1,17 +1,17 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { lstat, mkdir, open, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, open, realpath, rename, rm } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { imageSources } from './napcat.js';
 import type { Logger, StoredMessage } from './types.js';
 import { fingerprint, logEvent } from './logging.js';
 
-export interface ImageOptions { workspace: string; maxBytes: number; timeoutMs: number; logger?: Logger }
+export interface ImageOptions { workspace: string; maxBytes: number; timeoutMs: number; logger?: Logger; fetch?: typeof globalThis.fetch }
 export type IncomingImage = { path: string } | { error: string };
 
 class ImageError extends Error {}
 
-function imageExtension(bytes: Buffer): string {
+export function imageExtension(bytes: Buffer): string {
   if (bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) return 'png';
   if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'jpg';
   if (['GIF87a', 'GIF89a'].includes(bytes.subarray(0, 6).toString('ascii'))) return 'gif';
@@ -51,7 +51,7 @@ async function download(source: string, options: ImageOptions, signal: AbortSign
   const timeout = AbortSignal.timeout(options.timeoutMs);
   const requestSignal = AbortSignal.any([signal, timeout]);
   try {
-    const response = await fetch(url, { signal: requestSignal });
+    const response = await (options.fetch ?? fetch)(url, { signal: requestSignal });
     if (!response.ok || !response.body) {
       await response.body?.cancel();
       throw new ImageError('图片下载失败');
@@ -119,19 +119,36 @@ async function localImage(source: string, options: ImageOptions, signal: AbortSi
   } finally { await handle.close(); }
 }
 
-async function cacheImage(bytes: Buffer, options: ImageOptions, signal: AbortSignal): Promise<string> {
+export async function cacheImage(bytes: Buffer, options: ImageOptions, signal: AbortSignal): Promise<string> {
   const extension = imageExtension(bytes);
   const directory = resolve(options.workspace, '.qq-images');
-  await mkdir(directory, { recursive: true });
+  await mkdir(directory, { recursive: true, mode: 0o700 });
   if ((await lstat(directory)).isSymbolicLink()) throw new ImageError('图片缓存路径不允许');
   const path = join(directory, `${createHash('sha256').update(bytes).digest('hex')}.${extension}`);
   const temporary = join(directory, `${randomUUID()}.tmp`);
   try {
-    await writeFile(temporary, bytes, { flag: 'wx', mode: 0o600, signal });
+    const handle = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    try {
+      signal.throwIfAborted();
+      await handle.writeFile(bytes, { signal });
+      await handle.sync();
+    } finally { await handle.close(); }
     signal.throwIfAborted();
     await rename(temporary, path);
+    const parent = await open(directory, constants.O_RDONLY);
+    try { await parent.sync(); } finally { await parent.close(); }
     return path;
   } finally { await rm(temporary, { force: true }).catch(() => {}); }
+}
+
+/** Download and validate a portable incoming image without exposing its source in errors. */
+export async function readIncomingImage(source: string, options: ImageOptions, signal: AbortSignal): Promise<Buffer> {
+  checkOptions(options);
+  signal.throwIfAborted();
+  const bytes = source.startsWith('base64://') ? decodeBase64(source, options.maxBytes)
+    : await download(source, options, signal);
+  imageExtension(bytes);
+  return bytes;
 }
 
 /** Fetch portable ordinary images and leave readable files for the running CLI. */
@@ -151,8 +168,7 @@ export async function prepareIncomingImages(
         direction: 'inbound', source_type: source.startsWith('base64://') ? 'base64' : 'http' };
       if (options.logger) logEvent(options.logger, 'info', 'image.prepare_started', metadata);
       try {
-        const bytes = source.startsWith('base64://') ? decodeBase64(source, options.maxBytes)
-          : await download(source, options, signal);
+        const bytes = await readIncomingImage(source, options, signal);
         const path = await cacheImage(bytes, options, signal);
         signal.throwIfAborted();
         files.add(path);

@@ -5,10 +5,11 @@ import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 import { createCipheriv, randomBytes } from 'node:crypto';
-import { ConsoleDatabase } from '../src/console/database.js';
-import { defaultSettings, normalizeSettings, settingsFromEnv, settingsToEnv, validateSettings } from '../src/console/settings.js';
+import { ConsoleDatabase, NAPCAT_QUEUE_LIMITS } from '../src/console/database.js';
+import { defaultSettings, normalizeNapcatUrl, normalizeSettings, settingsFromEnv, settingsToEnv, validateSettings } from '../src/console/settings.js';
 import type { BotRecord, ConsoleEvent, WorkerHeartbeat } from '../src/console/contracts.js';
 import { loadConfig } from '../src/config.js';
+import { NAPCAT_EVENT_MAX_BYTES } from '../src/transport-protocol.js';
 
 function database(t: test.TestContext): { db: ConsoleDatabase; path: string; keyPath: string; directory: string } {
   const directory = mkdtempSync(join(tmpdir(), 'napcat-console-db-test-'));
@@ -46,6 +47,209 @@ test('management settings have independent defaults and validate active provider
   const inactive = validateSettings({ searchBaseUrl: 'invalid inactive URL', ttsBaseUrl: 'invalid inactive URL' });
   assert.equal(inactive.searchBaseUrl, 'invalid inactive URL');
   assert.throws(() => validateSettings({ searchProvider: 'tavily', tavilyApiKey: 'test-credential' }, inactive), /TAVILY_SEARCH_BASE_URL/u);
+});
+
+test('NapCat resources encrypt tokens, normalize URLs, mask public responses and enforce optimistic changes', t => {
+  const {db, path} = database(t);
+  const connection = db.createNapcatConnection({name: ' Shared connection ', wsUrl: 'WS://NAPCAT.EXAMPLE:80', token: 'synthetic-napcat-token', actionTimeout: 22});
+  assert.equal(connection.name, 'Shared connection'); assert.equal(connection.wsUrl, 'ws://napcat.example/');
+  assert.equal(connection.revision, 1); assert.equal(connection.reconnectSeconds, 3);
+  const inspector = new DatabaseSync(path); t.after(() => inspector.close());
+  const stored = JSON.stringify(inspector.prepare('SELECT * FROM napcat_connections').all());
+  assert.equal(stored.includes('synthetic-napcat-token'), false);
+  assert.equal(db.getPublicNapcatConnection(connection.id)!.tokenConfigured, true);
+  assert.equal('token' in db.getPublicNapcatConnection(connection.id)!, false);
+  assert.throws(() => db.createNapcatConnection({name: 'duplicate', wsUrl: connection.wsUrl, token: connection.token}), /已有连接/u);
+  const renamed = db.updateNapcatConnection(connection.id, {name: 'Renamed', expectedRevision: 1});
+  assert.equal(renamed.token, connection.token); assert.equal(renamed.revision, 2);
+  assert.throws(() => db.updateNapcatConnection(connection.id, {name: 'stale', expectedRevision: 1}), /版本冲突/u);
+  assert.equal(db.updateNapcatConnection(connection.id, {token: null}).token, undefined);
+  assert.equal(db.getPublicNapcatConnection(connection.id)!.tokenConfigured, false);
+  for (const wsUrl of ['http://napcat.example/', 'ws://user:pass@napcat.example/', 'ws://napcat.example/?token=secret', 'ws://napcat.example/#token']) {
+    assert.throws(() => normalizeNapcatUrl(wsUrl), /地址/u);
+  }
+  assert.throws(() => db.createNapcatConnection({name: 'invalid', wsUrl: 'ws://napcat.example/', token: 'line\nbreak'}), /Token/u);
+  assert.throws(() => db.updateNapcatConnection(connection.id, {reconnectSeconds: 0}), /正数/u);
+  db.deleteNapcatConnection(connection.id); assert.equal(db.getNapcatConnection(connection.id), null);
+});
+
+test('instances share resources, keep connection credentials out of snapshots, and protect referenced connections', t => {
+  const {db} = database(t);
+  const connection = db.createNapcatConnection({name: 'Primary', wsUrl: 'ws://primary.example/', token: 'synthetic-resource-token', actionTimeout: 21});
+  const bot = db.createBot({name: 'First', targetType: 'group', targetId: '10001', connectionId: connection.id, config: {modelApiKey: 'synthetic-model-token'}});
+  const second = db.createBot({name: 'Second', targetType: 'private', targetId: '10002', connectionId: connection.id, config: {}});
+  assert.deepEqual(new Set(db.getPublicNapcatConnection(connection.id)!.botIds), new Set([bot.id, second.id]));
+  assert.throws(() => db.deleteNapcatConnection(connection.id), /引用/u);
+  const snapshot = db.getWorkerSnapshot(bot.id);
+  assert.equal(snapshot.env.NAPCAT_WS_URL, 'ws://console.invalid/'); assert.equal(snapshot.env.NAPCAT_TOKEN, '');
+  assert.equal(snapshot.env.ACTION_TIMEOUT_MS, '21000'); assert.equal(snapshot.env.AGENT_API_KEY, 'synthetic-model-token');
+  const serialized = JSON.stringify(snapshot);
+  assert.equal(serialized.includes(connection.wsUrl), false); assert.equal(serialized.includes(connection.token!), false);
+  const other = db.createNapcatConnection({name: 'Secondary', wsUrl: 'ws://secondary.example/'});
+  db.bindNapcatAccount(connection.id, '12345'); db.bindNapcatAccount(other.id, '12345');
+  const updated = db.updateBot(bot.id, {connectionId: other.id, expectedRevision: 1});
+  assert.equal(updated.desiredRevision, 2); assert.equal(updated.volume, bot.volume); assert.equal(updated.connectionId, other.id);
+  db.updateNapcatConnection(other.id, {enabled: false});
+  assert.throws(() => db.setDesiredState(bot.id, 'running'), /停用/u);
+});
+
+test('known account IDs prevent duplicate target ownership across different resource URLs', t => {
+  const {db} = database(t);
+  const first = db.createNapcatConnection({name: 'First', wsUrl: 'ws://one.example/'});
+  const second = db.createNapcatConnection({name: 'Second', wsUrl: 'ws://two.example/'});
+  const one = db.createBot({name: 'One', targetType: 'group', targetId: '10001', connectionId: first.id, config: {}});
+  const two = db.createBot({name: 'Two', targetType: 'group', targetId: '10001', connectionId: second.id, config: {}});
+  db.setDesiredState(one.id, 'running'); db.setDesiredState(two.id, 'running');
+  db.bindNapcatAccount(first.id, '12345');
+  assert.throws(() => db.bindNapcatAccount(second.id, '12345'), /已有运行中的实例/u);
+  assert.equal(db.getNapcatConnection(second.id)!.accountId, null);
+  db.setDesiredState(one.id, 'stopped'); db.bindNapcatAccount(second.id, '12345');
+  assert.throws(() => db.setDesiredState(one.id, 'running'), /已有运行中的实例/u);
+  db.updateNapcatConnection(first.id, {wsUrl: 'ws://changed.example/'});
+  assert.equal(db.getNapcatConnection(first.id)!.accountId, '12345');
+  assert.throws(() => db.bindNapcatAccount(first.id, '54321'), /登录账号已改变/u);
+});
+
+test('connection references can change only after full stop and verified identical account ownership', t => {
+  const {db} = database(t); const bot = create(db);
+  const original = db.getNapcatConnection(bot.connectionId)!;
+  const sameAccount = db.createNapcatConnection({name: 'Alternate endpoint', wsUrl: 'ws://alternate.example/'});
+  assert.throws(() => db.updateBot(bot.id, {connectionId: sameAccount.id}), /必须先验证登录账号/u);
+  db.bindNapcatAccount(original.id, '12345');
+  assert.throws(() => db.updateBot(bot.id, {connectionId: sameAccount.id}), /必须先验证登录账号/u);
+  db.bindNapcatAccount(sameAccount.id, '12345');
+  db.setDesiredState(bot.id, 'running');
+  assert.throws(() => db.updateBot(bot.id, {connectionId: sameAccount.id}), /必须完全停止/u);
+  db.setDesiredState(bot.id, 'stopped'); db.setRuntime(bot.id, {state: 'stopping'});
+  assert.throws(() => db.updateBot(bot.id, {connectionId: sameAccount.id}), /必须完全停止/u);
+  db.setRuntime(bot.id, {state: 'stopped', drained: false});
+  assert.throws(() => db.updateBot(bot.id, {connectionId: sameAccount.id}), /必须完全停止/u);
+  db.setRuntime(bot.id, {drained: true, processing: true});
+  assert.throws(() => db.updateBot(bot.id, {connectionId: sameAccount.id}), /必须完全停止/u);
+  db.setRuntime(bot.id, {processing: false});
+  db.beginNapcatDelivery(bot.id, 'in-flight', 'a'.repeat(64));
+  assert.throws(() => db.updateBot(bot.id, {connectionId: sameAccount.id}), /必须完全停止/u);
+  db.finishNapcatDelivery(bot.id, 'in-flight', 'acknowledged');
+  const different = db.createNapcatConnection({name: 'Other account', wsUrl: 'ws://other-account.example/'});
+  db.bindNapcatAccount(different.id, '54321');
+  assert.throws(() => db.updateBot(bot.id, {connectionId: different.id}), /其他 QQ 账号，请新建实例/u);
+  const changed = db.updateBot(bot.id, {connectionId: sameAccount.id});
+  assert.equal(changed.connectionId, sameAccount.id); assert.equal(changed.volume, bot.volume); assert.equal(changed.desiredRevision, 2);
+});
+
+test('connection send deadlines revise referencing Workers while credentials and upstream reconnect changes stay central', t => {
+  const {db} = database(t); const one = create(db); const two = create(db, 'Other', '10002');
+  const id = one.connectionId; db.bindNapcatAccount(id, '12345');
+  db.updateNapcatConnection(id, {name: 'Renamed', token: 'synthetic-updated-token', wsUrl: 'ws://new-endpoint.example/', reconnectSeconds: 8});
+  assert.equal(db.getNapcatConnection(id)!.accountId, '12345');
+  assert.equal(db.getBot(one.id)!.desiredRevision, 1); assert.equal(db.getBot(two.id)!.desiredRevision, 1);
+  assert.equal(db.getWorkerSnapshot(one.id).env.RECONNECT_MS, '3000');
+  db.updateNapcatConnection(id, {actionTimeout: 22});
+  assert.equal(db.getBot(one.id)!.desiredRevision, 2); assert.equal(db.getBot(two.id)!.desiredRevision, 2);
+  assert.equal(db.getWorkerSnapshot(one.id).env.ACTION_TIMEOUT_MS, '22000');
+  assert.equal(db.getBot(one.id)!.volume, one.volume);
+  db.updateNapcatConnection(id, {actionTimeout: 22});
+  assert.equal(db.getBot(one.id)!.desiredRevision, 2);
+});
+
+test('legacy endpoint settings merge connections without altering instance revisions, volumes or stored history', t => {
+  const directory = mkdtempSync(join(tmpdir(), 'console-connection-migration-'));
+  const path = join(directory, 'console.sqlite3'); const keyPath = join(directory, 'master.key');
+  const initial = new ConsoleDatabase(path, keyPath);
+  const first = create(initial, 'First', '10001'); const second = create(initial, 'Second', '10002');
+  initial.ingestHeartbeat(first.id, heartbeat([event(1, 'conversation.started'), event(2, 'message.received', {messageId: 'persisted', text: 'Synthetic history'})]));
+  initial.close();
+  const inspector = new DatabaseSync(path);
+  const legacyConfig = {...defaultSettings(), wsUrl: 'ws://legacy.example:3002/', napcatToken: 'synthetic-legacy-token'};
+  const nonce = randomBytes(12); const cipher = createCipheriv('aes-256-gcm', readFileSync(keyPath), nonce);
+  const ciphertext = Buffer.concat([cipher.update(JSON.stringify(legacyConfig), 'utf8'), cipher.final()]);
+  const stored = Buffer.concat([nonce, cipher.getAuthTag(), ciphertext]).toString('base64');
+  inspector.prepare('UPDATE config_revisions SET config_cipher=?').run(stored);
+  inspector.exec('UPDATE bots SET connection_id=NULL; DELETE FROM napcat_connections');
+  inspector.close();
+  const db = new ConsoleDatabase(path, keyPath); t.after(() => {db.close(); rmSync(directory, {recursive: true, force: true});});
+  assert.equal(db.listNapcatConnections().length, 1);
+  assert.equal(db.getBot(first.id)!.connectionId, db.getBot(second.id)!.connectionId);
+  assert.equal(db.getBot(first.id)!.volume, first.volume); assert.equal(db.getBot(first.id)!.workerToken, first.workerToken);
+  assert.equal(db.getBot(first.id)!.desiredRevision, first.desiredRevision); assert.equal(db.getBot(first.id)!.appliedRevision, 1);
+  assert.equal(db.getConversation(first.id)!.items.length, 2);
+  const resource = db.listNapcatConnections()[0]!; assert.equal(resource.wsUrl, legacyConfig.wsUrl); assert.equal(resource.token, legacyConfig.napcatToken);
+  const reopened = new ConsoleDatabase(path, keyPath); t.after(() => reopened.close());
+  assert.equal(reopened.listNapcatConnections().length, 1);
+});
+
+test('persistent inbound queue preserves order, isolates ACKs, deduplicates after ACK and survives reconnects', t => {
+  const {db, path, keyPath} = database(t); const bot = create(db); const other = create(db, 'Other', '10002');
+  assert.equal(db.enqueueNapcatEvent(bot.id, {text: 'not running'}, 'stopped'), null);
+  db.setDesiredState(bot.id, 'running'); db.setDesiredState(other.id, 'running');
+  const first = db.enqueueNapcatEvent(bot.id, {text: 'first synthetic message'}, 'conn:one')!;
+  const foreign = db.enqueueNapcatEvent(other.id, {text: 'another instance'}, 'conn:one')!;
+  const second = db.enqueueNapcatEvent(bot.id, {text: 'second synthetic message'}, 'conn:two')!;
+  assert.ok(second > first); assert.deepEqual(db.pendingNapcatEvents(bot.id).map(item => item.seq), [first, second]);
+  const inspector = new DatabaseSync(path); t.after(() => inspector.close());
+  assert.equal(JSON.stringify(inspector.prepare('SELECT * FROM napcat_inbound').all()).includes('first synthetic message'), false);
+  db.ackNapcatEvents(bot.id, first); db.ackNapcatEvents(bot.id, first);
+  assert.equal(db.napcatAcknowledgedSeq(bot.id), first); assert.equal(db.pendingNapcatEventCount(other.id), 1);
+  assert.equal(db.enqueueNapcatEvent(bot.id, {text: 'duplicate'}, 'conn:one'), null);
+  const reopened = new ConsoleDatabase(path, keyPath); t.after(() => reopened.close());
+  assert.equal(reopened.napcatAcknowledgedSeq(bot.id), first);
+  assert.deepEqual(reopened.pendingNapcatEvents(bot.id), [{seq: second, event: {text: 'second synthetic message'}}]);
+  assert.deepEqual(reopened.pendingNapcatEvents(other.id).map(item => item.seq), [foreign]);
+  reopened.ackNapcatEvents(bot.id, second); reopened.ackNapcatEvents(bot.id, first);
+  assert.equal(reopened.napcatAcknowledgedSeq(bot.id), second); assert.equal(reopened.pendingNapcatEventCount(bot.id), 0);
+});
+
+test('inbound queue bounds reject newest messages and expire retained data with inspectable counts', t => {
+  t.mock.timers.enable({apis: ['Date'], now: Date.parse('2026-01-01T00:00:00Z')});
+  const {db} = database(t); const bot = create(db); db.setDesiredState(bot.id, 'running');
+  for (let index = 0; index < NAPCAT_QUEUE_LIMITS.messages; index++) assert.notEqual(db.enqueueNapcatEvent(bot.id, {id: index}, `id:${index}`), null);
+  assert.equal(db.enqueueNapcatEvent(bot.id, {id: 'overflow'}, 'overflow'), null);
+  assert.equal(db.getNapcatQueueStats(bot.id).pending, NAPCAT_QUEUE_LIMITS.messages); assert.equal(db.getNapcatQueueStats(bot.id).dropped, 1);
+  t.mock.timers.tick(NAPCAT_QUEUE_LIMITS.retentionMs + 1);
+  assert.equal(db.pendingNapcatEventCount(bot.id), 0); assert.equal(db.getNapcatQueueStats(bot.id).expired, NAPCAT_QUEUE_LIMITS.messages);
+  const large = 'x'.repeat(NAPCAT_QUEUE_LIMITS.bytes);
+  assert.equal(db.enqueueNapcatEvent(bot.id, {text: large}, 'oversized'), null);
+  assert.equal(db.getNapcatQueueStats(bot.id).dropped, 2);
+  assert.notEqual(db.enqueueNapcatEvent(bot.id, {id: 'fresh'}, 'id:0'), null);
+});
+
+test('inbound event byte limit accepts its boundary and drops oversized packets before they can block delivery', t => {
+  const {db} = database(t); const bot = create(db); db.setDesiredState(bot.id, 'running');
+  const overhead = Buffer.byteLength(JSON.stringify({text: ''}));
+  const boundary = {text: 'x'.repeat(NAPCAT_EVENT_MAX_BYTES - overhead)};
+  assert.equal(Buffer.byteLength(JSON.stringify(boundary)), NAPCAT_EVENT_MAX_BYTES);
+  const accepted = db.enqueueNapcatEvent(bot.id, boundary, 'exact-boundary');
+  assert.notEqual(accepted, null);
+  assert.equal(db.getNapcatQueueStats(bot.id).bytes, NAPCAT_EVENT_MAX_BYTES);
+  assert.equal(db.enqueueNapcatEvent(bot.id, {text: `${boundary.text}x`}, 'one-byte-over'), null);
+  const unicode = {text: '中'.repeat(Math.floor((NAPCAT_EVENT_MAX_BYTES - overhead) / 3) + 1)};
+  assert.ok(Buffer.byteLength(JSON.stringify(unicode)) > NAPCAT_EVENT_MAX_BYTES);
+  assert.equal(db.enqueueNapcatEvent(bot.id, unicode, 'unicode-over'), null);
+  assert.equal(db.getNapcatQueueStats(bot.id).dropped, 2);
+  assert.equal(db.pendingNapcatEventCount(bot.id), 1);
+  db.ackNapcatEvents(bot.id, accepted!);
+  const normal = db.enqueueNapcatEvent(bot.id, {text: 'normal message'}, 'normal-message');
+  assert.deepEqual(db.pendingNapcatEvents(bot.id), [{seq: normal, event: {text: 'normal message'}}]);
+});
+
+test('outbound ledger is idempotent, isolates instances, and recovers started requests without retries', t => {
+  const {db, path, keyPath} = database(t); const bot = create(db); const other = create(db, 'Other', '10002');
+  const hash = 'a'.repeat(64);
+  assert.equal(db.beginNapcatDelivery(bot.id, 'delivery-one', hash).created, true);
+  assert.equal(db.beginNapcatDelivery(bot.id, 'delivery-one', hash).created, false);
+  assert.throws(() => db.beginNapcatDelivery(bot.id, 'delivery-one', 'b'.repeat(64)), /不同内容/u);
+  db.beginNapcatDelivery(other.id, 'delivery-one', hash);
+  db.finishNapcatDelivery(bot.id, 'delivery-one', 'acknowledged', {message_id: 42});
+  db.finishNapcatDelivery(bot.id, 'delivery-one', 'failed');
+  assert.equal(db.getNapcatDelivery(bot.id, 'delivery-one')!.state, 'acknowledged');
+  assert.equal(db.pendingNapcatDeliveryCount(other.id), 1);
+  const reopened = new ConsoleDatabase(path, keyPath); t.after(() => reopened.close());
+  assert.equal(reopened.getNapcatDelivery(other.id, 'delivery-one')!.state, 'started');
+  assert.equal(reopened.recoverNapcatDeliveries(), 1);
+  assert.equal(reopened.getNapcatDelivery(other.id, 'delivery-one')!.state, 'unconfirmed');
+  assert.equal(reopened.beginNapcatDelivery(other.id, 'delivery-one', hash).created, false);
+  assert.equal(reopened.pendingNapcatDeliveryCount(other.id), 0);
+  assert.deepEqual(reopened.getNapcatDelivery(bot.id, 'delivery-one')!.result, {message_id: 42});
 });
 
 test('partial updates preserve credentials; explicit null clears only the selected secret', () => {
@@ -94,7 +298,11 @@ test('database encrypts configuration and worker token at rest, keeps key privat
   assert.equal(publicBot.configuredSecrets.napcatToken, true); assert.equal(publicBot.configuredSecrets.tavilyApiKey, false);
   assert.equal(db.verifyWorkerToken(bot.id, bot.workerToken), true); assert.equal(db.verifyWorkerToken(bot.id, 'wrong'), false);
   assert.equal(db.verifyWorkerToken('missing', bot.workerToken), false);
-  assert.equal(db.getWorkerSnapshot(bot.id).env.NAPCAT_TOKEN, 'credential-napcat-123');
+  const snapshot = db.getWorkerSnapshot(bot.id);
+  assert.equal(snapshot.env.NAPCAT_TOKEN, ''); assert.equal(snapshot.env.NAPCAT_WS_URL, 'ws://console.invalid/');
+  assert.equal(snapshot.connectionId, bot.connectionId); assert.equal(snapshot.transport, 'console');
+  assert.equal('wsUrl' in publicBot.config, false); assert.equal('actionTimeout' in publicBot.config, false);
+  assert.equal('reconnectSeconds' in publicBot.config, false);
   const second = new ConsoleDatabase(path, keyPath); t.after(() => second.close());
   assert.equal(second.getBot(bot.id)!.workerToken, bot.workerToken);
   const wrongKey = join(dirname(keyPath), 'wrong.key'); writeFileSync(wrongKey, Buffer.alloc(32, 1));
@@ -103,10 +311,10 @@ test('database encrypts configuration and worker token at rest, keeps key privat
 });
 
 test('configuration revisions are optimistic, names do not restart worker, and target is immutable', t => {
-  const { db } = database(t); const bot = create(db);
+  const { db } = database(t); const bot = db.createBot({name: 'test', targetType: 'group', targetId: '10001', config: {napcatToken: 'keep-this-secret'}});
   assert.equal(bot.desiredRevision, 1); assert.equal(bot.appliedRevision, 0); assert.equal(bot.desiredState, 'stopped');
   assert.equal(db.updateBot(bot.id, { name: 'renamed', expectedRevision: 1 }).desiredRevision, 1);
-  const updated = db.updateBot(bot.id, { config: { replyProbability: 100, napcatToken: 'keep-this-secret' }, expectedRevision: 1 });
+  const updated = db.updateBot(bot.id, { config: { replyProbability: 100 }, expectedRevision: 1 });
   assert.equal(updated.desiredRevision, 2); assert.equal(db.getWorkerSnapshot(bot.id).revision, 2);
   assert.throws(() => db.updateBot(bot.id, { config: { replyProbability: 10 }, expectedRevision: 1 }), /配置版本冲突/u);
   assert.equal(db.getBot(bot.id)!.desiredRevision, 2);
@@ -126,7 +334,7 @@ test('only one active worker per NapCat endpoint and immutable target is allowed
   const differentTarget = create(db, 'third', '10002'); db.setDesiredState(differentTarget.id, 'running');
   const differentConnection = db.createBot({ name: 'different endpoint', targetType: 'group', targetId: two.targetId, config: { wsUrl: 'ws://another-napcat.example:3002' } });
   db.setDesiredState(differentConnection.id, 'running');
-  assert.throws(() => db.updateBot(differentConnection.id, { config: { wsUrl: two.config.wsUrl } }), /已有运行中的实例/u);
+  assert.throws(() => db.updateBot(differentConnection.id, { config: { wsUrl: two.config.wsUrl } }), /必须完全停止/u);
   assert.equal(db.listPublicBots().length, 4);
 });
 
@@ -137,7 +345,7 @@ test('a stopped desired state does not release target ownership while its worker
   assert.throws(() => db.setDesiredState(two.id, 'running'), /已有运行中的实例/u);
   const anotherEndpoint = db.createBot({ name: 'another endpoint', targetType: 'group', targetId: one.targetId, config: { wsUrl: 'ws://another.example:3002' } });
   db.setDesiredState(anotherEndpoint.id, 'running');
-  assert.throws(() => db.updateBot(anotherEndpoint.id, { config: { wsUrl: one.config.wsUrl } }), /已有运行中的实例/u);
+  assert.throws(() => db.updateBot(anotherEndpoint.id, { config: { wsUrl: one.config.wsUrl } }), /必须完全停止/u);
   db.setRuntime(one.id, { state: 'error' });
   assert.throws(() => db.setDesiredState(two.id, 'running'), /已有运行中的实例/u);
   db.setRuntime(one.id, { state: 'stopped' }); db.setDesiredState(two.id, 'running');
@@ -227,7 +435,7 @@ test('change cursor is persistent and contains no secrets; settings and latency 
   ]));
   assert.equal(db.getLatencyP95(bot.id, 0), 19); assert.equal(db.getLatencyP95(bot.id, 1025), null);
   const changes = db.listChanges(before);
-  assert.ok(changes.length >= 3); assert.equal(changes[0]!.type, 'bot.created');
+  assert.ok(changes.length >= 3); assert.ok(changes.some(change => change.type === 'bot.created'));
   assert.equal(changes.at(-1)!.seq, db.getEventCursor()); assert.equal(db.listChanges(db.getEventCursor()).length, 0);
   assert.equal(JSON.stringify(changes).includes(bot.workerToken), false);
 });

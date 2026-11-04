@@ -3,7 +3,9 @@ node_modules/
 dist/
 coverage/
 playwright-report/
+.playwright-mcp/
 test-results/
+/src/plugin-system/generated/
 
 # Real environment files and deployment manifests stay local.
 .env
@@ -41,3 +43,5 @@ id_dsa
 *.local
 *.local.*
 .DS_Store
+__pycache__/
+*.py[cod]

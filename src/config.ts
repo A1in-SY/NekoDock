@@ -1,7 +1,9 @@
+import type { MemoryConfig } from './memory-contract.js';
 import { resolve } from 'node:path';
 import type { Target } from './types.js';
 import { loadWebSearchConfig, type WebSearchConfig } from './web-search.js';
 import { loadTtsConfig, type TtsConfig } from './tts.js';
+import { loadNetworkProxyConfig, type NetworkProxyConfig } from './network.js';
 
 export interface Config {
   target: Target;
@@ -18,11 +20,16 @@ export interface Config {
   agentContextWindow: number;
   agentCompactLimit: number;
   agentMaxOutputTokens: number;
+  agentKeepRecentTokens: number;
+  agentSummaryMaxTokens: number;
+  memory: MemoryConfig;
   agentSupportsImages: boolean;
   agentSupportsReasoning: boolean;
   allowCommands: boolean;
   allowFileWrites: boolean;
+  taskCreatorOnly: boolean;
   persona: string;
+  networkProxy: NetworkProxyConfig;
   webSearch: WebSearchConfig;
   tts: TtsConfig;
   voiceReplyEnabled: boolean;
@@ -36,6 +43,9 @@ export interface Config {
   actionTimeoutMs: number;
   imageMaxBytes: number;
   imageTimeoutMs: number;
+  /** Persistent inbound images in this Worker's volume; unrelated to model context lifetime. */
+  imageCacheDays: number;
+  imageCacheMaxBytes: number;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -105,6 +115,29 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const agentMaxOutputTokens = tokenLimit('AGENT_MAX_OUTPUT_TOKENS', 8192);
   if (agentCompactLimit >= agentContextWindow) throw new Error('AGENT_AUTO_COMPACT_TOKEN_LIMIT 必须小于 AGENT_CONTEXT_WINDOW');
   if (agentMaxOutputTokens > agentContextWindow - agentCompactLimit) throw new Error('AGENT_MAX_OUTPUT_TOKENS 不能大于上下文窗口与自动压缩阈值之间的预留量');
+  const agentKeepRecentTokens = tokenLimit('AGENT_KEEP_RECENT_TOKENS', Math.min(20_000, Math.max(1, Math.floor(agentCompactLimit / 4))));
+  const agentSummaryMaxTokens = tokenLimit('AGENT_SUMMARY_MAX_TOKENS', Math.min(4000, agentMaxOutputTokens));
+  if (agentKeepRecentTokens >= agentCompactLimit) throw new Error('AGENT_KEEP_RECENT_TOKENS 必须小于自动压缩阈值');
+  if (agentSummaryMaxTokens > agentMaxOutputTokens) throw new Error('AGENT_SUMMARY_MAX_TOKENS 不能大于最大输出量');
+  const memoryUrl = (name: string): string => {
+    const input = env[name]?.trim() ?? ''; if (!input) return '';
+    let value: URL; try { value = new URL(input); } catch { throw new Error(`${name} 必须为有效的 HTTP 地址`); }
+    if (!['http:', 'https:'].includes(value.protocol) || value.username || value.password || value.search || value.hash) throw new Error(`${name} 必须为不含凭据的 HTTP 地址`);
+    return value.toString().replace(/\/+$/, '');
+  };
+  const memoryTime = env.MEMORY_DAILY_TIME ?? '04:00';
+  if (!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(memoryTime)) throw new Error('MEMORY_DAILY_TIME 必须为 HH:mm');
+  const memoryZone = env.MEMORY_TIMEZONE ?? 'Asia/Shanghai';
+  try { new Intl.DateTimeFormat('en', { timeZone: memoryZone }).format(); } catch { throw new Error('MEMORY_TIMEZONE 必须为有效 IANA 时区'); }
+  const embeddingProvider = env.MEMORY_EMBEDDING_PROVIDER ?? 'none';
+  if (!['none', 'openai-compatible'].includes(embeddingProvider)) throw new Error('MEMORY_EMBEDDING_PROVIDER 选项无效');
+  const memory: MemoryConfig = { enabled: boolean('MEMORY_ENABLED', false), dailyEnabled: boolean('MEMORY_DAILY_ENABLED', true), dailyTime: memoryTime, timezone: memoryZone,
+    afterCompaction: boolean('MEMORY_AFTER_COMPACTION', true), recallTokens: number('MEMORY_RECALL_TOKENS', 3000, 16000),
+    model: env.MEMORY_MODEL?.trim() ?? '', baseUrl: memoryUrl('MEMORY_BASE_URL'), apiKey: env.MEMORY_API_KEY || undefined,
+    embeddingProvider: embeddingProvider as MemoryConfig['embeddingProvider'], embeddingBaseUrl: memoryUrl('MEMORY_EMBEDDING_BASE_URL'),
+    embeddingModel: env.MEMORY_EMBEDDING_MODEL?.trim() ?? '', embeddingApiKey: env.MEMORY_EMBEDDING_API_KEY || undefined };
+  for (const value of [memory.model, memory.embeddingModel]) if (value.length > 1024 || /[\x00-\x1f\x7f]/u.test(value)) throw new Error('MEMORY_MODEL 模型名称无效');
+  if (memory.embeddingProvider !== 'none' && (!memory.embeddingBaseUrl || !memory.embeddingModel)) throw new Error('MEMORY_EMBEDDING_PROVIDER 启用时必须填写服务地址与模型');
   const agentTimeoutMs = Number(agentValue('AGENT_TIMEOUT_MS', 'CODEX_TIMEOUT_MS') ?? 600_000);
   if (!Number.isSafeInteger(agentTimeoutMs) || agentTimeoutMs <= 0) throw new Error('AGENT_TIMEOUT_MS 必须为正的安全整数');
   const dataDir = resolve(env.DATA_DIR ?? './data');
@@ -128,12 +161,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     agentHome: resolve(env.AGENT_HOME ?? `${dataDir}/pi`),
     workspace: resolve(agentValue('AGENT_WORKSPACE', 'CODEX_WORKSPACE') ?? `${dataDir}/workspace`),
     agentModel, agentBaseUrl, agentApiKey, agentApi, agentReasoning,
-    agentContextWindow, agentCompactLimit, agentMaxOutputTokens,
+    agentContextWindow, agentCompactLimit, agentMaxOutputTokens, agentKeepRecentTokens, agentSummaryMaxTokens, memory,
     agentSupportsImages: boolean('AGENT_SUPPORTS_IMAGES', true),
     agentSupportsReasoning: boolean('AGENT_SUPPORTS_REASONING', true),
     allowCommands: boolean('AGENT_ALLOW_COMMANDS', legacySandbox === 'danger-full-access'),
     allowFileWrites: boolean('AGENT_ALLOW_FILE_WRITES', legacySandbox !== 'read-only'),
+    taskCreatorOnly: boolean('TASK_CREATOR_ONLY', true),
     persona: env.AGENT_PERSONA ?? '',
+    networkProxy: loadNetworkProxyConfig(env),
     webSearch: loadWebSearchConfig(env),
     tts, voiceReplyEnabled, voiceReplyProbability,
     agentTimeoutMs,
@@ -144,5 +179,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     actionTimeoutMs: number('ACTION_TIMEOUT_MS', 15_000),
     imageMaxBytes: number('IMAGE_MAX_BYTES', 10 * 1024 * 1024),
     imageTimeoutMs: number('IMAGE_TIMEOUT_MS', 15_000),
+    imageCacheDays: number('IMAGE_CACHE_DAYS', 30, Math.floor(Number.MAX_SAFE_INTEGER / 86_400_000)),
+    imageCacheMaxBytes: number('IMAGE_CACHE_MAX_BYTES', 2048 * 1024 * 1024),
   };
 }

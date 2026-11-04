@@ -27,9 +27,12 @@ secrets
 credentials
 coverage
 playwright-report
+.playwright-mcp
 test-results
 
 # Local control-plane database, encrypted keys and deployment snapshots.
 console-data
 backups
 *.log
+**/__pycache__
+**/*.py[cod]

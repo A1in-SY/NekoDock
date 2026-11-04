@@ -23,10 +23,16 @@ npm run build:web
 
 ```bash
 docker compose -f compose.console.yaml --profile build build worker-image
-docker compose -f compose.console.yaml up -d --build console
+docker compose -f compose.console.yaml build console
+docker compose -f compose.console.yaml build plugin-runner
+docker compose -f compose.console.yaml up -d console plugin-runner
 ```
 
 先通过控制台重启一个验证实例，确认运行正常，再逐个更新其他受管实例。等待当前轮生成与发送 ACK 完成，再由控制台重建容器。检查运行状态、NapCat 连接、Pi 会话和配置生效版本。不要强杀仍有待发记录的容器。
+
+构建前检查可用内存、Swap 和磁盘空间。每条构建命令只指定一个服务，等待该服务构建完成后再构建下一个；不要依赖 `COMPOSE_PARALLEL_LIMIT` 限制 Buildx Bake 的并发。小内存主机应为编译进程设置内存上限，并在构建时观察内存压力与换页情况。
+
+每次更新前记录当前镜像 ID，并为 Worker、Console 和插件运行器保留一组回滚镜像。全部实例更新并验证成功后，立即清理本项目更早且无容器引用的镜像，以及已被替换、排空并停用的旧容器；正常停止的受管实例容器继续保留。镜像只保留当前版本、所有容器仍在引用的版本和最近一组已验证的回滚版本，逐项删除，不使用强制删除。检查构建缓存占用；共享 Docker 主机仅清理能确认归属本项目的缓存。清理前后记录磁盘用量，核对容器状态；更新失败时保留回滚资源。不要使用全局 `docker system prune`、`container prune`、`image prune -a` 或卷清理，不删除数据卷、数据库、配置和备份。
 
 纳管独立 Worker 时，先备份、停止旧实例并关闭自动重启，再导入原配置和原卷。受管期间不要再次执行旧 Compose 的启动命令。
 

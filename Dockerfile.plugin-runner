@@ -1,0 +1,28 @@
+FROM node:24.16.0-bookworm-slim AS build
+WORKDIR /app
+COPY package.json package-lock.json tsconfig.json ./
+RUN npm ci --ignore-scripts
+COPY src ./src
+COPY scripts ./scripts
+RUN npm run build && npm prune --omit=dev --ignore-scripts
+
+FROM node:24.16.0-bookworm-slim
+ARG YT_DLP_VERSION=2026.10.26
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates python3 python3-venv python3-pil fonts-noto-cjk fonts-noto-color-emoji ffmpeg \
+    && python3 -m venv /opt/plugin-tools \
+    && /opt/plugin-tools/bin/pip install --no-cache-dir "yt-dlp==${YT_DLP_VERSION}" \
+    && ln -s /opt/plugin-tools/bin/yt-dlp /usr/local/bin/yt-dlp \
+    && yt-dlp --version && ffprobe -version \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /runner-work /plugin-bootstrap \
+    && chown -R node:node /runner-work
+WORKDIR /app
+COPY --from=build /app/package.json ./
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/dist/src ./dist/src
+COPY src/plugins/bilibili/render ./dist/src/plugins/bilibili/render
+COPY src/plugins/heybox/render ./dist/src/plugins/heybox/render
+ENV NODE_ENV=production PLUGIN_RUNNER_WORKDIR=/runner-work
+USER node
+CMD ["node", "dist/src/plugin-runner.js"]

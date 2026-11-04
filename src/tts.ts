@@ -1,4 +1,8 @@
 import { spawn } from 'node:child_process';
+import { constants } from 'node:fs';
+import { access, open, realpath } from 'node:fs/promises';
+import { basename, delimiter, isAbsolute, resolve } from 'node:path';
+import { defaultNetworkProxy, proxyEnvironment, proxyUrlWithCredentials, routeNetworkUrl, type NetworkProxyConfig } from './network.js';
 import { isMp3, MAX_VOICE_BYTES } from './audio.js';
 import { logEvent } from './logging.js';
 import type { Logger } from './types.js';
@@ -63,9 +67,14 @@ export function loadTtsConfig(env: NodeJS.ProcessEnv = process.env): TtsConfig {
   };
 }
 
-export function createSpeechProvider(config: TtsConfig, logger: Logger): SpeechProvider | null {
+export interface SpeechNetworkOptions {
+  fetch?: typeof globalThis.fetch;
+  networkProxy?: NetworkProxyConfig;
+}
+
+export function createSpeechProvider(config: TtsConfig, logger: Logger, options: SpeechNetworkOptions = {}): SpeechProvider | null {
   if (config.provider === 'none') return null;
-  return config.provider === 'mimo' ? new MimoTtsProvider(config, logger) : new EdgeTtsProvider(config, logger);
+  return config.provider === 'mimo' ? new MimoTtsProvider(config, logger, options) : new EdgeTtsProvider(config, logger, options);
 }
 
 const MAX_STDERR_BYTES = 64 * 1_024;
@@ -100,7 +109,7 @@ function loadMimoConfig(env: NodeJS.ProcessEnv): MimoConfig {
 class MimoTtsProvider implements SpeechProvider {
   readonly name = 'mimo';
 
-  constructor(private readonly config: MimoConfig, private readonly logger: Logger) {}
+  constructor(private readonly config: MimoConfig, private readonly logger: Logger, private readonly network: SpeechNetworkOptions) {}
 
   async synthesize(text: string, signal: AbortSignal): Promise<{ file: string }> {
     const started = Date.now();
@@ -132,7 +141,7 @@ class MimoTtsProvider implements SpeechProvider {
     const combined = AbortSignal.any([signal, timeout.signal]);
     try {
       combined.throwIfAborted();
-      const response = await fetch(`${this.config.baseUrl}/chat/completions`, {
+      const response = await (this.network.fetch ?? fetch)(`${this.config.baseUrl}/chat/completions`, {
         method: 'POST',
         redirect: 'manual',
         headers: {
@@ -221,7 +230,7 @@ function audioTooLarge(): TtsError { return new TtsError('TTS_AUDIO_TOO_LARGE', 
 class EdgeTtsProvider implements SpeechProvider {
   readonly name = 'edge-tts';
 
-  constructor(private readonly config: EdgeConfig, private readonly logger: Logger) {}
+  constructor(private readonly config: EdgeConfig, private readonly logger: Logger, private readonly network: SpeechNetworkOptions) {}
 
   async synthesize(text: string, signal: AbortSignal): Promise<{ file: string }> {
     const started = Date.now();
@@ -247,17 +256,24 @@ class EdgeTtsProvider implements SpeechProvider {
     }
   }
 
-  private run(text: string, signal: AbortSignal): Promise<Buffer> {
+  private async run(text: string, signal: AbortSignal): Promise<Buffer> {
+    const proxy = this.network.networkProxy ?? defaultNetworkProxy();
+    const launch = proxy.enabled ? await edgeProxyLaunch(this.config, proxy) : undefined;
+    if (signal.aborted) throw cancelled();
+    if (this.network.networkProxy) logEvent(this.logger, 'info', 'network.route', {
+      category: 'tts', ...routeNetworkUrl(proxy, 'wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1'),
+    });
     return new Promise((resolve, reject) => {
-      // Use stdin for text and stdout for media: no temporary files or spoken text in argv.
-      const child = spawn(this.config.bin, [
+      // Text uses stdin and media uses stdout. Proxy credentials use an extra pipe,
+      // never argv, and the Python API selects the proxy explicitly for WSS.
+      const child = spawn(launch?.command ?? this.config.bin, launch?.args ?? [
         '--file', '-', '--write-media', '-', '--no-progress', '--voice', this.config.voice,
         `--rate=${this.config.rate}`, `--volume=${this.config.volume}`, `--pitch=${this.config.pitch}`,
       ], {
         shell: false,
         detached: process.platform !== 'win32',
-        stdio: ['pipe', 'pipe', 'pipe'],
-        env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
+        stdio: ['pipe', 'pipe', 'pipe', ...(launch ? ['pipe' as const] : [])],
+        env: { ...proxyEnvironment({ ...proxy, enabled: false }, process.env), PYTHONIOENCODING: 'utf-8' },
       });
       let failure: TtsError | undefined;
       let closed = false;
@@ -277,7 +293,7 @@ class EdgeTtsProvider implements SpeechProvider {
         if (failure || closed) return;
         failure = error;
         chunks = [];
-        child.stdin.destroy();
+        child.stdin!.destroy();
         kill('SIGTERM');
         killTimer = setTimeout(() => kill('SIGKILL'), TERMINATE_GRACE_MS);
         killTimer.unref();
@@ -287,16 +303,21 @@ class EdgeTtsProvider implements SpeechProvider {
       timer.unref();
       signal.addEventListener('abort', abort, { once: true });
       child.on('error', () => fail(new TtsError('TTS_START_FAILED', 'Speech provider could not be started')));
-      child.stdin.on('error', () => fail(new TtsError('TTS_IO_ERROR', 'Speech provider input failed')));
-      child.stdout.on('error', () => fail(new TtsError('TTS_IO_ERROR', 'Speech provider output failed')));
-      child.stderr.on('error', () => fail(new TtsError('TTS_IO_ERROR', 'Speech provider diagnostics failed')));
-      child.stdout.on('data', (chunk: Buffer) => {
+      if (launch) {
+        const configuration = child.stdio[3] as import('node:stream').Writable;
+        configuration.on('error', () => fail(new TtsError('TTS_IO_ERROR', 'Speech provider configuration failed')));
+        configuration.end(JSON.stringify(launch.config), 'utf8');
+      }
+      child.stdin!.on('error', () => fail(new TtsError('TTS_IO_ERROR', 'Speech provider input failed')));
+      child.stdout!.on('error', () => fail(new TtsError('TTS_IO_ERROR', 'Speech provider output failed')));
+      child.stderr!.on('error', () => fail(new TtsError('TTS_IO_ERROR', 'Speech provider diagnostics failed')));
+      child.stdout!.on('data', (chunk: Buffer) => {
         if (failure) return;
         bytes += chunk.length;
         if (bytes > this.config.maxBytes) fail(new TtsError('TTS_AUDIO_TOO_LARGE', 'Speech audio exceeds TTS_MAX_BYTES'));
         else chunks.push(chunk);
       });
-      child.stderr.on('data', (chunk: Buffer) => {
+      child.stderr!.on('data', (chunk: Buffer) => {
         if (failure) return;
         stderrBytes += chunk.length;
         if (stderrBytes > MAX_STDERR_BYTES) fail(new TtsError('TTS_DIAGNOSTIC_TOO_LARGE', 'Speech provider diagnostics exceeded the limit'));
@@ -312,9 +333,55 @@ class EdgeTtsProvider implements SpeechProvider {
         chunks = [];
       });
       if (signal.aborted) abort();
-      if (!failure) child.stdin.end(text, 'utf8');
+      if (!failure) child.stdin!.end(text, 'utf8');
     });
   }
+}
+
+const EDGE_PROXY_PYTHON = `
+import asyncio, json, os, sys
+from edge_tts import Communicate
+with os.fdopen(3, 'r', encoding='utf-8') as config_pipe:
+    config = json.load(config_pipe)
+text = sys.stdin.buffer.read().decode('utf-8')
+async def run():
+    communicate = Communicate(text, config['voice'], rate=config['rate'], volume=config['volume'],
+                              pitch=config['pitch'], proxy=config['proxy'])
+    async for chunk in communicate.stream():
+        if chunk['type'] == 'audio':
+            sys.stdout.buffer.write(chunk['data'])
+            sys.stdout.buffer.flush()
+asyncio.run(run())
+`;
+
+async function edgeProxyLaunch(config: EdgeConfig, proxy: NetworkProxyConfig): Promise<{
+  command: string; args: string[]; config: { voice: string; rate: string; volume: string; pitch: string; proxy: string | null };
+}> {
+  let command: string;
+  try {
+    const candidates = isAbsolute(config.bin) || config.bin.includes('/') ? [resolve(config.bin)] :
+      (process.env.PATH ?? '').split(delimiter).map(directory => resolve(directory, config.bin));
+    let entry: string | undefined;
+    for (const candidate of candidates) {
+      try { await access(candidate, constants.X_OK); entry = await realpath(candidate); break; } catch { /* Try the next PATH entry. */ }
+    }
+    if (!entry) throw new Error();
+    const file = await open(entry, 'r');
+    let line: string;
+    try { const bytes = Buffer.alloc(512); const read = await file.read(bytes, 0, bytes.length, 0); line = bytes.subarray(0, read.bytesRead).toString('utf8').split('\n')[0]!; }
+    finally { await file.close(); }
+    const shebang = /^#!\s*(\S+)(?:\s+(\S+))?\s*$/u.exec(line);
+    if (!shebang) throw new Error();
+    command = basename(shebang[1]!) === 'env' ? shebang[2] ?? '' : shebang[1]!;
+    if (!/^python(?:\d+(?:\.\d+)*)?$/u.test(basename(command))) throw new Error();
+  } catch {
+    throw new TtsError('TTS_PROXY_UNSUPPORTED', 'Speech proxy requires a Python edge-tts entry point');
+  }
+  const route = routeNetworkUrl(proxy, 'wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1');
+  return { command, args: ['-c', EDGE_PROXY_PYTHON], config: {
+    voice: config.voice, rate: config.rate, volume: config.volume, pitch: config.pitch,
+    proxy: route.mode === 'proxy' ? proxyUrlWithCredentials(proxy) : null,
+  } };
 }
 
 function integerSetting(raw: string | undefined, name: string, fallback: number, maximum: number): number {

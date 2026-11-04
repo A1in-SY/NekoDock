@@ -13,6 +13,15 @@ import { createConsole } from '../src/console/server.js';
 
 const time='2026-10-25T06:00:00.123456789Z';
 const appTime='2026-10-25T14:00:00.123+08:00';
+test('gateway logs retain routing correlation without exposing message bodies or credentials',()=>{
+ const safe=sanitizeLogSnapshot({sourceId:'console:test',truncated:false,lines:[
+  {time:appTime,stream:'stdout',message:`${appTime} INFO napcat.api.succeeded echo="request-1" connection_id="connection-1" token="synthetic-secret"`},
+  {time:appTime,stream:'stdout',message:`${appTime} INFO console.napcat.delivery_finished bot_id="bot-1" connection_id="connection-1" delivery_id="delivery-1" seq=12 outcome="acknowledged" text="synthetic-private-chat"`},
+ ]},['synthetic-secret']);
+ assert.equal(safe.lines.length,2);assert.match(safe.lines[0]!.message,/connection_id="connection-1"/);
+ assert.match(safe.lines[1]!.message,/bot_id="bot-1"/);assert.match(safe.lines[1]!.message,/seq=12/);assert.match(safe.lines[1]!.message,/outcome="acknowledged"/);
+ assert.equal(JSON.stringify(safe).includes('synthetic-secret'),false);assert.equal(JSON.stringify(safe).includes('synthetic-private-chat'),false);
+});
 function frame(stream:1|2,text:string|Buffer):Buffer {
  const bytes=typeof text==='string'?Buffer.from(text):text;const header=Buffer.alloc(8);header[0]=stream;header.writeUInt32BE(bytes.length,4);return Buffer.concat([header,bytes]);
 }
@@ -124,7 +133,7 @@ test('authenticated real HTTP log SSE sends snapshots only on changes, reconnect
   const stream=await connect(`${base}/api/bots/${bot.id}/logs/stream`,cookie);clients.push(stream);await until(()=>stream.events.some(e=>e.event==='logs'));
   assert.equal(JSON.stringify(stream.events).includes(bot.workerToken),false);assert.equal(JSON.stringify(stream.events).includes('current-key'),false);
   const first=stream.events.filter(e=>e.event==='logs').length;await new Promise(resolve=>setTimeout(resolve,65));assert.equal(stream.events.filter(e=>e.event==='logs').length,first);
-  db.updateBot(bot.id,{expectedRevision:1,config:{napcatToken:'updated-key'}});docker.extra='updated-key current-key';await until(()=>stream.events.filter(e=>e.event==='logs').length>first);
+  db.updateNapcatConnection(bot.connectionId,{expectedRevision:1,token:'updated-key'});docker.extra='updated-key current-key';await until(()=>stream.events.filter(e=>e.event==='logs').length>first);
   assert.equal(JSON.stringify(stream.events).includes('updated-key'),false);assert.equal(JSON.stringify(stream.events).includes('current-key'),false);
   docker.available=false;await until(()=>stream.events.some(e=>e.event==='status'&&(e.data as {state:string}).state==='unavailable'));
   const beforeRecovery=stream.events.filter(e=>e.event==='logs').length;docker.available=true;

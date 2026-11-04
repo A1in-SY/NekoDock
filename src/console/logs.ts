@@ -5,6 +5,7 @@ import type { ConsoleAuth } from './auth.js';
 import type { ConsoleDatabase } from './database.js';
 import type { DockerClient } from './docker.js';
 import { SECRET_FIELDS } from './contracts.js';
+import { proxySecrets } from '../network.js';
 import { formatLogTime } from '../logging.js';
 
 export interface DockerLogLine { time:string; stream:'stdout'|'stderr'; message:string; }
@@ -65,13 +66,13 @@ export class DockerLogDecoder {
 
 // Only application metadata is shown here; raw Agent events, configuration dumps,
 // chat content, tool arguments/results and stack traces are not log-page data.
-const metadataFields=new Set(('botId revision action port through_seq count message_count reply_allowed resumed session_ref run_id stage reason failure duration_ms pid exit_code exit_signal stderr_bytes '+
+const metadataFields=new Set(('botId bot_id connection_id seq outcome revision action port through_seq count message_count reply_allowed resumed session_ref run_id stage reason failure duration_ms pid exit_code exit_signal stderr_bytes '+
  'attached_count failure_count text_count image_count segmented_count input_tokens cached_input_tokens output_tokens total_tokens type tool tool_ref tool_type tool_count status '+
  'request_ref run_ref start_index end_index delivery_id part_index reply_index message_index message_ref sender_ref message_seq trigger mentioned target_type inserted busy '+
  'bytes image_index direction source_type provider text_chars voice model probability selected enabled timeout_ms retry_ms waiter_count pending_count echo segment_count '+
  'error_code retcode code has_session cursor batch_size reply_count command_id kind result replayed draining signal connected sent_count attempted_count skipped_count '+
  'web_search_provider tts_provider target random_reply_probability queue_size processing item_hash item_type server server_hash tool_hash http_status source_count '+
- 'next_reply_index total has_reply pending_command part_count delivery_status close_code ready_state operation api accepted_requests item_ref aborted mode timeout confirmation_only reconnecting').split(' '));
+ 'next_reply_index total has_reply pending_command part_count delivery_status close_code ready_state operation api accepted_requests item_ref aborted mode timeout confirmation_only reconnecting category target_ref for_tools').split(' '));
 function safeMessage(raw:string,secrets:readonly string[]):{message:string;level:LogLine['level']}|null {
  const app=/^\d{4}-\d\d-\d\dT\S+ (INFO|WARN|ERROR|DEBUG) ([a-z][a-z0-9_.-]{0,100})(?: (.*))?$/u.exec(raw);
  let message:string,level:LogLine['level'];
@@ -128,7 +129,7 @@ export class LogStreams {
   const controller=new AbortController();const knownSecrets=new Set<string>();
   const stop=()=>{if(stopped)return;stopped=true;if(timer)clearTimeout(timer);controller.abort();this.clients.delete(client);if(!response.destroyed)response.end();};
   const client={token,stop};this.clients.add(client);response.once('close',stop);
-  const rememberSecrets=()=>{for(const bot of this.db.listBots()){knownSecrets.add(bot.workerToken);for(const field of SECRET_FIELDS)if(bot.config[field])knownSecrets.add(bot.config[field]!);}};
+  const rememberSecrets=()=>{for(const connection of this.db.listNapcatConnections())if(connection.token)knownSecrets.add(connection.token);for(const bot of this.db.listBots()){knownSecrets.add(bot.workerToken);for(const field of SECRET_FIELDS)if(bot.config[field])knownSecrets.add(bot.config[field]!);for(const secret of proxySecrets({enabled:bot.config.proxyEnabled,url:bot.config.proxyUrl,username:bot.config.proxyUsername,password:bot.config.proxyPassword,noProxy:bot.config.proxyNoProxy,forTools:bot.config.proxyForTools}))knownSecrets.add(secret);}};
   const write=(event:string,value:unknown)=>{
    if(stopped||response.destroyed)return;
    if(response.writableLength>512*1024){response.destroy();stop();return;}

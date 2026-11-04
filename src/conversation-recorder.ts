@@ -58,13 +58,14 @@ export class ConversationRecorder {
   reset(throughSeq: number, commandId: number | string): void {
     const id = randomUUID();
     this.db.prepare('UPDATE console_state SET conversation_id=? WHERE id=1').run(id);
-    this.append('conversation.started', { legacy:false }, `conversation:new:${commandId}`);
     const messages = this.db.prepare('SELECT message_id FROM messages WHERE seq>? ORDER BY seq').all(throughSeq);
     if (messages.length) {
       const messageIds = messages.map(row => String(row.message_id));
       // An already uploaded ingress retains its original seq and is moved by this event.
       for(let offset=0;offset<messageIds.length;offset+=500) this.append('conversation.messages_moved', { messageIds:messageIds.slice(offset,offset+500) }, `conversation:moved:${commandId}:${offset}`);
     }
+    // Move queued ingress before publishing the boundary that invalidates old work.
+    this.append('conversation.started', { legacy:false }, `conversation:new:${commandId}`);
   }
 
   pending(limit = 100): ConsoleEvent[] {

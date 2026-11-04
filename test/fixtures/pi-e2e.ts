@@ -19,11 +19,11 @@ export const busyReply = '我正在想上面的消息怎么回，你等会哦';
 export const pngBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==';
 export interface InputMessage { messageId: string; senderId: string; text: string; images?: Array<{ path: string }>; [key: string]: unknown }
 export interface ModelCall {
-  path: string; authorization?: string; body: Record<string, any>; batch: InputMessage[];
+  path: string; authorization?: string; body: Record<string, any>; batch: InputMessage[]; replyTargetMessageIds: string[];
   /** All tool responses after the latest user input, in provider wire format. */
   results: Array<Record<string, any>>; images: string[];
 }
-export interface Segment { type: string; data: { text?: string; file?: string; qq?: string } }
+export interface Segment { type: string; data: { text?: string; file?: string; qq?: string; id?: string } }
 export interface Outgoing { action: string; params: { group_id?: string; user_id?: string; message: Segment[] }; echo: string; connection: number }
 export interface RunningBridge {
   child: ChildProcessWithoutNullStreams; closed: boolean; code: number | null;
@@ -38,11 +38,16 @@ function messageText(item: Record<string, any>): string {
 export function decodeModelCall(path: string, authorization: string | undefined, body: Record<string, any>): ModelCall {
   const items: Array<Record<string, any>> = body.input ?? body.messages ?? [];
   const userIndex = items.findLastIndex(item => item.role === 'user');
-  const user = items[userIndex]; let batch: InputMessage[] = [];
-  try { const parsed = JSON.parse(user ? messageText(user) : 'null'); if (Array.isArray(parsed)) batch = parsed; } catch {}
+  const user = items[userIndex]; let batch: InputMessage[] = []; let replyTargetMessageIds: string[] = [];
+  try {
+    const parsed = JSON.parse(user ? messageText(user) : 'null');
+    if (parsed && Array.isArray(parsed.messages) && Array.isArray(parsed.replyTargetMessageIds)) {
+      batch = parsed.messages; replyTargetMessageIds = parsed.replyTargetMessageIds;
+    }
+  } catch {}
   const images = (user?.content && Array.isArray(user.content) ? user.content : [])
     .map((part: any) => part.image_url?.url ?? part.image_url ?? '').filter((url: unknown): url is string => typeof url === 'string' && url.startsWith('data:'));
-  return { path, authorization, body, batch, images,
+  return { path, authorization, body, batch, replyTargetMessageIds, images,
     results: items.slice(userIndex + 1).filter(item => item.type === 'function_call_output' || item.role === 'tool') };
 }
 
@@ -96,7 +101,7 @@ export async function piFixture(t: TestContext, handler: ModelHandler) {
   if (dockerImage) await chmod(directory, 0o755);
   const active = new Map<string, RunningBridge>();
   const processes: RunningBridge[] = []; const calls: ModelCall[] = []; const outgoing: Outgoing[] = [];
-  const authorizations: Array<string | undefined> = []; const failures: unknown[] = []; let connections = 0;
+  const authorizations: Array<string | undefined> = []; const inspections: string[] = []; const failures: unknown[] = []; let connections = 0;
   const model = createServer((request, response) => { void (async () => {
     let raw = ''; for await (const chunk of request) raw += String(chunk);
     const call = decodeModelCall(request.url ?? '', request.headers.authorization, JSON.parse(raw)); calls.push(call);
@@ -108,7 +113,14 @@ export async function piFixture(t: TestContext, handler: ModelHandler) {
     const connection = ++connections; authorizations.push(request.headers.authorization);
     socket.on('message', raw => {
       try {
-        const message = { ...JSON.parse(raw.toString()), connection } as Outgoing; outgoing.push(message);
+        const message = { ...JSON.parse(raw.toString()), connection } as Outgoing;
+        if (message.action === 'get_status' || message.action === 'get_login_info') {
+          inspections.push(message.action);
+          socket.send(JSON.stringify({echo: message.echo, status: 'ok', retcode: 0,
+            data: message.action === 'get_status' ? {online: true, good: true} : {user_id: '999', nickname: 'Isolated fixture'}}));
+          return;
+        }
+        outgoing.push(message);
         if (onSend(message, socket) !== false) socket.send(JSON.stringify({ echo: message.echo, status: 'ok', retcode: 0, data: { message_id: outgoing.length } }));
       } catch (error) { failures.push(error); }
     });
@@ -116,6 +128,7 @@ export async function piFixture(t: TestContext, handler: ModelHandler) {
   await Promise.all([once(napcat, 'listening'), new Promise<void>(resolve => model.listen(0, bindHost, resolve))]);
   const modelUrl = `http://${requestHost}:${(model.address() as AddressInfo).port}/v1`;
   const wsUrl = `ws://${requestHost}:${(napcat.address() as AddressInfo).port}`;
+  const localWsUrl = `ws://127.0.0.1:${(napcat.address() as AddressInfo).port}`;
   const dataPath = (target = '1001') => join(directory, `data-${target}`);
   const workspace = (target = '1001') => join(dataPath(target), 'workspace');
   const runtimeWorkspace = (target = '1001') => dockerImage ? '/data/workspace' : workspace(target);
@@ -199,7 +212,7 @@ export async function piFixture(t: TestContext, handler: ModelHandler) {
     for (const result of stopped) if (result.status === 'rejected') throw result.reason;
     assert.deepEqual(failures, []);
   });
-  return { directory, modelUrl, wsUrl, napcat, calls, outgoing, authorizations, processes, failures, dataPath, workspace, runtimeWorkspace,
+  return { directory, modelUrl, wsUrl, localWsUrl, napcat, calls, outgoing, inspections, authorizations, processes, failures, dataPath, workspace, runtimeWorkspace,
     start, stop, read, complete, event, broadcast, send: (id: string, text = id, mention = true, target = '1001', sender = '501') => broadcast(event(id, text, mention, target, sender)),
     waitFor, diagnostic, get connections() { return connections; }, set onSend(value: typeof onSend) { onSend = value; } };
 }

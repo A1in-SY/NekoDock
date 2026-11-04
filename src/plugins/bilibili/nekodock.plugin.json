@@ -1,0 +1,166 @@
+{
+  "kind": "nekodock-plugin",
+  "id": "bilibili",
+  "name": "哔哩哔哩增强",
+  "description": "解析视频、动态和直播分享，补充内容资料，并按实例配置展示。",
+  "version": "1.1.0",
+  "apiVersion": 1,
+  "entries": {
+    "console": "./index.js",
+    "runner": "./runner.js"
+  },
+  "capabilities": [
+    "commands",
+    "content-enrichment",
+    "video-download"
+  ],
+  "resourceTypes": [
+    "video",
+    "post",
+    "live"
+  ],
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "enhance": {
+        "type": "boolean",
+        "title": "视频上下文增强",
+        "default": true,
+        "group": "视频"
+      },
+      "subtitles": {
+        "type": "boolean",
+        "title": "尝试获取字幕",
+        "default": true,
+        "group": "视频"
+      },
+      "autoVideo": {
+        "type": "boolean",
+        "title": "自动发送视频",
+        "default": false,
+        "group": "视频"
+      },
+      "maxDurationSeconds": {
+        "type": "integer",
+        "title": "视频时长上限（秒）",
+        "minimum": 1,
+        "maximum": 3600,
+        "default": 300,
+        "group": "视频"
+      },
+      "maxMiB": {
+        "type": "integer",
+        "title": "视频大小上限（MiB）",
+        "minimum": 1,
+        "maximum": 256,
+        "default": 50,
+        "group": "视频"
+      },
+      "maxHeight": {
+        "type": "integer",
+        "title": "最高画面高度",
+        "minimum": 144,
+        "maximum": 1080,
+        "default": 720,
+        "group": "视频"
+      },
+      "dynamicEnhance": {
+        "type": "boolean",
+        "title": "动态上下文增强",
+        "default": true,
+        "group": "动态"
+      },
+      "dynamicDisplay": {
+        "type": "string",
+        "title": "动态自动展示",
+        "enum": [
+          "off",
+          "original",
+          "card"
+        ],
+        "enumLabels": [
+          "关闭",
+          "原始图文",
+          "排版图片"
+        ],
+        "default": "off",
+        "group": "动态"
+      },
+      "liveEnhance": {
+        "type": "boolean",
+        "title": "直播上下文增强",
+        "default": true,
+        "group": "直播"
+      },
+      "liveDisplay": {
+        "type": "string",
+        "title": "直播自动展示",
+        "enum": [
+          "off",
+          "original",
+          "card"
+        ],
+        "enumLabels": [
+          "关闭",
+          "原始图文",
+          "排版图片"
+        ],
+        "default": "off",
+        "group": "直播"
+      },
+      "timeoutSeconds": {
+        "type": "integer",
+        "title": "下载总超时（秒）",
+        "minimum": 5,
+        "maximum": 600,
+        "default": 120,
+        "group": "通用"
+      },
+      "waitSeconds": {
+        "type": "integer",
+        "title": "本轮等待解析（秒）",
+        "minimum": 0,
+        "maximum": 5,
+        "default": 2,
+        "group": "通用"
+      },
+      "cacheHours": {
+        "type": "integer",
+        "title": "媒体缓存保留（小时）",
+        "minimum": 1,
+        "maximum": 720,
+        "default": 24,
+        "group": "通用"
+      },
+      "cacheMaxMiB": {
+        "type": "integer",
+        "title": "媒体缓存容量（MiB）",
+        "minimum": 50,
+        "maximum": 16384,
+        "default": 1024,
+        "group": "通用"
+      },
+      "cookie": {
+        "type": "string",
+        "title": "Cookie（可选）",
+        "description": "仅填写本实例使用的 Cookie；留空保留，清除时显式提交空字符串。",
+        "secret": true,
+        "group": "通用"
+      }
+    }
+  },
+  "commands": [
+    {
+      "name": "/bili info",
+      "description": "查询视频、动态或直播资料，可提供链接或引用分享消息。",
+      "contextPolicy": "chat",
+      "executor": "console"
+    },
+    {
+      "name": "/bili download",
+      "description": "下载并发送视频，可提供链接或引用分享消息。",
+      "contextPolicy": "chat",
+      "executor": "console"
+    }
+  ]
+}

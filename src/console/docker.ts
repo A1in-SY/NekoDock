@@ -2,6 +2,7 @@ import http from 'node:http';
 import { hostname } from 'node:os';
 import type { BotRecord } from './contracts.js';
 import { DockerLogDecoder, type DockerLogSnapshot } from './logs.js';
+import { NAPCAT_MEDIA_MAX_BYTES } from '../transport-protocol.js';
 
 export interface ContainerInfo { Id: string; State: {Running:boolean;Status:string;Error?:string}; Config:{Labels:Record<string,string>}; Mounts?:Array<{Name?:string;Destination:string}>; }
 export interface DockerStats { cpu_stats?:{cpu_usage?:{total_usage?:number};system_cpu_usage?:number;online_cpus?:number;throttling_data?:unknown};precpu_stats?:{cpu_usage?:{total_usage?:number};system_cpu_usage?:number};memory_stats?:{usage?:number;stats?:{inactive_file?:number;total_inactive_file?:number}};networks?:Record<string,{rx_bytes?:number;tx_bytes?:number}>;read?:string; }
@@ -61,13 +62,13 @@ export class DockerClient {
   async remove(id:string):Promise<void>{const c=await this.inspect(id);if(c?.State.Running)throw new Error('请先停止实例');if(c)await this.request('DELETE',`/containers/${this.name(id)}`);}
   async stats(id:string):Promise<DockerStats>{await this.inspect(id);return this.request('GET',`/containers/${this.name(id)}/stats?stream=false`);}
   async media(id:string,path:string):Promise<{bytes:Buffer;mime:string}>{
-    if(!/^\/data\/console-media\/[a-f0-9]{64}\.(png|jpg|gif|webp|mp3)$/.test(path))throw new Error('请求的媒体路径无效');
+    if(!/^\/data\/(?:console-media\/[a-f0-9]{64}\.(?:png|jpg|gif|webp|mp3)|workspace\/\.qq-images\/[a-f0-9]{64}\.(?:png|jpg|gif|webp))$/.test(path))throw new Error('请求的媒体路径无效');
     if(!await this.inspect(id))throw new Error('实例容器不存在');
     const archive=await new Promise<Buffer>((resolve,reject)=>{
       const chunks:Buffer[]=[];let size=0;
       const req=http.get({socketPath:this.options.socketPath,path:`/containers/${this.name(id)}/archive?path=${encodeURIComponent(path)}`},res=>{
         if(res.statusCode!==200){res.resume();reject(new DockerError(res.statusCode??502,'媒体暂不可用'));return;}
-        res.on('data',(chunk:Buffer)=>{size+=chunk.length;if(size>12*1024*1024){req.destroy();reject(new Error('请求的媒体超过大小限制'));return;}chunks.push(chunk);});
+        res.on('data',(chunk:Buffer)=>{size+=chunk.length;if(size>NAPCAT_MEDIA_MAX_BYTES+1024*1024){req.destroy();reject(new Error('请求的媒体超过大小限制'));return;}chunks.push(chunk);});
         res.on('end',()=>resolve(Buffer.concat(chunks)));res.on('error',()=>reject(new Error('请求的媒体读取失败')));
       });req.setTimeout(15000,()=>req.destroy());req.on('error',()=>reject(new Error('请求的媒体读取失败')));
     });
@@ -76,7 +77,7 @@ export class DockerClient {
     const filename=archive.subarray(0,100).toString().replace(/\0.*$/s,'');
     const sizeText=archive.subarray(124,136).toString().replace(/\0.*$/s,'').trim();
     if(filename!==path.split('/').at(-1)||!/^\d+$/.test(sizeText))throw new Error('请求的媒体归档无效');
-    const size=parseInt(sizeText,8);if(!Number.isSafeInteger(size)||size<=0||size>10*1024*1024||archive.length<512+size)throw new Error('请求的媒体大小无效');
+    const size=parseInt(sizeText,8);if(!Number.isSafeInteger(size)||size<=0||size>NAPCAT_MEDIA_MAX_BYTES||archive.length<512+size)throw new Error('请求的媒体大小无效');
     const bytes=archive.subarray(512,512+size),ext=path.split('.').at(-1)!;
     const signatures:Record<string,boolean>={png:bytes.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10])),jpg:bytes[0]===255&&bytes[1]===216&&bytes[2]===255,gif:/^GIF8[79]a$/.test(bytes.subarray(0,6).toString()),webp:bytes.subarray(0,4).toString()==='RIFF'&&bytes.subarray(8,12).toString()==='WEBP',mp3:bytes.subarray(0,3).toString()==='ID3'||bytes[0]===255&&(bytes[1]!&224)===224};
     if(!signatures[ext])throw new Error('请求的媒体格式无效');

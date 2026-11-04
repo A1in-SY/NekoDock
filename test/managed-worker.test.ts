@@ -9,7 +9,7 @@ import { cachedSnapshot, loadManagedSnapshot, managedIdentity, materializeSnapsh
 import type { WorkerSnapshot } from '../src/console/contracts.js';
 import { BridgeStore } from '../src/store.js';
 const logger={info(){},warn(){},error(){}};
-function config(identity:ManagedIdentity,revision=1):WorkerSnapshot {return{botId:identity.botId,revision,target:{type:'group',id:'1001'},env:{TARGET_TYPE:'group',TARGET_ID:'1001',NAPCAT_WS_URL:'ws://127.0.0.1:9999',AGENT_API_KEY:'private-api-credential'},persona:'Persona text'};}
+function config(identity:ManagedIdentity,revision=1):WorkerSnapshot {return{botId:identity.botId,revision,connectionId:'connection-test',transport:'console',target:{type:'group',id:'1001'},env:{TARGET_TYPE:'group',TARGET_ID:'1001',NAPCAT_WS_URL:'ws://console.invalid/',AGENT_API_KEY:'private-api-credential'},persona:'Persona text'};}
 
 test('managed identity remains optional for standalone workers and rejects partial credentials',()=>{
  assert.equal(managedIdentity({}),null);assert.throws(()=>managedIdentity({BOT_INSTANCE_ID:'one'}),/requires/);

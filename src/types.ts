@@ -1,3 +1,5 @@
+import type { TaskChatMessage, TaskTools } from './scheduled-contract.js';
+import type { ContextCommit, ContextSubmission } from './chat-context-contract.js';
 export type TargetType = 'group' | 'private';
 export interface Target { type: TargetType; id: string }
 
@@ -39,18 +41,20 @@ export interface PendingBatch {
   nextReplyIndex: number;
   generationDone?: boolean;
   modelStarted?: boolean;
+  context?: ContextSubmission;
 }
 
 export interface ReplyToolRequest { messages: OutputMessage[] }
 export interface ReplyToolReceipt { accepted: true }
 export interface ReplyTools {
-  send(request: ReplyToolRequest): Promise<ReplyToolReceipt>;
+  send(request: ReplyToolRequest, metadata?: { toolCallId?: string }): Promise<ReplyToolReceipt>;
 }
 export interface ReplyRequestRecord extends ReplyToolRequest {
   requestId: string;
   startIndex: number;
   endIndex: number;
   sendStarted: boolean;
+  toolCallId?: string;
 }
 
 export interface Logger {
@@ -64,13 +68,16 @@ export type RunObserver = (event:RunObservation)=>void;
 export interface SendReceipt { messageId?:string; }
 export interface AgentResult { messages: OutputMessage[] }
 export interface AgentRunner {
-  run(batch: PendingBatch, sessionId: string | null, onSession: (id: string) => void, signal: AbortSignal, replies?: ReplyTools, observer?:RunObserver): Promise<AgentResult>;
+  supportsContextCommits?: boolean;
+  recoverContext?(sessionId: string | null, onCommit: (receipt: ContextCommit) => void, stagedBatchIds?: string[]): Promise<void>;
+  run(batch: PendingBatch, sessionId: string | null, onSession: (id: string) => void, signal: AbortSignal, replies?: ReplyTools, observer?:RunObserver, tasks?:TaskTools, externalMessages?:TaskChatMessage[]): Promise<AgentResult>;
   compact?(sessionId: string, signal: AbortSignal, observer?: RunObserver): Promise<void>;
 }
 
 export interface MessageSender {
-  sendText(text: string, signal: AbortSignal): Promise<void | SendReceipt>;
+  sendText(text: string, signal: AbortSignal, replyTo?: string): Promise<void | SendReceipt>;
   sendImage(file: string, signal: AbortSignal): Promise<void | SendReceipt>;
   sendMessage(segments: MessageSegment[], signal: AbortSignal): Promise<void | SendReceipt>;
   sendVoice?(file: string, signal: AbortSignal): Promise<void | SendReceipt>;
+  sendVideo?(file: string, signal: AbortSignal): Promise<void | SendReceipt>;
 }

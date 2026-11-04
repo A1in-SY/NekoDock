@@ -8,6 +8,10 @@ import type {
 import { api, errorText } from "./api";
 import { conversationActivity, conversationDisplay, mergeConversationUpdate, mergeLatestConversation, mergeOlderConversation } from "./conversation-state";
 import { compact, date, ErrorBox, fmt, Icon } from "./ui";
+import { deliveryLabels, runLabels } from "./tasks-state";
+import { IncomingImageAttachment, PluginMediaAttachment, SharedContents } from "./shared-content";
+import { nativeIncomingImages } from "./shared-content-state";
+import type { TaskDeliveryStatus, TaskRunStatus } from "../../src/scheduled-contract";
 
 const object = (value: unknown): Record<string, unknown> =>
   value && typeof value === "object" && !Array.isArray(value)
@@ -323,6 +327,14 @@ function ActiveExecution({ kind, startedAt }: { kind: "run" | "compact"; started
 }
 function EventItem({ event, botId }: { event: ConsoleEvent; botId: string }) {
   const p = event.payload;
+  const incomingImages = nativeIncomingImages(p.images, p.contents);
+  if (event.type === "schedule.run.updated") {
+    const run = object(p.run);
+    const events = Array.isArray(p.events) ? p.events as ConsoleEvent[] : [];
+    const nested = conversationDisplay({ id: "task", agentSessionId: null, startedAt: event.time, cursor: 0, nextBefore: null, items: events,
+      usage: { input: null, cached: null, output: null, total: null }, context: { used: null, window: null, compactLimit: null } });
+    return <details className="conversation-tool conversation-scheduled"><summary><Icon name="chevron" className="chevron" /><Icon name="calendar" /><span>{text(p.taskName) || "定时任务"}</span><time>{runLabels[run.status as TaskRunStatus] || "任务执行"}</time></summary><div className="scheduled-conversation-body"><p>{deliveryLabels[run.deliveryStatus as TaskDeliveryStatus] || "未发送"}{typeof run.acknowledgedMessages === "number" && run.acknowledgedMessages > 0 ? ` ${run.acknowledgedMessages} 条` : ""}{typeof run.scheduledAt === "number" ? ` · 计划 ${date(run.scheduledAt)}` : ""}</p>{text(run.error) && <p>{text(run.error)}</p>}{nested.map(item => <EventItem key={item.seq} event={item} botId={botId} />)}{events.filter(item => item.type === "script.output").map(item => <pre key={item.seq}>{text(item.payload.text) || text(item.payload.output)}</pre>)}<a href={"#bot/" + encodeURIComponent(botId) + "/tasks"}>查看任务与完整执行记录 <Icon name="arrow" /></a></div></details>;
+  }
   if (event.type === "thinking.updated")
     return (
       <details className="conversation-tool conversation-thinking">
@@ -344,11 +356,21 @@ function EventItem({ event, botId }: { event: ConsoleEvent; botId: string }) {
         </div>
         <div className="conversation-text">
           {text(p.text) || "（非文字消息）"}
+          {incomingImages.length > 0 && <div className="incoming-image-attachments">
+            {incomingImages.map((image, index) => <IncomingImageAttachment key={text(object(image).attachmentId) || index} image={image} botId={botId} />)}
+          </div>}
+          {Array.isArray(p.contents) && p.contents.length > 0 && <SharedContents contents={p.contents} botId={botId} images={p.images} />}
         </div>
       </article>
     );
   if (event.type === "reply.accepted")
     return <AcceptedReply payload={p} botId={botId} />;
+  if (event.type === "plugin.message.sent")
+    return <article className="conversation-message from-assistant"><div className="conversation-author">{p.pluginId === 'bilibili' ? '哔哩哔哩增强' : '插件回复'}<time>{date(event.time)}</time></div><div className="conversation-text">{text(p.text)}
+      {Array.isArray(p.assets) && p.assets.map((asset, index) => { const value = object(asset); return (value.type === 'video' || value.type === 'image') && typeof value.id === 'string'
+        ? <PluginMediaAttachment key={value.id} asset={value} botId={botId} />
+        : <span key={index}>{text(value.title)}</span>; })}
+    </div></article>;
   if (event.type === "run.failed" || event.type === "compact.failed") {
     const detail = text(p.error) || (event.type === "compact.failed"
       ? p.aborted ? "上下文压缩已中止，可在实例日志查看详细信息。" : "上下文压缩未完成，可在实例日志查看详细信息。"
