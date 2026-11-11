@@ -5,10 +5,11 @@ import {mkdtemp,mkdir,readFile,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {SessionManager} from '@earendil-works/pi-coding-agent';
+import type {AgentMessage} from '@earendil-works/pi-agent-core';
 import {PiRunner} from '../src/pi.js';
 import {createPiTools} from '../src/pi-tools.js';
 import {ReplyToolError,replyMessagesSchema,validateRecallRequest,validateReplyRequest} from '../src/reply-contract.js';
-import {appendRecallEvents,CHAT_RECALL_CUSTOM_TYPE,committedContext,prepareContextInput,recoverContextReceipts} from '../src/pi-context.js';
+import {appendRecallEvents,CHAT_RECALL_CUSTOM_TYPE,committedContext,modelContextMessages,prepareContextInput,recoverContextReceipts} from '../src/pi-context.js';
 import type {PiConfig} from '../src/pi-protocol.js';
 import type {ChatContextMessage,ChatRecallEvent,ContextCommit,ContextSubmission} from '../src/chat-context-contract.js';
 import type {PendingBatch,ReplyTools,RunObservation} from '../src/types.js';
@@ -27,6 +28,35 @@ const batch=(context:ContextSubmission,replyAllowed=true):PendingBatch=>({throug
   trigger:replyAllowed,rawJson:JSON.stringify({message:[{type:'text',data:{text:m.text}}]})})),replyAllowed,replies:null,nextReplyIndex:0,context});
 const text=(value:unknown)=>JSON.stringify(value);
 const toolBody=(result:{content:unknown[]})=>JSON.parse((result.content[0] as {text:string}).text);
+
+test('provider recall dedup removes only events covered by a visible recall tool result without changing durable messages',()=>{
+  const other={...recall,eventId:'external-recall',messageId:'10002'};
+  const notice=(event:ChatRecallEvent):AgentMessage=>({role:'custom',customType:CHAT_RECALL_CUSTOM_TYPE,
+    content:JSON.stringify({source:'chat_state',type:'message_recalled',...event}),display:false,details:{event},timestamp:1});
+  const result:AgentMessage={role:'toolResult',toolName:'recall_message',toolCallId:'recall-partial',isError:false,timestamp:1,
+    content:[{type:'text',text:JSON.stringify({status:'partial',events:[recall]})}]};
+  const covered=notice(recall),external=notice(other);
+  for(const messages of [[covered,result,external],[result,covered,external]]) {
+    const before=structuredClone(messages),filtered=modelContextMessages(messages);
+    assert.deepEqual(filtered,[result,external]);assert.deepEqual(messages,before);
+    assert.ok(messages.includes(covered),'The original status entry must remain durable');
+  }
+  assert.deepEqual(modelContextMessages([covered,external]),[covered,external],
+    'A status remains necessary when the corresponding tool output is absent from the current context');
+});
+
+test('provider recall dedup preserves notices not confirmed by a matching successful tool output',()=>{
+  const notice:AgentMessage={role:'custom',customType:CHAT_RECALL_CUSTOM_TYPE,content:'Recall status',display:false,details:{event:recall},timestamp:1};
+  const result=(body:unknown,extra:Record<string,unknown>={}):AgentMessage=>({role:'toolResult',toolName:'recall_message',toolCallId:'recall-test',
+    isError:false,timestamp:1,content:[{type:'text',text:typeof body==='string'?body:JSON.stringify(body)}],...extra});
+  for(const output of [
+    result({status:'unconfirmed',events:[]}),result({status:'recalled'}),result('invalid JSON'),
+    result({events:[{...recall,time:'invalid'}]}),result({events:[{...recall,messageId:'different-message'}]}),
+    result({events:[recall]},{isError:true}),result({events:[recall]},{toolName:'search_chat_history'}),
+  ])assert.deepEqual(modelContextMessages([output,notice]),[output,notice]);
+  const unrelated:AgentMessage={...notice,customType:'unrelated-status'};
+  const output=result({events:[recall]});assert.deepEqual(modelContextMessages([output,unrelated]),[output,unrelated]);
+});
 
 test('reply arguments preserve independent real QQ quote targets and reject media quotes or invented reply segments',()=>{
   const request={messages:[{type:'text',text:'First answer.',replyTo:'10001'},
@@ -91,20 +121,32 @@ test('Pi returns a rejected quote as a correctable tool result and accepts only 
   assert.ok(f.events.some(e=>e.type==='tool.completed'&&e.payload.tool==='send_message'));
 });
 
-test('Pi exposes recall only when available and uses the exact logical reference returned by send',async t=>{
-  let recalled='';
+test('Pi preserves recall results and durable status while filtering duplicate provider user notices across continuations and resume',async t=>{
+  let recalled='';const selfRecall={...recall,messageId:'10003',authorId:'self'};
   const f=await fixture(t,(call,response,index)=>{
     if(index===1){assert.ok(call.body.tools.some((t:any)=>t.function?.name==='recall_message'));respond(call,response,[{name:'send_message',arguments:{messages:[{type:'text',text:'An incorrect answer.'}]}}]);}
     else if(index===2){assert.match(text(call.body.messages),/reply_original:0/);respond(call,response,[{name:'recall_message',arguments:{messageRef:'reply_original:0'}}]);}
     else if(index===3){assert.ok(call.body.messages.some((item:any)=>item.role==='tool'&&JSON.parse(item.content).status==='recalled'));
-      assert.match(text(call.body.messages),/message_recalled/);
+      assert.ok(!call.body.messages.some((item:any)=>item.role==='user'&&text(item.content).includes('message_recalled')));
+      assert.deepEqual(call.body.tools,f.requests[0]!.tools,'Tool definitions remain static throughout the run');
+      f.runner.notifyRecall(selfRecall);
       respond(call,response,[{name:'send_message',arguments:{messages:[{type:'text',text:'The corrected answer.'}]}}]);}
-    else respond(call,response,'Internal completion.');
+    else {
+      assert.ok(!call.body.messages.some((item:any)=>item.role==='user'&&text(item.content).includes('message_recalled')));
+      if(index===5)respond(call,response,[{name:'send_message',arguments:{messages:[{type:'text',text:'A later answer.'}]}}]);
+      else respond(call,response,'Internal completion.');
+    }
   },{send:async()=>({accepted:true,messages:[{messageRef:'reply_original:0',status:'queued'}]}),recall:async(request,meta)=>{
     recalled=request.messageRef;assert.ok(meta?.operationId);assert.ok(meta?.toolCallId);
-    return {messageRef:request.messageRef,status:'recalled',parts:[{messageId:'10003',partIndex:0,status:'recalled'}],events:[{...recall,messageId:'10003',authorId:'self'}]};
+    f.runner.notifyRecall(selfRecall);
+    return {messageRef:request.messageRef,status:'recalled',parts:[{messageId:'10003',partIndex:0,status:'recalled'}],events:[selfRecall]};
   }});
   await f.run(batch(submission('self-recall',[human()])));assert.equal(recalled,'reply_original:0');assert.equal(f.requests.length,4);
+  const entries=(await readFile(f.session!,'utf8')).trim().split('\n').map(line=>JSON.parse(line));
+  assert.equal(entries.filter(e=>e.type==='custom_message'&&e.customType===CHAT_RECALL_CUSTOM_TYPE).length,1);
+  await f.run(batch(submission('self-recall-resumed',[human('10004')],[selfRecall])));assert.equal(f.requests.length,6);
+  const recovered=await recoverContextReceipts(f.session!);
+  assert.deepEqual(recovered.find(item=>item.batchId==='self-recall-resumed')!.recallEventIds,[selfRecall.eventId]);
   const noRecall=createPiTools(config,async()=>{});assert.equal(noRecall.some(tool=>tool.name==='recall_message'),false);
 });
 

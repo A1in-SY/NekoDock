@@ -217,6 +217,7 @@ export class Processor {
     let tail = Promise.resolve();
     let failed = false;
     let failure: unknown;
+    let recallOperationId: string | undefined;
     const tools: ReplyTools = {
       send: async (request, metadata) => {
         if (signal.aborted) throw new Error('Reply acceptance cancelled.');
@@ -240,7 +241,10 @@ export class Processor {
       recall: async (request, metadata) => {
         if(signal.aborted)throw new Error('Reply recall cancelled.');
         const operationId=metadata?.operationId??metadata?.toolCallId??randomUUID();
+        if(recallOperationId!==undefined&&recallOperationId!==operationId)
+          throw new ReplyToolError('RECALL_LIMIT_REACHED','recall_message may be called at most once per agent run, including failed or unconfirmed attempts.');
         const existing=store.beginReplyRecall(request.messageRef,operationId);
+        recallOperationId=operationId;
         if(existing==='started')return {messageRef:request.messageRef,status:'unconfirmed',parts:[],code:'RECALL_INTERRUPTED'};
         if(existing)return existing;
         const active=this.activeReply;

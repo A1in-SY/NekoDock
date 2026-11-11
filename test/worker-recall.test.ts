@@ -184,3 +184,61 @@ test('recall notice preceding the model ACK remains authoritative in the durable
   store.beginReplyAttempt(1,0);store.applyRecall(recall('qq'));store.acknowledgeReply(1,0,'qq');
   assert.equal(store.replyLedger.part(1,0)!.state,'recalled');assert.equal(store.chatMessageForQQ('qq')!.recalled,true);
 });
+
+test('one recall per agent run rejects later attempts before side effects, preserves replay, and resets next run',async t=>{
+  const f=fixture(t),ack=f.gate();f.store.insert(incoming('1'));const sent:string[]=[];let secondRef='',recalls=0,checked=false;
+  const processor=f.start({async run(batch,_session,_onSession,_signal,tools){
+    if(batch.throughSeq===1) {
+      await assert.rejects(tools!.recall!({messageRef:'unknown'},{operationId:'invalid'}),error=>error instanceof ReplyToolError&&error.code==='RECALL_TARGET_UNKNOWN');
+      const first=(await tools!.send({messages:[{type:'text',text:'first'}]})).messages![0]!.messageRef;
+      await until(()=>sent.includes('first'));
+      const result=await tools!.recall!({messageRef:first},{operationId:'first-recall'});
+      secondRef=(await tools!.send({messages:[{type:'text',text:'second'}]})).messages![0]!.messageRef;
+      await until(()=>sent.includes('second'));
+      await assert.rejects(tools!.recall!({messageRef:secondRef},{operationId:'second-recall'}),
+        error=>error instanceof ReplyToolError&&error.code==='RECALL_LIMIT_REACHED');
+      assert.deepEqual(await tools!.recall!({messageRef:first},{operationId:'first-recall'}),result);
+      assert.equal(f.store.replyLedger.parts(secondRef)[0]!.cancelRequested,false);
+      assert.equal(f.store.replyLedger.parts(secondRef)[0]!.state,'started');
+      await tools!.send({messages:[{type:'text',text:'after error'}]});ack.release();checked=true;
+    } else {
+      const result=await tools!.recall!({messageRef:secondRef},{operationId:'next-run-recall'});
+      assert.equal(result.status,'recalled');
+    }
+    return {messages:[]};
+  }},{async sendText(text){sent.push(text);if(text==='second')await ack.promise;return {messageId:'qq-'+text};},
+    async recallMessage(messageRef){recalls++;const id=messageRef===secondRef?'qq-second':'qq-first';
+      return {messageRef,status:'recalled',parts:[{messageId:id,partIndex:0,status:'recalled'}],events:[recall(id)]};}});
+  await until(()=>f.store.getCursor()===1);assert.equal(checked,true);assert.equal(recalls,1);assert.deepEqual(sent,['first','second','after error']);
+  assert.equal(f.store.replyLedger.parts(secondRef)[0]!.state,'acknowledged');
+  f.store.insert(incoming('2'));processor.notify();await until(()=>f.store.getCursor()===2);
+  assert.equal(recalls,2);assert.equal(f.store.replyLedger.parts(secondRef)[0]!.state,'recalled');
+});
+
+for(const status of ['failed','unconfirmed'] as const)test(`a ${status} recall still consumes the run allowance`,async t=>{
+  const f=fixture(t);f.store.insert(incoming('1'));let calls=0;
+  f.start({async run(_batch,_session,_onSession,_signal,tools){
+    const ref=(await tools!.send({messages:[{type:'text',text:'original'}]})).messages![0]!.messageRef;
+    await until(()=>f.store.replyLedger.parts(ref)[0]?.state==='acknowledged');
+    const result=await tools!.recall!({messageRef:ref},{operationId:'attempt'});assert.equal(result.status,status);
+    await assert.rejects(tools!.recall!({messageRef:ref},{operationId:'retry'}),error=>error instanceof ReplyToolError&&error.code==='RECALL_LIMIT_REACHED');
+    assert.deepEqual(await tools!.recall!({messageRef:ref},{operationId:'attempt'}),result);
+    return {messages:[]};
+  }},{async sendText(){return {messageId:'qq-original'};},async recallMessage(messageRef){calls++;
+    return {messageRef,status,parts:[{messageId:'qq-original',partIndex:0,status}]};}});
+  await until(()=>f.store.getCursor()===1);assert.equal(calls,1);
+});
+
+test('an in-flight recall reserves the sole allowance before awaiting its result',async t=>{
+  const f=fixture(t),gate=f.gate();f.store.insert(incoming('1'));let calls=0;
+  f.start({async run(_batch,_session,_onSession,_signal,tools){
+    const refs=(await tools!.send({messages:[{type:'text',text:'A'},{type:'text',text:'B'}]})).messages!.map(m=>m.messageRef);
+    await until(()=>f.store.replyLedger.parts(refs[1]!)[0]?.state==='acknowledged');
+    const pending=tools!.recall!({messageRef:refs[0]!},{operationId:'in-flight'});await until(()=>calls===1);
+    await assert.rejects(tools!.recall!({messageRef:refs[1]!},{operationId:'concurrent'}),error=>error instanceof ReplyToolError&&error.code==='RECALL_LIMIT_REACHED');
+    assert.equal(f.store.replyLedger.parts(refs[1]!)[0]!.cancelRequested,false);gate.release();await pending;
+    return {messages:[]};
+  }},{async sendText(text){return {messageId:'qq-'+text};},async recallMessage(messageRef){calls++;await gate.promise;
+    return {messageRef,status:'recalled',parts:[{messageId:'qq-A',partIndex:0,status:'recalled'}],events:[recall('qq-A')]};}});
+  await until(()=>f.store.getCursor()===1);assert.equal(calls,1);
+});

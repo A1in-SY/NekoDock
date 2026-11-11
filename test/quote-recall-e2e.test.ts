@@ -14,7 +14,7 @@ import { normalizeMessage } from '../src/napcat.js';
 import { uploadWorkerEvents } from '../src/managed-worker.js';
 import { deferred,piFixture,respond,sendReply } from './fixtures/pi-e2e.js';
 
-test('real Pi tools quote separate questions, recall an ACKed reply, and append both sides recalls through the Console gateway', {timeout:30000},async t=>{
+test('managed Pi tools deduplicate own recall notices, enforce one recall per run, and preserve external recalls', {timeout:30000},async t=>{
   let recalledRef='';
   const f=await piFixture(t,async(call,response,index)=>{
     const wire=JSON.stringify(call.body);
@@ -27,16 +27,32 @@ test('real Pi tools quote separate questions, recall an ACKed reply, and append 
       const accepted=JSON.parse(String(outputs.at(-1)!.output));recalledRef=accepted.messages[0].messageRef;
       respond(call,response,[{name:'recall_message',arguments:{messageRef:recalledRef}}]);
     }else if(index===3) {
-      assert.match(wire,/message_recalled/);assert.match(wire,/An incorrect draft/);
+      assert.match(wire,/An incorrect draft/);
+      assert.ok(!(call.body.input as Array<Record<string,unknown>>).some(item=>item.role==='user'&&JSON.stringify(item.content).includes('message_recalled')));
+      assert.ok((call.body.input as Array<Record<string,unknown>>).some(item=>item.type==='function_call_output'&&JSON.parse(String(item.output)).status==='recalled'));
       sendReply(call,response,[{type:'text',text:'The corrected answer for A.',replyTo:'10001'},{type:'text',text:'The answer for B.',replyTo:'10002'}]);
-    }else if(index===4)respond(call,response,'Internal completion.');
-    else if(index===5) {
+    }else if(index===4) {
+      const outputs=(call.body.input as Array<Record<string,unknown>>).filter(item=>item.type==='function_call_output');
+      const accepted=JSON.parse(String(outputs.at(-1)!.output));
+      respond(call,response,[{name:'recall_message',arguments:{messageRef:accepted.messages[0].messageRef}}]);
+    }else if(index===5) {
+      assert.match(wire,/RECALL_LIMIT_REACHED/);assert.deepEqual(call.body.tools,f.calls[0]!.body.tools);
+      respond(call,response,'Internal completion.');
+    }else if(index===6) {
       assert.match(wire,/Question B/);assert.match(wire,/message_recalled/);
       sendReply(call,response,[{type:'text',text:'This quote must be rejected.',replyTo:'10002'}]);
-    }else if(index===6) {
+    }else if(index===7) {
       assert.match(wire,/QUOTE_TARGET_RECALLED/);
       sendReply(call,response,[{type:'text',text:'A valid follow-up.',replyTo:'10003'}]);
-    }else if(index===7)respond(call,response,'Internal completion.');
+    }else if(index===8) {
+      await f.waitFor(()=>f.outgoing.filter(m=>m.action==='send_group_msg').length===4,'The new reply must reach the mock transport');
+      const outputs=(call.body.input as Array<Record<string,unknown>>).filter(item=>item.type==='function_call_output');
+      const accepted=JSON.parse(String(outputs.at(-1)!.output));
+      respond(call,response,[{name:'recall_message',arguments:{messageRef:accepted.messages[0].messageRef}}]);
+    }else if(index===9) {
+      const outputs=(call.body.input as Array<Record<string,unknown>>).filter(item=>item.type==='function_call_output');
+      assert.equal(JSON.parse(String(outputs.at(-1)!.output)).status,'recalled');respond(call,response,'Internal completion.');
+    }
     else assert.fail(`Unexpected model request ${index}`);
   });
   f.onSend=(message)=>{
@@ -79,11 +95,12 @@ test('real Pi tools quote separate questions, recall an ACKed reply, and append 
   assert.equal(store.chatMessageForQQ('1')!.text,'An incorrect draft.');
   f.broadcast({post_type:'notice',notice_type:'group_recall',self_id:'999',group_id:'1001',user_id:'501',operator_id:'501',message_id:'10002',time:1792727203});
   await f.waitFor(()=>store.chatMessageForQQ('10002')?.recalled===true,'A human recall must traverse the durable stream');
-  await delay(100);assert.equal(f.calls.length,4,'A recall alone must not start a model request');
+  await delay(100);assert.equal(f.calls.length,5,'A recall alone must not start a model request');
   f.send('10003','A fresh follow-up');
   await f.waitFor(()=>store.getCursor()===3&&store.peekPendingBatch()===null,'The rejected quote must be repairable in the same round');
-  assert.equal(f.calls.length,7);assert.equal(f.outgoing.filter(m=>m.action==='send_group_msg').length,4);
-  assert.equal(f.outgoing.at(-1)!.params.message[0]!.data.id,'10003');
+  assert.equal(f.calls.length,9);assert.equal(f.outgoing.filter(m=>m.action==='send_group_msg').length,4);
+  assert.equal(f.outgoing.filter(m=>m.action==='delete_msg').length,2);
+  assert.equal(f.outgoing.filter(m=>m.action==='send_group_msg').at(-1)!.params.message[0]!.data.id,'10003');
   assert.ok(f.outgoing.every(m=>!JSON.stringify(m.params).includes('This quote must be rejected')));
   await f.waitFor(()=>consoleApp.db.getConversation(bot.id)?.items.some(e=>e.type==='message.recalled')===true,'The recall must be visible through the real event upload');
   assert.equal(store.chatMessageForQQ('10002')!.text.includes('Question B'),true);

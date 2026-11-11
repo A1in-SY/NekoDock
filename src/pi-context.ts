@@ -122,7 +122,7 @@ function parseEnvelope(text: string): unknown {
   return null;
 }
 
-/** Delivery metadata remains durable but has no semantic role in provider requests. */
+/** Keep durable metadata and duplicate recall notices out of provider requests. */
 export function modelContextMessages(messages: AgentMessage[]): AgentMessage[] {
   let result = messages;
   messages.forEach((message,index) => {
@@ -137,7 +137,24 @@ export function modelContextMessages(messages: AgentMessage[]): AgentMessage[] {
     if (result === messages) result = [...messages];
     result[index] = {...message,content:content as never};
   });
-  return result;
+  const coveredRecalls=new Map<string,string>();
+  for(const message of result) {
+    if(message.role!=='toolResult'||message.toolName!=='recall_message'||message.isError)continue;
+    for(const part of message.content) {
+      if(part.type!=='text')continue;
+      let body:Json|null;
+      try {body=object(JSON.parse(part.text));}catch{continue;}
+      if(!Array.isArray(body?.events))continue;
+      for(const event of body.events)if(validChatRecallEvent(event))coveredRecalls.set(event.eventId,event.messageId);
+    }
+  }
+  if(!coveredRecalls.size)return result;
+  const filtered=result.filter(message=>{
+    if(message.role!=='custom'||message.customType!==CHAT_RECALL_CUSTOM_TYPE)return true;
+    const event=object(message.details)?.event;
+    return !validChatRecallEvent(event)||coveredRecalls.get(event.eventId)!==event.messageId;
+  });
+  return filtered.length===result.length?result:filtered;
 }
 
 function inputImages(messages: Json[], imageData: Record<string, ContextImage>, old?: ReturnType<typeof textInput>): ContextImage[] {
