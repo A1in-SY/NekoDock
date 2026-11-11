@@ -93,7 +93,7 @@ Console 与 Worker 之间通过 SSE 实时投递、HTTP 确认落库和提交发
 | Worker 与 Console 的心跳、消息 SSE、发送、日志和任务同步 | 始终使用独立直连客户端 |
 | Console 与 NapCat | 不受实例代理影响 |
 
-默认绕过 `localhost`、`127.0.0.1`、`::1`、`host.docker.internal`。列表支持逗号、空白或换行分隔；主机与域名匹配本域及其子域，可使用 `.example.com`、`*.example.com`，可指定端口，如 `api.example.com:8443` 或 `[::1]:8080`。IP 精确匹配，不支持 CIDR；`*` 绕过所有请求。内置请求和 Edge 使用统一判断，脚本库的 `NO_PROXY` 支持范围不同，尤其不能保证跨库的端口限定规则一致。
+默认绕过 `localhost`、`127.0.0.1`、`::1`、`host.docker.internal`。列表支持逗号、空白或换行分隔；主机与域名匹配本域及其子域，可使用 `.example.com`、`*.example.com`，可指定端口，如 `api.example.com:8443` 或 `[::1]:8080`。IP 支持精确匹配及 IPv4／IPv6 CIDR，如 `10.20.0.0/16`、`2001:db8::/32`；CIDR 不附加端口，只匹配 URL 中的 IP，不通过 DNS 判断域名所属网段。`*` 绕过所有请求。内置请求和 Edge 使用统一判断；脚本库的 `NO_PROXY` 和浏览器的 bypass 支持范围不同，不能保证 CIDR 或端口限定规则一致，需要兼容时同时列出实际 IP。
 
 容器访问宿主机代理可填写 `http://host.docker.internal:7890`，但宿主端口必须监听在容器可访问的接口。容器中的 `127.0.0.1` 指向容器自身。配置选中代理后，连接或认证失败不会自动直连重试；当前轮及发送 ACK 收尾后切换新版本，停止中的实例下次启动应用。
 

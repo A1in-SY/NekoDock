@@ -66,9 +66,61 @@ test('bypass matches domains, boundaries, ports, IPv4 and canonical IPv6 without
     assert.equal(routeNetworkUrl(proxy, url).mode, 'proxy', url);
   }
   assert.equal(routeNetworkUrl(config('http://proxy.example', { noProxy: '*' }), 'https://any.example').mode, 'direct');
-  for (const noProxy of ['10.0.0.0/8', 'https://example.com', 'example.com:0', '[::1]:65536', '*.']) {
+  for (const noProxy of ['https://example.com', 'example.com:0', '[::1]:65536', '*.']) {
     assert.throws(() => normalizeNetworkProxy({ noProxy }), code('NETWORK_PROXY_CONFIG_ERROR'));
   }
+});
+
+test('CIDR bypass matches only IP literals within IPv4 and IPv6 subnet boundaries', () => {
+  const proxy = config('http://proxy.example', { noProxy: '10.20.0.0/22,2001:0DB8:0042:0000::/64,10.20.0.0/22' });
+  assert.equal(proxy.noProxy, '10.20.0.0/22,2001:db8:42::/64');
+  for (const url of ['http://10.20.0.0', 'https://10.20.0.8:8443', 'http://10.20.3.255',
+    'http://[2001:db8:42::]', 'https://[2001:db8:42::1]', 'http://[2001:db8:42:0:ffff:ffff:ffff:ffff]']) {
+    assert.deepEqual(routeNetworkUrl(proxy, url), { mode: 'direct', reason: 'bypass' }, url);
+  }
+  for (const url of ['http://10.19.255.255', 'http://10.20.4.0', 'http://[2001:db8:41:ffff:ffff:ffff:ffff:ffff]',
+    'http://[2001:db8:42:1::]', 'http://[::ffff:10.20.0.8]', 'http://localhost', 'http://internal.example']) {
+    assert.equal(routeNetworkUrl(proxy, url).mode, 'proxy', url);
+  }
+  const exact = config('http://proxy.example', { noProxy: '192.0.2.1/32,2001:db8::1/128' });
+  assert.equal(routeNetworkUrl(exact, 'http://192.0.2.1').mode, 'direct');
+  assert.equal(routeNetworkUrl(exact, 'http://192.0.2.2').mode, 'proxy');
+  assert.equal(routeNetworkUrl(exact, 'http://[2001:db8::1]').mode, 'direct');
+  assert.equal(routeNetworkUrl(exact, 'http://[2001:db8::2]').mode, 'proxy');
+  const allIPs = config('http://proxy.example', { noProxy: '0.0.0.0/0,::/0' });
+  assert.equal(routeNetworkUrl(allIPs, 'https://192.0.2.8').mode, 'direct');
+  assert.equal(routeNetworkUrl(allIPs, 'https://[2001:db8::8]').mode, 'direct');
+  assert.equal(routeNetworkUrl(allIPs, 'https://internal.example').mode, 'proxy');
+});
+
+test('CIDR bypass rejects invalid prefixes, non-IP networks and port suffixes', () => {
+  for (const noProxy of ['10.20.0.0/', '10.20.0.0/33', '10.20.0.0/-1', '10.20.0.0/+1', '10.20.0.0/1.5',
+    '10.20.0.0/08', '10.20.0.0/8/1', '2001:db8::/129', 'internal.example/24', '10.20.0.0/22:8080',
+    '10.20.0.0:8080/22', '[2001:db8::]/64', '[2001:db8::]/64:8080', '2001:db8::/64:8080', 'fe80::1%eth0/64']) {
+    assert.throws(() => normalizeNetworkProxy({ noProxy }), code('NETWORK_PROXY_CONFIG_ERROR'), noProxy);
+  }
+});
+
+test('tool proxy settings preserve CIDR entries without domain wildcard expansion', () => {
+  const proxy = config('http://proxy.example', { noProxy: '10.20.0.0/16,2001:db8::/32,internal.example,[::1]:8080' });
+  const env = proxyEnvironment(proxy, {}, true);
+  assert.equal(env.NO_PROXY, '10.20.0.0/16,2001:db8::/32,internal.example,.internal.example,[::1]:8080');
+  assert.equal(env.no_proxy, env.NO_PROXY);
+  assert.equal(playwrightProxy(proxy)?.bypass, '10.20.0.0/16,2001:db8::/32,internal.example,*.internal.example,[::1]:8080');
+  assert.deepEqual(JSON.parse(env.NEKODOCK_PLAYWRIGHT_PROXY!), playwrightProxy(proxy));
+});
+
+test('CIDR bypass sends local HTTP requests directly and keeps unrelated requests on the proxy', async t => {
+  let directCount = 0; const proxied: string[] = [];
+  const target = await service(t, (request, response) => {
+    directCount++; assert.equal(request.headers['proxy-authorization'], undefined); response.end('direct');
+  });
+  const proxy = await service(t, (request, response) => { proxied.push(request.url!); response.end('proxy'); });
+  const client = createNetworkClient(config(proxy.url, { noProxy: '127.0.0.0/8', username: 'user', password: 'password' }));
+  t.after(() => client.close());
+  assert.equal(await (await client.fetch(target.url)).text(), 'direct');
+  assert.equal(await (await client.fetch('http://192.0.2.1/outside')).text(), 'proxy');
+  assert.equal(directCount, 1); assert.deepEqual(proxied, ['http://192.0.2.1/outside']);
 });
 
 test('proxy environment removes ambient settings and preserves exact credentials with percent escapes', () => {

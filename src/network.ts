@@ -1,4 +1,4 @@
-import { isIP } from 'node:net';
+import { BlockList, isIP } from 'node:net';
 import { domainToASCII } from 'node:url';
 import { Agent, Dispatcher, ProxyAgent, Request as UndiciRequest, fetch as undiciFetch } from 'undici';
 import { fingerprint, logEvent } from './logging.js';
@@ -23,7 +23,10 @@ export class NetworkError extends Error {
   constructor(readonly code: string) { super(code); this.name = 'NetworkError'; }
 }
 
-interface BypassEntry { host: string; port?: number; all?: boolean }
+interface BypassEntry {
+  host: string; port?: number; all?: boolean;
+  subnet?: { prefix: number; family: 'ipv4' | 'ipv6'; addresses: BlockList };
+}
 
 function configError(): never { throw new NetworkError('NETWORK_PROXY_CONFIG_ERROR'); }
 
@@ -39,6 +42,17 @@ function normalizeHost(value: string): string {
 
 function parseBypassEntry(value: string): BypassEntry {
   if (value === '*') return { host: '*', all: true };
+  if (value.includes('/')) {
+    const parts = value.split('/');
+    const family = isIP(parts[0] ?? '');
+    if (parts.length !== 2 || !family || parts[0]!.includes('%') || !/^(0|[1-9]\d{0,2})$/u.test(parts[1]!)) configError();
+    const prefix = Number(parts[1]);
+    if (prefix > (family === 4 ? 32 : 128)) configError();
+    const host = normalizeHost(parts[0]!);
+    const type = family === 4 ? 'ipv4' : 'ipv6';
+    const addresses = new BlockList(); addresses.addSubnet(host, prefix, type);
+    return { host, subnet: { prefix, family: type, addresses } };
+  }
   let host = value;
   let port: number | undefined;
   if (value.startsWith('[')) {
@@ -54,6 +68,12 @@ function parseBypassEntry(value: string): BypassEntry {
   if (host.startsWith('*.')) host = host.slice(2);
   else if (host.startsWith('.')) host = host.slice(1);
   return { host: normalizeHost(host), ...(port === undefined ? {} : { port }) };
+}
+
+function formatBypassEntry(entry: BypassEntry): string {
+  if (entry.all) return '*';
+  if (entry.subnet) return `${entry.host}/${entry.subnet.prefix}`;
+  return `${isIP(entry.host) === 6 && entry.port ? `[${entry.host}]` : entry.host}${entry.port ? `:${entry.port}` : ''}`;
 }
 
 function bypassEntries(value: string): BypassEntry[] {
@@ -92,8 +112,7 @@ export function normalizeNetworkProxy(input: Partial<NetworkProxyConfig> = {}): 
   if (result.password !== undefined && result.username === undefined) configError();
   if (result.username === undefined) delete result.username;
   if (result.password === undefined) delete result.password;
-  result.noProxy = [...new Set(bypassEntries(result.noProxy).map(entry => entry.all ? '*' :
-    `${isIP(entry.host) === 6 && entry.port ? `[${entry.host}]` : entry.host}${entry.port ? `:${entry.port}` : ''}`))].join(',');
+  result.noProxy = [...new Set(bypassEntries(result.noProxy).map(formatBypassEntry))].join(',');
   return result;
 }
 
@@ -128,9 +147,17 @@ function routeFor(config: NetworkProxyConfig, entries: BypassEntry[], input: str
   if (!config.enabled) return { mode: 'direct', reason: 'disabled' };
   const url = input instanceof URL ? input : new URL(input);
   const host = normalizeHost(url.hostname);
+  const family = isIP(host);
   const port = Number(url.port || (url.protocol === 'https:' || url.protocol === 'wss:' ? 443 : 80));
-  const bypass = entries.some(entry => entry.all || (entry.port === undefined || entry.port === port)
-    && (host === entry.host || !isIP(entry.host) && host.endsWith(`.${entry.host}`)));
+  const bypass = entries.some(entry => {
+    if (entry.all) return true;
+    if (entry.subnet) {
+      const type = family === 4 ? 'ipv4' : family === 6 ? 'ipv6' : undefined;
+      return type === entry.subnet.family && entry.subnet.addresses.check(host, type);
+    }
+    return (entry.port === undefined || entry.port === port)
+      && (host === entry.host || !isIP(entry.host) && host.endsWith(`.${entry.host}`));
+  });
   return bypass ? { mode: 'direct', reason: 'bypass' } : { mode: 'proxy', reason: 'configured' };
 }
 
@@ -254,10 +281,11 @@ export function proxyEnvironment(input: NetworkProxyConfig = defaultNetworkProxy
     result[name] = proxyUrl; result[name.toUpperCase()] = proxyUrl;
   }
   // Node http needs a dotted companion to match subdomains; curl already treats
-  // bare domains as suffixes. Port-scoped bypass support still varies by tool.
+  // bare domains as suffixes. CIDR and port-scoped support still vary by tool.
   const noProxy = [...new Set(bypassEntries(config.noProxy).flatMap(entry => {
     if (entry.all) return ['*'];
-    const normalized = `${isIP(entry.host) === 6 && entry.port ? `[${entry.host}]` : entry.host}${entry.port ? `:${entry.port}` : ''}`;
+    const normalized = formatBypassEntry(entry);
+    if (entry.subnet) return [normalized];
     return !isIP(entry.host) && !entry.port ? [normalized, `.${entry.host}`] : [normalized];
   }))].join(',');
   result.no_proxy = noProxy; result.NO_PROXY = noProxy;
@@ -271,6 +299,7 @@ export function playwrightProxy(input: NetworkProxyConfig): { server: string; us
   if (!config.enabled || !config.forTools) return undefined;
   const bypass = bypassEntries(config.noProxy).flatMap(entry => {
     if (entry.all) return ['*'];
+    if (entry.subnet) return [formatBypassEntry(entry)];
     const suffix = entry.port ? `:${entry.port}` : '';
     const host = isIP(entry.host) === 6 ? `[${entry.host}]` : entry.host;
     return isIP(entry.host) ? [`${host}${suffix}`] : [`${host}${suffix}`, `*.${host}${suffix}`];
