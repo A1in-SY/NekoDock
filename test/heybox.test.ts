@@ -113,7 +113,7 @@ test('enhancement and automatic card settings are independent and enforce bounde
   const plugin = createPlugin({ id: 'heybox', name: 'Synthetic', required: false } as PluginManifest), content = parseGameDetail(detail(), source());
   assert.deepEqual(plugin.afterResolve('share', source(), { ...HEYBOX_DEFAULTS, enhance: false }, content), { provideContext: false, prepare: { mode: 'card', provideContext: false } });
   assert.deepEqual(plugin.afterResolve('share', source(), { ...HEYBOX_DEFAULTS, autoCard: false }, content), { provideContext: true });
-  assert.equal(plugin.shouldProcess({ ...HEYBOX_DEFAULTS, enhance: false, autoCard: false }), false);
+  assert.equal(plugin.shouldProcess({ ...HEYBOX_DEFAULTS, enhance: false, autoCard: false }, source()), false);
   assert.throws(() => validateHeyboxConfig({ maxMiB: 100 })); assert.throws(() => validateHeyboxConfig({ cookie: 'sensitive\nvalue' })); assert.throws(() => validateHeyboxConfig({ unexpected: true }));
   assert.deepEqual(plugin.command({ message: '/heybox' }), undefined);
 });

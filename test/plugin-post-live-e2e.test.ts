@@ -28,12 +28,13 @@ function wireImages(call:ModelCall):string[] {
 }
 
 for(const scenario of [
-  {kind:'post',mode:'original',pluginMessages:2,sourceVision:true},
-  {kind:'post',mode:'card',pluginMessages:1,sourceVision:true},
-  {kind:'live',mode:'original',pluginMessages:2,sourceVision:false},
+  {pluginId:'bilibili',kind:'post',mode:'original',pluginMessages:2,sourceVision:true},
+  {pluginId:'bilibili',kind:'post',mode:'card',pluginMessages:1,sourceVision:true},
+  {pluginId:'bilibili',kind:'live',mode:'original',pluginMessages:2,sourceVision:false},
+  {pluginId:'heybox',kind:'post',mode:'card',pluginMessages:1,sourceVision:true},
 ] as const) {
-  test(`managed ${scenario.kind} ${scenario.mode} preserves source context and confirmed image delivery across Worker restart`,{timeout:dockerImage?100000:60000},async t=>{
-    const shareId=`share-${scenario.kind}-${scenario.mode}`,questionId=`question-${scenario.kind}-${scenario.mode}`;
+  test(`managed ${scenario.pluginId} ${scenario.kind} ${scenario.mode} preserves source context and confirmed image delivery across Worker restart`,{timeout:dockerImage?100000:60000},async t=>{
+    const shareId=`share-${scenario.pluginId}-${scenario.kind}-${scenario.mode}`,questionId=`question-${scenario.pluginId}-${scenario.kind}-${scenario.mode}`;
     const actualIds=scenario.pluginMessages===1?['93001']:['93001','93002'];
     const f=await piFixture(t,(call,response)=>{
       if(call.results.length){assertAccepted(call);respond(call,response,'Internal completion.');return;}
@@ -71,20 +72,22 @@ for(const scenario of [
     const bot=app.db.createBot({name:'Example',targetType:'group',targetId:'1001',connectionId:connection.id,
       config:{model:'synthetic-model',baseUrl:f.modelUrl,modelApi:'openai-responses',memoryEnabled:false,replyProbability:0,supportsImages:true,supportsReasoning:false,
         voiceEnabled:false,allowCommands:false,allowFileWrites:false}});
-    const config=app.db.plugins.view(bot.id,'bilibili');
-    app.db.plugins.update(bot.id,'bilibili',{expectedRevision:config.revision,enabled:true,config:{dynamicEnhance:true,dynamicDisplay:scenario.mode,liveEnhance:true,liveDisplay:scenario.mode}});
+    const config=app.db.plugins.view(bot.id,scenario.pluginId);
+    app.db.plugins.update(bot.id,scenario.pluginId,{expectedRevision:config.revision,enabled:true,config:scenario.pluginId==='heybox'
+      ?{postEnhance:true,postAutoCard:true}:{dynamicEnhance:true,dynamicDisplay:scenario.mode,liveEnhance:true,liveDisplay:scenario.mode}});
     app.db.setDesiredState(bot.id,'running');app.db.setRuntime(bot.id,{state:'starting'});await app.gateway.reconcile();
     await f.waitFor(()=>app.gateway.getConnectionStatus(connection.id).online,'mock NapCat login');
     const overrides={CONSOLE_URL:`http://${requestHost}:${port}`,BOT_INSTANCE_ID:bot.id,WORKER_TOKEN:bot.workerToken};
     const worker=await f.start('1001',overrides);await f.waitFor(()=>app.gateway.getBotStatus(bot.id).channelConnected,'managed Worker transport');
     const postId='1000000000000000001',roomId='10001';
-    const sourceUrl=scenario.kind==='post'?`https://www.bilibili.com/opus/${postId}`:`https://live.bilibili.com/${roomId}`;
+    const sourceUrl=scenario.pluginId==='heybox'?`https://www.xiaoheihe.cn/app/bbs/link/${postId}`
+      :scenario.kind==='post'?`https://www.bilibili.com/opus/${postId}`:`https://live.bilibili.com/${roomId}`;
     const event=f.event(shareId,'',false);
     f.broadcast({...event,message:[{type:'json',data:{data:JSON.stringify({app:'com.tencent.miniapp_01',config:{token:'tracking-marker'},meta:{detail_1:{title:'哔哩哔哩',desc:'Synthetic share',qqdocurl:sourceUrl}}})}}]});
     let resolveJob:PluginRunnerJob|null=null;
     await f.waitFor(()=>{resolveJob=app.db.plugins.claim();return resolveJob?.operation==='resolve';},'source resolve job');
-    const image={id:'source-image',url:'https://i0.hdslb.com/bfs/new_dyn/synthetic-source.png',role:scenario.kind==='post'?'content' as const:'cover' as const,status:'pending' as const,width:1,height:1};
-    const content:PluginContent=scenario.kind==='post'?{type:'post',platform:'bilibili',resourceId:`post:${postId}`,url:sourceUrl,title:'Synthetic post',author:'Synthetic creator',authorId:'2001',publishedAt:1792727200,observedAt:1792727300,
+    const image={id:scenario.pluginId==='heybox'?`post:${postId}:image:1`:'source-image',url:scenario.pluginId==='heybox'?'https://cdn.max-c.com/synthetic-source.png':'https://i0.hdslb.com/bfs/new_dyn/synthetic-source.png',role:scenario.kind==='post'?'content' as const:'cover' as const,status:'pending' as const,width:1,height:1};
+    const content:PluginContent=scenario.kind==='post'?{type:'post',platform:scenario.pluginId,resourceId:`post:${postId}`,url:sourceUrl,title:'Synthetic post',author:'Synthetic creator',authorId:'2001',publishedAt:1792727200,observedAt:1792727300,
       blocks:[{type:'paragraph',text:'Synthetic post body'},{type:'image',image}],retrieval:{status:'ready'}}:
       {type:'live',platform:'bilibili',resourceId:`live:${roomId}`,url:sourceUrl,title:'Synthetic offline room',author:'Synthetic streamer',authorId:'2001',observedAt:1792727300,
         live:{roomId,status:'offline',area:'Synthetic category',cover:image},retrieval:{status:'ready'}};
@@ -122,7 +125,7 @@ for(const scenario of [
     assert.equal(imageSend.params.message[0]?.data.file,'base64://'+(scenario.mode==='card'?cardPng:sourcePng).toString('base64'));
     if(scenario.mode==='original')assert.equal(pluginSends[0]?.params.message.find(segment=>segment.type==='reply')?.data.id,shareId);
     if(scenario.sourceVision) {
-      await f.waitFor(()=>f.read('1001',db=>Number(db.prepare("SELECT COUNT(*) AS n FROM incoming_image_cache WHERE source_plugin='bilibili' AND plugin_asset_id=? AND status='ready'").get(sourceAsset)?.n))===1,'source image persists through authenticated Worker asset API');
+      await f.waitFor(()=>f.read('1001',db=>Number(db.prepare("SELECT COUNT(*) AS n FROM incoming_image_cache WHERE source_plugin=? AND plugin_asset_id=? AND status='ready'").get(scenario.pluginId,sourceAsset)?.n))===1,'source image persists through authenticated Worker asset API');
       assert.equal(assetRequests,1);
       const sourcePath=f.read('1001',db=>String(db.prepare('SELECT path FROM incoming_image_cache WHERE plugin_asset_id=?').get(sourceAsset)?.path));
       const hostPath=dockerImage?join(f.dataPath(),sourcePath.replace(/^\/data\//u,'')):sourcePath;

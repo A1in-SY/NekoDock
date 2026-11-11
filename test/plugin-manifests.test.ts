@@ -307,6 +307,7 @@ test('content plugins keep response abilities independent and declare only game-
   assert.equal(heybox.autoCard.parent, undefined);
   assert.equal(heybox.showPrices.parent, 'autoCard');
   assert.equal(heybox.showPrices.group, heybox.autoCard.group);
+  for (const key of ['postEnhance', 'postAutoCard']) { assert.equal(heybox[key].group, '帖子行为'); assert.equal(heybox[key].parent, undefined); }
   const children = plugins.flatMap((plugin: { manifest: { id: string; configSchema?: { properties: Record<string, { parent?: string }> } } }) =>
     Object.entries(plugin.manifest.configSchema?.properties ?? {}).flatMap(([key, field]) => field.parent ? [`${plugin.manifest.id}.${key}`] : []));
   assert.deepEqual(children, ['heybox.showPrices']);

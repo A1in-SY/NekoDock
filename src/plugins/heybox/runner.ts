@@ -6,10 +6,12 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { createNetworkClient } from '../../network.js';
 import { imageExtension } from '../../images.js';
 import type { PluginContent, PluginContentImage, PluginExecution, PluginRunnerDefinition, PluginRunnerJob } from '../../plugin-system/contracts.js';
-import { boundedBytes, fetchGameDetail, HeyboxError, heyboxImageUrl } from './api.js';
+import { boundedBytes, fetchGameDetail, fetchPostDetail, HeyboxError, heyboxImageUrl } from './api.js';
 import { contentText, parseGameDetail, validateHeyboxContent } from './content.js';
-import { normalizeHeyboxResource } from './recognize.js';
+import { normalizeHeyboxLink } from './recognize.js';
 import { validateHeyboxConfig } from './config.js';
+import { parsePostDetail } from './post-content.js';
+import { preparePost } from './post-presentation.js';
 
 export type HeyboxRun = (command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; signal: AbortSignal; timeoutMs: number }) => Promise<string>;
 export interface HeyboxTools { fetch?: typeof fetch; run?: HeyboxRun; }
@@ -36,8 +38,8 @@ async function scriptPath(): Promise<string> {
 }
 
 export async function executeHeyboxJob(input: PluginRunnerJob, root: string, signal: AbortSignal, tools: HeyboxTools = {}): Promise<PluginExecution> {
-  const source = normalizeHeyboxResource(input.resource.url);
-  if (!source || input.resource.kind !== 'game') throw new HeyboxError('HEYBOX_INVALID_URL');
+  const source = normalizeHeyboxLink(input.resource.url);
+  if (!source || input.resource.kind !== source.kind) throw new HeyboxError('HEYBOX_INVALID_URL');
   const config = validateHeyboxConfig(input.config), requestSignal = AbortSignal.any([signal, AbortSignal.timeout(config.timeoutSeconds * 1000)]);
   requestSignal.throwIfAborted();
   await mkdir(root, { recursive: true, mode: 0o700 }); const directory = await mkdtemp(join(root, 'job-heybox-'));
@@ -49,9 +51,15 @@ export async function executeHeyboxJob(input: PluginRunnerJob, root: string, sig
   const cleanup = async () => { await network?.close(); await rm(directory, { recursive: true, force: true }); };
   try {
     if (input.operation === 'resolve') {
-      const content = parseGameDetail(await fetchGameDetail(source, fetcher, requestSignal, config.cookie), source);
+      const content = source.kind === 'post' ? parsePostDetail(await fetchPostDetail(source, fetcher, requestSignal, config.cookie), source)
+        : parseGameDetail(await fetchGameDetail(source, fetcher, requestSignal, config.cookie), source);
       handedOff = true; return { content, cleanup };
     }
+    if (input.operation === 'prepare' && source.kind === 'post') {
+      const prepared = await preparePost(input, source, config, directory, fetcher, execute, env, requestSignal);
+      handedOff = true; return { ...prepared, cleanup };
+    }
+    if (source.kind !== 'game') throw new HeyboxError('HEYBOX_OPERATION_INVALID');
     if (input.operation !== 'prepare' || !input.content || input.presentation?.mode !== 'card') throw new HeyboxError('HEYBOX_OPERATION_INVALID');
     const content = validateHeyboxContent(structuredClone(input.content), source);
     const files: NonNullable<PluginExecution['files']> = []; let cover: string | undefined;

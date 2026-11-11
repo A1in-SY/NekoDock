@@ -1,7 +1,7 @@
 import { PluginExecutionError } from '../../plugin-system/contracts.js';
 import { heyboxSignedUrl } from './signing.js';
 import { normalizeHeyboxResource } from './recognize.js';
-import type { HeyboxResource } from './types.js';
+import type { HeyboxResource, HeyboxPostResource } from './types.js';
 
 export class HeyboxError extends PluginExecutionError {}
 export const object = (value: unknown): Record<string, any> => value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, any> : {};
@@ -57,4 +57,20 @@ export async function fetchGameDetail(source: HeyboxResource, fetcher: typeof fe
   if (!text(result.name) || !identifier(result.appid ?? result.steam_appid) || result.game_type !== resource.gameType) throw new HeyboxError('HEYBOX_RESPONSE_INVALID');
   if (/^\d+$/u.test(resource.appId) && identifier(result.appid ?? result.steam_appid) !== resource.appId) throw new HeyboxError('HEYBOX_GAME_MISMATCH');
   return result;
+}
+
+export async function fetchPostDetail(source: HeyboxPostResource, fetcher: typeof fetch, signal: AbortSignal, cookie?: string): Promise<Record<string, any>> {
+  const url = heyboxSignedUrl('/bbs/app/link/tree', { app: 'heybox', os_type: 'web', x_app: 'heybox_website',
+    x_client_type: 'web', x_os_type: 'Mac', client_type: 'web', web_version: '3.0',
+    link_id: source.postId, is_first: '1', page: '1', index: '1', limit: '1', owner_only: '0' });
+  const response = await fetcher(url, { redirect: 'error', signal, headers: { 'user-agent': 'Mozilla/5.0',
+    referer: 'https://www.xiaoheihe.cn/', ...(cookie ? { cookie } : {}) } });
+  let data: Record<string, any>;
+  try { data = object(JSON.parse((await boundedBytes(response, 4 * 1024 * 1024)).toString('utf8'))); }
+  catch (error) { if (error instanceof HeyboxError) throw error; throw new HeyboxError('HEYBOX_RESPONSE_INVALID'); }
+  if (data.status !== 'ok') throw new HeyboxError('HEYBOX_API_FAILED');
+  const post = object(object(data.result).link), id = identifier(post.linkid);
+  if (!/^\d{1,24}$/u.test(id) || !text(post.title) || typeof post.text !== 'string') throw new HeyboxError('HEYBOX_RESPONSE_INVALID');
+  if (/^\d+$/u.test(source.postId) && source.postId !== id) throw new HeyboxError('HEYBOX_POST_MISMATCH');
+  return post;
 }
