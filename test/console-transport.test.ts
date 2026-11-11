@@ -8,6 +8,7 @@ import { handleIncomingEvent } from '../src/incoming.js';
 import { BridgeStore } from '../src/store.js';
 import type { Logger, MessageSegment, Target } from '../src/types.js';
 import type { ForwardSnapshot } from '../src/forward-contract.js';
+import type { ChatRecallEvent } from '../src/chat-context-contract.js';
 
 type RecordedRequest = { path: string; authorization: string | undefined; body: Record<string, unknown> };
 type RequestHandler = (request: HttpRequest, response: ServerResponse, body: Record<string, unknown>) => void;
@@ -35,6 +36,7 @@ async function waitFor(condition: () => boolean, message = 'condition timed out'
 async function fixture(t: TestContext, options: {
   onEvent?: ConstructorParameters<typeof ConsoleTransport>[0]['onEvent'];
   onContentUpdate?: ConstructorParameters<typeof ConsoleTransport>[0]['onContentUpdate'];
+  onRecall?: ConstructorParameters<typeof ConsoleTransport>[0]['onRecall'];
   onStream?: (response: ServerResponse, index: number) => void;
   onAck?: RequestHandler;
   onSend?: RequestHandler;
@@ -75,6 +77,7 @@ async function fixture(t: TestContext, options: {
     identity, logger, actionTimeoutMs: options.actionTimeoutMs ?? 500, reconnectMs: 10,
     onEvent: options.onEvent ?? (input => received.push(input)),
     ...(options.onContentUpdate?{onContentUpdate:options.onContentUpdate}:{}),
+    ...(options.onRecall?{onRecall:options.onRecall}:{}),
   });
   t.after(async () => {
     await client.stop();
@@ -144,6 +147,16 @@ test('worker persists ordered streamed messages before posting each authenticate
   }
 });
 
+test('recall state is persisted before its independent SSE ACK without entering ordinary message handling',async t=>{
+  const persisted:ChatRecallEvent[]=[],order:string[]=[];
+  const event:ChatRecallEvent={eventId:'recall-example',messageId:'qq-example',time:1792727201,operatorId:'123',authorId:'123'};
+  const f=await fixture(t,{onRecall:recall=>{persisted.push(recall);order.push('persist');},
+    onStream:response=>response.write(frame('recall',{seq:1,event:null,recall:event})),
+    onAck:(_request,response)=>{assert.equal(persisted.length,1);order.push('ack');json(response,{ok:true});}});
+  f.client.start();await waitFor(()=>f.acks().length===1);
+  assert.deepEqual(persisted,[event]);assert.deepEqual(order,['persist','ack']);assert.deepEqual(f.received,[]);
+});
+
 test('an unacknowledged stream replay is deduplicated by the existing Worker store and handler', async t => {
   const store = new BridgeStore(':memory:', target);
   const controller = new AbortController();
@@ -171,6 +184,23 @@ test('an unacknowledged stream replay is deduplicated by the existing Worker sto
   assert.equal(notifications, 1);
   assert.deepEqual(store.openOrCreateBatch(10)?.messages.map(message => message.messageId), ['104']);
   assert.deepEqual(f.acks().map(request => request.body), [{ seq: 4 }, { seq: 4 }]);
+});
+
+test('Worker dispatch validation accepts declared command plugins and rejects unknown or mismatched routes before ACK', async t => {
+  const base = { pluginId: 'dice', command: 'dice', args: ' 1 6', sourceMessageId: '104', executor: 'console', contextPolicy: 'chat' };
+  const invalid = [
+    { ...base, pluginId: 'undeclared-plugin' }, { ...base, executor: 'worker' }, { ...base, contextPolicy: 'control' },
+    { ...base, sourceMessageId: 'other-message' }, { ...base, args: 'x'.repeat(16385) },
+  ];
+  const dispatches: unknown[] = [];
+  const f = await fixture(t, {
+    onStream: (response, index) => response.write(frame('message', { seq: 1, event: event(104), dispatch: invalid[index - 1] ?? base })),
+    onEvent: (_value, _attachments, dispatch) => dispatches.push(dispatch),
+  });
+  f.client.start();
+  await waitFor(() => f.acks().length === 1);
+  assert.deepEqual(dispatches, [base]);
+  assert.equal(f.streams.length, invalid.length + 1);
 });
 
 test('forward content snapshots and durable updates persist in order before ACK without a second chat event',async t=>{

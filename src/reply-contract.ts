@@ -3,15 +3,16 @@ import type { OutputMessage, ReplyToolRequest, TargetType } from './types.js';
 
 export const REPLY_MAX_MESSAGES = 10;
 export const REPLY_MAX_BODY_BYTES = 256 * 1024;
+const replyTargetSchema = { type: 'string', minLength: 1, maxLength: 200, description: 'The real QQ messageId of an existing, unrecalled message in this conversation.' };
 
 export function replyMessagesSchema(targetType?: TargetType) {
   return {
     type: 'array' as const, minItems: 1, maxItems: REPLY_MAX_MESSAGES,
     items: { anyOf: [
-      { type: 'object', properties: { type: { type: 'string', enum: ['text'] }, text: { type: 'string', minLength: 1, maxLength: 20000 } }, required: ['type', 'text'], additionalProperties: false },
+      { type: 'object', properties: { type: { type: 'string', enum: ['text'] }, text: { type: 'string', minLength: 1, maxLength: 20000 }, replyTo: replyTargetSchema }, required: ['type', 'text'], additionalProperties: false },
       { type: 'object', properties: { type: { type: 'string', enum: ['image'] }, path: { type: 'string', minLength: 1, maxLength: 4096 } }, required: ['type', 'path'], additionalProperties: false },
       ...(targetType === 'group' ? [{ type: 'object', properties: {
-        type: { type: 'string', enum: ['message'] }, segments: { type: 'array', minItems: 1, maxItems: 100, items: { anyOf: [
+        type: { type: 'string', enum: ['message'] }, replyTo: replyTargetSchema, segments: { type: 'array', minItems: 1, maxItems: 100, items: { anyOf: [
           { type: 'object', properties: { type: { type: 'string', enum: ['text'] }, text: { type: 'string', minLength: 1, maxLength: 20000 } }, required: ['type', 'text'], additionalProperties: false },
           { type: 'object', properties: { type: { type: 'string', enum: ['at'] }, userId: { type: 'string', pattern: '^[1-9]\\d*$' } }, required: ['type', 'userId'], additionalProperties: false },
         ] } },
@@ -25,7 +26,20 @@ function object(value: unknown): Record<string, unknown> | null {
 }
 
 export class ReplyToolError extends Error {
-  constructor(readonly code: 'REPLY_INVALID_REQUEST' | 'REPLY_UNAVAILABLE', message: string) { super(message); }
+  constructor(readonly code: string, message: string, readonly messageIndex?: number) { super(message); }
+}
+
+function replyTarget(value: unknown): value is string | undefined {
+  return value === undefined || typeof value === 'string' && value.length > 0 && value.length <= 200 && value.trim() === value;
+}
+
+export function validateRecallRequest(value: unknown): { messageRef: string } {
+  const input = object(value);
+  if (!input || Object.keys(input).length !== 1 || typeof input.messageRef !== 'string'
+    || !input.messageRef.length || input.messageRef.length > 400 || input.messageRef.trim() !== input.messageRef) {
+    throw new ReplyToolError('RECALL_INVALID_REQUEST', 'Provide one exact messageRef returned by send_message.');
+  }
+  return {messageRef: input.messageRef};
 }
 
 export function validateReplyRequest(value: unknown, targetType?: TargetType): ReplyToolRequest {
@@ -33,16 +47,19 @@ export function validateReplyRequest(value: unknown, targetType?: TargetType): R
   const invalid = () => new ReplyToolError('REPLY_INVALID_REQUEST', 'Invalid reply tool arguments.');
   if (!input || Object.keys(input).some(key => key !== 'messages')
     || !Array.isArray(input.messages) || input.messages.length < 1 || input.messages.length > REPLY_MAX_MESSAGES) throw invalid();
-  const messages: OutputMessage[] = input.messages.map(value => {
+  const messages: OutputMessage[] = input.messages.map((value, messageIndex) => {
+    const message = object(value);
+    if (!message || !replyTarget(message.replyTo)) throw new ReplyToolError('REPLY_INVALID_REQUEST', 'Invalid reply message arguments.', messageIndex);
     if (targetType === 'group' && isSegmentMessage(value) && value.segments.length <= 100
       && value.segments.every(segment => segment.type !== 'text' || segment.text.length <= 20000)) {
       return { type: 'message', segments: value.segments.map(segment => segment.type === 'text'
-        ? { type: 'text', text: segment.text } : { type: 'at', userId: segment.userId }) };
+        ? { type: 'text', text: segment.text } : { type: 'at', userId: segment.userId }), ...(message.replyTo === undefined ? {} : {replyTo:message.replyTo}) };
     }
-    const message = object(value);
-    if (!message || Object.keys(message).length !== 2) throw invalid();
-    if (message.type === 'text' && typeof message.text === 'string' && message.text.trim() && message.text.length <= 20000) return { type: 'text', text: message.text };
+    if (Object.keys(message).some(key => !['type', 'text', 'path', ...(message.type === 'text' ? ['replyTo'] : [])].includes(key))) throw invalid();
+    if (message.type === 'text' && Object.keys(message).length === (message.replyTo === undefined ? 2 : 3)
+      && typeof message.text === 'string' && message.text.trim() && message.text.length <= 20000) return { type: 'text', text: message.text, ...(message.replyTo === undefined ? {} : {replyTo:message.replyTo}) };
     if (message.type === 'image' && typeof message.path === 'string' && message.path.trim() && message.path.length <= 4096
+      && Object.keys(message).length === 2
       && (!/^[a-z][a-z\d+.-]*:/i.test(message.path) || /^https?:\/\//i.test(message.path))) return { type: 'image', path: message.path };
     throw invalid();
   });

@@ -2,8 +2,8 @@
   "kind": "nekodock-plugin",
   "id": "douyin",
   "name": "抖音增强",
-  "description": "解析视频分享文案，补充作品资料，并按实例配置下载和发送视频。",
-  "version": "1.0.0",
+  "description": "解析视频分享文案，补充作品资料，并按实例配置发送排版图片和视频。",
+  "version": "1.1.1",
   "apiVersion": 1,
   "entries": { "console": "./index.js", "runner": "./runner.js" },
   "capabilities": ["content-enrichment", "video-download"],
@@ -12,15 +12,16 @@
   "configSchema": {
     "type": "object",
     "properties": {
-      "enhance": { "type": "boolean", "title": "视频上下文增强", "default": true, "group": "视频" },
-      "autoVideo": { "type": "boolean", "title": "自动发送视频", "default": true, "group": "视频" },
-      "maxDurationSeconds": { "type": "integer", "title": "视频时长上限（秒）", "minimum": 1, "maximum": 3600, "default": 300, "group": "视频" },
-      "maxMiB": { "type": "integer", "title": "视频大小上限（MiB）", "minimum": 1, "maximum": 256, "default": 50, "group": "视频" },
-      "maxResolution": { "type": "integer", "title": "清晰度上限（短边像素）", "description": "按画面短边选择视频流，兼顾横屏与竖屏；实际尺寸会在下载后校验。", "minimum": 144, "maximum": 1080, "default": 720, "group": "视频" },
-      "timeoutSeconds": { "type": "integer", "title": "单次处理超时（秒）", "minimum": 10, "maximum": 600, "default": 120, "group": "处理与缓存" },
-      "waitSeconds": { "type": "integer", "title": "等待解析资料（秒）", "minimum": 0, "maximum": 30, "default": 3, "group": "处理与缓存" },
-      "cacheHours": { "type": "integer", "title": "媒体缓存保留（小时）", "minimum": 1, "maximum": 720, "default": 24, "group": "处理与缓存" },
-      "cacheMaxMiB": { "type": "integer", "title": "媒体缓存上限（MiB）", "minimum": 16, "maximum": 10240, "default": 1024, "group": "处理与缓存" }
+      "enhance": { "type": "boolean", "title": "视频上下文增强", "default": true, "group": "视频行为" },
+      "videoDisplay": { "type": "string", "title": "视频自动展示", "description": "与上下文增强、自动发送视频分别控制；排版图片包含作者、发布文案和视频封面。", "enum": ["off", "card"], "enumLabels": ["关闭", "排版图片"], "default": "off", "group": "视频行为" },
+      "autoVideo": { "type": "boolean", "title": "自动发送视频", "default": true, "group": "视频行为" },
+      "maxDurationSeconds": { "type": "integer", "title": "视频时长上限（秒）", "minimum": 1, "maximum": 3600, "default": 300, "group": "视频下载限制" },
+      "maxResolution": { "type": "integer", "title": "清晰度上限（短边像素）", "description": "按画面短边选择视频流，兼顾横屏与竖屏；实际尺寸会在下载后校验。", "minimum": 144, "maximum": 1080, "default": 720, "group": "视频下载限制" },
+      "maxMiB": { "type": "integer", "title": "单个媒体大小上限（MiB）", "minimum": 1, "maximum": 256, "default": 50, "group": "媒体与缓存" },
+      "cacheHours": { "type": "integer", "title": "媒体缓存保留（小时）", "minimum": 1, "maximum": 720, "default": 24, "group": "媒体与缓存" },
+      "cacheMaxMiB": { "type": "integer", "title": "媒体缓存上限（MiB）", "minimum": 16, "maximum": 10240, "default": 1024, "group": "媒体与缓存" },
+      "timeoutSeconds": { "type": "integer", "title": "单次处理超时（秒）", "minimum": 10, "maximum": 600, "default": 120, "group": "处理" },
+      "waitSeconds": { "type": "integer", "title": "等待解析资料（秒）", "minimum": 0, "maximum": 30, "default": 3, "group": "处理" }
     }
   }
 }

@@ -1,4 +1,5 @@
 import type { ConsoleEvent, ConversationUpdate, ConversationView } from "../../src/console/contracts";
+import { messageStateDisplay } from './message-state.ts';
 
 function mergeItems(previous: ConsoleEvent[], next: ConsoleEvent[]) {
   const items = new Map(previous.map((item) => [item.seq, item]));
@@ -126,12 +127,20 @@ export function conversationDisplay(view: ConversationView | null): ConsoleEvent
       if (item.type === "reply.accepted" && typeof item.payload.requestId === "string")
         replies.set(item.payload.requestId, result.length);
       result.push(item);
-    } else if (item.type === "delivery.acknowledged" && typeof item.payload.mediaPath === "string") {
+    } else if (item.type === "delivery.acknowledged") {
       const index = replies.get(String(item.payload.requestId));
       if (index !== undefined) {
         const reply = result[index]!;
         const deliveries = Array.isArray(reply.payload.deliveries) ? reply.payload.deliveries : [];
-        result[index] = { ...reply, payload: { ...reply.payload, deliveries: [...deliveries, item.payload] } };
+        const existing=deliveries.findIndex(value=>{
+          if(!value||typeof value!=='object')return false;
+          const delivery=value as Record<string,unknown>;
+          return typeof item.payload.deliveryId==='string'&&delivery.deliveryId===item.payload.deliveryId
+            ||typeof item.payload.partIndex==='number'&&delivery.partIndex===item.payload.partIndex;
+        });
+        const next=[...deliveries];
+        if(existing>=0)next[existing]={...next[existing],...item.payload};else next.push(item.payload);
+        result[index] = { ...reply, payload: { ...reply.payload, deliveries: next } };
       }
     } else if (item.type === "tool.started" || item.type === "tool.completed") {
       const key = (item.runId ?? "") + ":" + (item.itemId ?? item.seq);
@@ -178,7 +187,7 @@ export function conversationDisplay(view: ConversationView | null): ConsoleEvent
       }
     }
   }
-  return result;
+  return messageStateDisplay(result,view?.items ?? []);
 }
 
 export interface ConversationActivity { kind: "run" | "compact"; startedAt: number | null; }

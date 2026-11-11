@@ -1,3 +1,4 @@
+import type { ReplyDecisionConfig } from './reply-decision-contract.js';
 import type { MemoryConfig } from './memory-contract.js';
 import { resolve } from 'node:path';
 import type { Target } from './types.js';
@@ -36,6 +37,7 @@ export interface Config {
   voiceReplyProbability: number;
   agentTimeoutMs: number;
   randomReplyProbability: number;
+  replyDecision: ReplyDecisionConfig;
   batchSize: number;
   replyMaxChars: number;
   retryMs: number;
@@ -82,6 +84,31 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const probability = env.RANDOM_REPLY_PROBABILITY === undefined ? 0.05 : Number(env.RANDOM_REPLY_PROBABILITY);
   if (env.RANDOM_REPLY_PROBABILITY === '' || !Number.isFinite(probability) || probability < 0 || probability > 1) {
     throw new Error('RANDOM_REPLY_PROBABILITY 必须为 0 至 1 的数字');
+  }
+  const replyMode = env.REPLY_MODE?.trim() ?? 'random';
+  if (replyMode !== 'random' && replyMode !== 'jev') throw new Error('REPLY_MODE 必须为 random 或 jev');
+  const replyThreshold = env.REPLY_JUDGE_THRESHOLD === undefined ? 0.7 : Number(env.REPLY_JUDGE_THRESHOLD);
+  if (env.REPLY_JUDGE_THRESHOLD?.trim() === '' || !Number.isFinite(replyThreshold) || replyThreshold < 0 || replyThreshold > 1) {
+    throw new Error('REPLY_JUDGE_THRESHOLD 必须为 0 至 1 的数字');
+  }
+  const replyDecision: ReplyDecisionConfig = {
+    mode: replyMode, baseUrl: env.REPLY_JUDGE_BASE_URL?.trim() ?? 'https://api.typesafe.ai/v1',
+    model: env.REPLY_JUDGE_MODEL?.trim() ?? 'jev-latest', apiKey: env.REPLY_JUDGE_API_KEY?.trim() || undefined,
+    threshold: replyThreshold, timeoutMs: number('REPLY_JUDGE_TIMEOUT_MS', 3000, 60_000),
+    instructions: env.REPLY_JUDGE_INSTRUCTIONS ?? '',
+  };
+  if (replyDecision.instructions.length > 16_000) throw new Error('REPLY_JUDGE_INSTRUCTIONS 不能超过 16000 字符');
+  if (replyDecision.apiKey && (replyDecision.apiKey.length > 8192 || /[\x00-\x1f\x7f]/u.test(replyDecision.apiKey))) throw new Error('REPLY_JUDGE_API_KEY 无效');
+  if (replyMode === 'jev') {
+    let judgeUrl: URL;
+    try { judgeUrl = new URL(replyDecision.baseUrl); }
+    catch { throw new Error('REPLY_JUDGE_BASE_URL 必须为有效的 HTTP 地址'); }
+    if (!['http:', 'https:'].includes(judgeUrl.protocol) || judgeUrl.username || judgeUrl.password
+      || replyDecision.baseUrl.includes('?') || replyDecision.baseUrl.includes('#')) throw new Error('REPLY_JUDGE_BASE_URL 必须为不含凭据、查询参数或片段的 HTTP 地址');
+    if (/\/systemone\/*$/u.test(judgeUrl.pathname)) throw new Error('REPLY_JUDGE_BASE_URL 请填写 API 根路径，不要包含 /systemone');
+    replyDecision.baseUrl = judgeUrl.toString().replace(/\/+$/, '');
+    if (!replyDecision.model || replyDecision.model.length > 1024 || /[\x00-\x1f\x7f]/u.test(replyDecision.model)) throw new Error('REPLY_JUDGE_MODEL 必须为有效模型名称');
+    if (!replyDecision.apiKey) throw new Error('Jev 判断模式必须填写 REPLY_JUDGE_API_KEY');
   }
   const legacySandbox = env.CODEX_SANDBOX;
   if (legacySandbox !== undefined && !['read-only', 'workspace-write', 'danger-full-access'].includes(legacySandbox)) {
@@ -172,7 +199,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     webSearch: loadWebSearchConfig(env),
     tts, voiceReplyEnabled, voiceReplyProbability,
     agentTimeoutMs,
-    randomReplyProbability: probability,
+    randomReplyProbability: probability, replyDecision,
     batchSize: number('BATCH_SIZE', 50, 1000),
     replyMaxChars: number('REPLY_MAX_CHARS', 1500, 10_000),
     retryMs: number('RETRY_MS', 5000), reconnectMs: number('RECONNECT_MS', 3000),

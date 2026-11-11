@@ -1,9 +1,9 @@
-import type { RunObservation, TargetType } from './types.js';
+import type { ReplyToolReceipt, RunObservation, TargetType } from './types.js';
 import type { WebSearchConfig } from './web-search.js';
 import type { TaskToolRequest } from './scheduled-contract.js';
 import type { NetworkProxyConfig } from './network.js';
 import type { MemoryProposal, MemoryHistorySearch, MemorySearch } from './memory-contract.js';
-import type { ContextCommit } from './chat-context-contract.js';
+import type { ChatRecallEvent, ContextCommit } from './chat-context-contract.js';
 import type { PiContextStart } from './pi-context.js';
 
 export interface PiConfig {
@@ -20,12 +20,17 @@ export interface PiConfig {
 export interface PiStart {
   type: 'start'; operation: 'run' | 'append' | 'compact' | 'scheduled' | 'memory'; config: PiConfig;
   taskManagement?: boolean; taskState?: boolean;
+  recallEnabled?: boolean;
   memoryRead?: boolean; recalledMemory?: unknown;
   session: string | null; prompt: string; system: string;
   images: Array<{ type: 'image'; data: string; mimeType: string }>;
   context?: PiContextStart;
 }
-export type PiParentMessage = PiStart | { type: 'abort' } | { type: 'send-result'; id: string; accepted: boolean }
+export type ReplyOperationError = { code:string; message:string; messageIndex?:number };
+export type PiParentMessage = PiStart | { type: 'abort' }
+  | { type: 'send-result'; id: string; accepted: boolean; receipt?:ReplyToolReceipt; error?:ReplyOperationError }
+  | { type:'recall-result'; id:string; ok:boolean; result?:unknown; error?:ReplyOperationError }
+  | { type:'recall-event'; event:ChatRecallEvent }
   | {type:'task-result'; id:string; ok:boolean; result?:unknown; error?:string}
   | {type:'memory-result'; id:string; ok:boolean; result?:unknown; error?:string};
 export type PiChildMessage =
@@ -34,6 +39,7 @@ export type PiChildMessage =
   | { type: 'event'; event: RunObservation }
   | { type: 'context-committed'; receipt: ContextCommit }
   | { type: 'send'; id: string; request: unknown; toolCallId?: string }
+  | { type: 'recall'; id: string; request: unknown; toolCallId?: string }
   | { type: 'task-manage'; id: string; operationId: string; request: TaskToolRequest }
   | { type: 'task-state'; id: string; data: Record<string,unknown>; expectedVersion: number }
   | { type: 'memory-query'; id: string; operation: 'search'; request: MemorySearch }

@@ -1,13 +1,14 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import { type PluginSettings, type PluginResource, type PluginContent, type PluginDispatch, type PluginId, type PlatformPluginId, type PluginInstanceView, type PluginJobView, type PluginResult, type PluginRunnerJob, type PluginRunnerResult, type PluginSync, type PluginPresentation, type PluginOutput } from '../plugin-contract.js';
-import { PLUGIN_MANIFESTS, contentPlugin, contentPlugins, controlCommand } from '../plugin-system/registry.js';
+import { type PluginSettings, type PluginResource, type PluginContent, type PluginDispatch, type PluginId, type PlatformPluginId, type PluginInstanceView, type PluginJobView, type PluginResult, type PluginRunnerJob, type PluginRunnerResult, type PluginSync, type PluginPresentation, type PluginOutput, type CommandPluginDefinition } from '../plugin-contract.js';
+import { PLUGIN_MANIFESTS, contentPlugin, contentPlugins, commandPlugins, configurablePlugin, controlCommand } from '../plugin-system/registry.js';
 import type { BotRecord } from './contracts.js';
 import type { ConsoleEvent } from './contracts.js';
 import type { NapcatSendResult } from '../transport-protocol.js';
+import { ConsoleForwardInspections } from './forward-inspections.js';
 
 interface Host {requireBot(id:string):BotRecord;encrypt(value:unknown):string;decrypt(value:string):unknown;transaction<T>(fn:()=>T):T;change(id:string,type:string):void;}
-interface JobRow {id:string;bot_id:string;plugin_id:PlatformPluginId;source_message_id:string;conversation_id:string|null;operation:'resolve'|'download'|'prepare';resource_key:string;resource_cipher:string;content_cipher?:string|null;presentation_cipher?:string|null;finished_at?:number|null;config_revision:number;command_kind:string;automatic:number;state:string;attempts:number;lease:string|null;lease_until:number;created_at:number;expires_at:number;next_attempt:number;error:string|null;uploaded_asset_id?:string|null;}
+interface JobRow {id:string;bot_id:string;plugin_id:PlatformPluginId;source_message_id:string;conversation_id:string|null;operation:'resolve'|'download'|'prepare'|'execute'|'inspect';resource_key:string;resource_cipher:string;content_cipher?:string|null;presentation_cipher?:string|null;command_execution_cipher?:string|null;finished_at?:number|null;config_revision:number;command_kind:string;automatic:number;state:string;attempts:number;lease:string|null;lease_until:number;created_at:number;expires_at:number;next_attempt:number;error:string|null;uploaded_asset_id?:string|null;}
 interface ResultRow {id:string;bot_id:string;plugin_id:PlatformPluginId;source_message_id:string;conversation_id:string|null;payload_cipher:string;acknowledged_at:number|null;created_at:number;}
 const object=(v:unknown):Record<string,unknown>|null=>v!==null&&typeof v==='object'&&!Array.isArray(v)?v as Record<string,unknown>:null;
 const identifier=(v:unknown)=>typeof v==='string'&&v.length>0&&v.length<=200?v:typeof v==='number'&&Number.isSafeInteger(v)?String(v):null;
@@ -16,6 +17,7 @@ export const PLUGIN_QUEUE_LIMITS={jobs:1000,sourceBytes:4*1024*1024} as const;
 
 /** Plugin state uses the Console transaction, while only Workers assign chat ownership. */
 export class ConsolePlugins {
+  readonly inspections: ConsoleForwardInspections;
   constructor(private readonly db:DatabaseSync,private readonly host:Host) {
     db.exec(`
       CREATE TABLE IF NOT EXISTS plugin_configs(bot_id TEXT NOT NULL REFERENCES bots(id),plugin_id TEXT NOT NULL,enabled INTEGER NOT NULL,revision INTEGER NOT NULL,config_cipher TEXT NOT NULL,PRIMARY KEY(bot_id,plugin_id));
@@ -40,18 +42,23 @@ export class ConsolePlugins {
     }
     else if(!columns.some(column=>column.name==='content_cipher'))db.exec('ALTER TABLE plugin_jobs ADD COLUMN content_cipher TEXT');
     const jobColumns=db.prepare('PRAGMA table_info(plugin_jobs)').all() as Array<{name:string}>;
-    for(const name of ['presentation_cipher','finished_at'])if(!jobColumns.some(column=>column.name===name))db.exec(`ALTER TABLE plugin_jobs ADD COLUMN ${name} ${name==='finished_at'?'INTEGER':'TEXT'}`);
+    for(const name of ['presentation_cipher','finished_at','command_execution_cipher'])if(!jobColumns.some(column=>column.name===name))db.exec(`ALTER TABLE plugin_jobs ADD COLUMN ${name} ${name==='finished_at'?'INTEGER':'TEXT'}`);
     db.exec('CREATE TABLE IF NOT EXISTS plugin_job_assets(job_id TEXT NOT NULL REFERENCES plugin_jobs(id),asset_key TEXT NOT NULL,asset_id TEXT NOT NULL,type TEXT NOT NULL,role TEXT NOT NULL,lease TEXT NOT NULL,PRIMARY KEY(job_id,asset_key));');
     const resultColumns=db.prepare('PRAGMA table_info(plugin_results)').all() as Array<{name:string}>;
     if(!resultColumns.some(column=>column.name==='plugin_id'))db.exec("ALTER TABLE plugin_results ADD COLUMN plugin_id TEXT NOT NULL DEFAULT 'bilibili'");
     for(const [name,type] of [['job_id','TEXT'],['output_group','TEXT'],['output_index','INTEGER']])if(!resultColumns.some(column=>column.name===name))db.exec(`ALTER TABLE plugin_results ADD COLUMN ${name} ${type}`);
     db.exec('CREATE INDEX IF NOT EXISTS plugin_result_group ON plugin_results(bot_id,output_group,output_index);');
+    this.inspections = new ConsoleForwardInspections(db, {...host, configuration: botId => this.config(botId, 'forward-nsfw'),
+      recordReply: (notification, receipt) => this.result(notification.botId, notification.replyTo, `reply:${notification.jobId}:notification`, {
+        pluginId:'forward-nsfw',kind:'reply',text:notification.text,deliveryId:notification.deliveryId,automatic:true,
+        delivery:{status:'acknowledged',...(receipt.messageId?{messageId:receipt.messageId}:{})},
+      },Date.now())});
   }
   catalog(){return PLUGIN_MANIFESTS;}
   private config(botId:string,pluginId:string):{enabled:boolean;revision:number;settings:PluginSettings} {
     this.host.requireBot(botId);
     const row=this.db.prepare("SELECT enabled,revision,config_cipher FROM plugin_configs WHERE bot_id=? AND plugin_id=?").get(botId,pluginId) as {enabled:number;revision:number;config_cipher:string}|undefined;
-    const definition=contentPlugin(pluginId);
+    const definition=configurablePlugin(pluginId);
     return row?{enabled:!!row.enabled,revision:row.revision,settings:definition.validateConfig(this.host.decrypt(row.config_cipher))}:{enabled:false,revision:0,settings:{...definition.defaults}};
   }
   list(botId:string):PluginInstanceView[]{return PLUGIN_MANIFESTS.map(m=>this.view(botId,m.id));}
@@ -66,15 +73,19 @@ export class ConsolePlugins {
     const body=object(input);if(!body)throw new Error('插件配置必须为对象');
     for(const key of Object.keys(body))if(!['expectedRevision','enabled','config','settings'].includes(key))throw new Error('插件配置包含未知项目');
     if(pluginId==='core') {if(body.enabled===false)throw new Error('内置插件不可关闭');if(body.config!==undefined||body.settings!==undefined)throw new Error('内置插件没有可修改配置');return this.view(botId,pluginId);}
-    contentPlugin(pluginId);
+    const definition=configurablePlugin(pluginId);
     return this.host.transaction(()=>{
       const current=this.config(botId,pluginId);if(body.expectedRevision!==current.revision)throw new Error('插件配置版本冲突，请刷新后重试');
       const enabled=body.enabled??current.enabled;if(typeof enabled!=='boolean')throw new Error('插件开关必须为布尔值');
-      const settings=contentPlugin(pluginId).validateConfig(body.config??body.settings??{},current.settings);
+      const settings=configurablePlugin(pluginId).validateConfig(body.config??body.settings??{},current.settings);
+      if(enabled&&definition.kind==='observer') {
+        if(this.host.requireBot(botId).targetType!=='group')throw new Error('插件仅支持群聊实例');
+        definition.validateEnabled?.(settings);
+      }
       const revision=current.revision+1;
       this.db.prepare("INSERT INTO plugin_configs(bot_id,plugin_id,enabled,revision,config_cipher) VALUES (?,?,?,?,?) ON CONFLICT(bot_id,plugin_id) DO UPDATE SET enabled=excluded.enabled,revision=excluded.revision,config_cipher=excluded.config_cipher").run(botId,pluginId,enabled?1:0,revision,this.host.encrypt(settings));
       // Old credential/config snapshots never gain permission to send under a new revision.
-      this.db.prepare("UPDATE plugin_jobs SET state='cancelled',error='PLUGIN_CONFIGURATION_CHANGED' WHERE bot_id=? AND plugin_id=? AND state IN ('queued','running')").run(botId,pluginId);
+      this.db.prepare("UPDATE plugin_jobs SET state='cancelled',error='PLUGIN_CONFIGURATION_CHANGED' WHERE bot_id=? AND plugin_id=? AND state IN ('queued','running','resolving')").run(botId,pluginId);
       this.cancelUnsent(botId,'PLUGIN_CONFIGURATION_CHANGED',undefined,pluginId);this.host.change(botId,'plugin.updated');
       return this.view(botId,pluginId);
     });
@@ -95,7 +106,9 @@ export class ConsolePlugins {
       ??(row.content_cipher?this.host.decrypt(row.content_cipher) as PluginContent:undefined);
     const definition=contentPlugins.find(plugin=>plugin.manifest.id===row.plugin_id);
     const summary=definition?.summarize(resource,content);
-    const deliveries:PluginJobView['deliveries']=[];
+    const commandExecution=row.command_execution_cipher?this.host.decrypt(row.command_execution_cipher) as PluginJobView['commandExecution']:undefined;
+    const commandName=definition?.commandName?.(row.command_kind)??(commandExecution?PLUGIN_MANIFESTS.find(plugin=>plugin.id===row.plugin_id)?.commands.find(command=>command.name.slice(1)===row.command_kind)?.name:undefined);
+    const deliveries:PluginJobView['deliveries']=[...this.inspections.deliveries(row.id)];
     for(const {value:result} of results) {
       if(result.kind==='enrichment')continue;
       const gateway=result.deliveryId?this.db.prepare('SELECT state,result_cipher FROM napcat_deliveries WHERE bot_id=? AND delivery_id=?').get(row.bot_id,result.deliveryId) as {state:string;result_cipher:string|null}|undefined:undefined;
@@ -108,8 +121,10 @@ export class ConsolePlugins {
     }
     const finishedAt=row.finished_at??((row.state==='completed'||row.state==='failed')&&results.length?Math.max(...results.map(result=>result.createdAt)):undefined);
     return {id:row.id,pluginId:row.plugin_id,sourceMessageId:row.source_message_id,...(row.conversation_id?{conversationId:row.conversation_id}:{}),
-      operation:row.operation,state:row.state,createdAt:row.created_at,attempts:row.attempts,automatic:!!row.automatic,command:row.command_kind,...(definition?.commandName?{commandName:definition.commandName(row.command_kind)}:{}),
+      operation:row.operation,state:row.state,createdAt:row.created_at,attempts:row.attempts,automatic:!!row.automatic,command:row.command_kind,...(commandName?{commandName}:{}),
       ...(summary?{resource:summary}:{}),
+      ...(commandExecution?{commandExecution}:{}),
+      ...(row.operation==='inspect'?{inspection:this.inspections.view(row.id)}:{}),
       ...(finishedAt===undefined?{}:{finishedAt,durationMs:Math.max(0,finishedAt-row.created_at)}),...(row.error?{error:safeCode(row.error)}:{}),deliveries};
   }
   dispatch(botId:string,messageId:string):PluginDispatch|undefined {const row=this.db.prepare('SELECT dispatch_json FROM plugin_dispatches WHERE bot_id=? AND message_id=?').get(botId,messageId) as {dispatch_json:string}|undefined;return row?JSON.parse(row.dispatch_json) as PluginDispatch:undefined;}
@@ -124,7 +139,7 @@ export class ConsolePlugins {
       this.db.prepare('UPDATE plugin_results SET conversation_id=? WHERE bot_id=? AND source_message_id=?').run(event.conversationId,botId,messageId);
     }
     if(event.type==='conversation.started') {
-      this.db.prepare("UPDATE plugin_jobs SET state='cancelled',error='PLUGIN_CONVERSATION_CHANGED' WHERE bot_id=? AND conversation_id IS NOT NULL AND conversation_id<>? AND state IN ('queued','running')").run(botId,event.conversationId);
+      this.db.prepare("UPDATE plugin_jobs SET state='cancelled',error='PLUGIN_CONVERSATION_CHANGED' WHERE bot_id=? AND operation<>'inspect' AND conversation_id IS NOT NULL AND conversation_id<>? AND state IN ('queued','running')").run(botId,event.conversationId);
       this.cancelUnsent(botId,'PLUGIN_CONVERSATION_CHANGED',event.conversationId);
     }
   }
@@ -134,6 +149,11 @@ export class ConsolePlugins {
     if(this.db.prepare('SELECT 1 FROM plugin_dispatches WHERE bot_id=? AND message_id=?').get(botId,messageId))return;
     const core=controlCommand(event);
     if(core){this.saveDispatch(botId,core);return;}
+    for(const definition of commandPlugins) {
+      const dispatch=definition.command(event);if(!dispatch)continue;
+      const conf=this.config(botId,definition.manifest.id);if(!conf.enabled)continue;
+      this.executeCommand(botId,definition,dispatch,conf,now);return;
+    }
     const command=contentPlugins.map(definition=>definition.command(event)).find(dispatch=>dispatch&&this.config(botId,dispatch.pluginId).enabled);
     for(const definition of contentPlugins) {
     const pluginId=definition.manifest.id;const conf=this.config(botId,pluginId);if(!conf.enabled)continue;
@@ -165,6 +185,18 @@ export class ConsolePlugins {
       for(const resource of resources)if(definition.shouldProcess(conf.settings,resource))this.enqueue(botId,pluginId,messageId,resource,'share',true,conf.revision,now);
     }
     }
+  }
+  private executeCommand(botId:string,definition:CommandPluginDefinition,dispatch:PluginDispatch,conf:{revision:number;settings:PluginSettings},now:number):void {
+    const execution=definition.execute(dispatch,conf.settings);
+    if(typeof execution.text!=='string'||!execution.text.trim()||execution.text.length>64000||typeof execution.summary!=='string'||!execution.summary.trim()||!Array.isArray(execution.details))throw new Error('插件指令产物无效');
+    const commandExecution={text:execution.text,summary:execution.summary.slice(0,500),input:dispatch.args.slice(0,1000),details:execution.details.slice(0,16).map(detail=>({label:detail.label.slice(0,100),value:detail.value.slice(0,2000)}))};
+    const id=randomUUID(),pluginId=definition.manifest.id;
+    this.db.prepare(`INSERT INTO plugin_jobs(id,bot_id,plugin_id,source_message_id,operation,resource_key,resource_cipher,command_execution_cipher,config_revision,command_kind,automatic,state,attempts,created_at,finished_at,expires_at)
+      VALUES (?,?,?,?,'execute','none',?,?,?,?,0,'completed',1,?,?,?)`)
+      .run(id,botId,pluginId,dispatch.sourceMessageId,this.host.encrypt(null),this.host.encrypt(commandExecution),conf.revision,dispatch.command,now,now,now+600_000);
+    this.saveDispatch(botId,{...dispatch,args:dispatch.args.slice(0,16384),jobId:id});
+    this.result(botId,dispatch.sourceMessageId,`reply:${id}`,{pluginId,kind:'reply',text:execution.text,deliveryId:`plugin:${id}:reply`,automatic:false},now);
+    this.host.change(botId,'plugin.result');
   }
   private saveDispatch(botId:string,dispatch:PluginDispatch){this.db.prepare('INSERT OR IGNORE INTO plugin_dispatches(bot_id,message_id,dispatch_json) VALUES (?,?,?)').run(botId,dispatch.sourceMessageId,JSON.stringify(dispatch));}
   private enqueue(botId:string,pluginId:PlatformPluginId,messageId:string,resource:PluginResource|undefined,command:string,automatic:boolean,revision:number,now:number):string|undefined {
@@ -211,17 +243,18 @@ export class ConsolePlugins {
     const bot=this.host.requireBot(botId);const enabledConfigs=contentPlugins.map(plugin=>({plugin,config:this.config(botId,plugin.manifest.id)})).filter(item=>item.config.enabled);
     const results=bot.desiredState==='running'?(this.db.prepare('SELECT * FROM plugin_results WHERE bot_id=? AND conversation_id IS NOT NULL AND acknowledged_at IS NULL ORDER BY created_at,id LIMIT 100').all(botId) as unknown as ResultRow[]).map(r=>this.decodeResult(r)):[];
     for(let index=0;index<results.length;index++) {const result=results[index]!;if(result.kind!=='enrichment'&&!result.delivery&&result.expiresAt!==undefined&&result.expiresAt<Date.now()){this.cancel(botId,result.id,'PLUGIN_SEND_EXPIRED');results[index]=this.getResult(botId,result.id)!;}}
-    const bindingsRequired=(this.db.prepare('SELECT source_message_id FROM plugin_jobs WHERE bot_id=? AND conversation_id IS NULL UNION SELECT source_message_id FROM plugin_results WHERE bot_id=? AND conversation_id IS NULL LIMIT 1000').all(botId,botId) as Array<{source_message_id:string}>).map(r=>r.source_message_id);
+    const bindingsRequired=(this.db.prepare("SELECT source_message_id FROM plugin_jobs WHERE bot_id=? AND operation<>'inspect' AND conversation_id IS NULL UNION SELECT source_message_id FROM plugin_results WHERE bot_id=? AND conversation_id IS NULL LIMIT 1000").all(botId,botId) as Array<{source_message_id:string}>).map(r=>r.source_message_id);
     const pendingSources=(this.db.prepare("SELECT DISTINCT source_message_id FROM plugin_jobs WHERE bot_id=? AND operation='resolve' AND state IN ('queued','running') ORDER BY created_at LIMIT 1000").all(botId) as Array<{source_message_id:string}>).map(r=>r.source_message_id);
     return {results:results.filter(result=>result.kind==='enrichment'||result.delivery||this.groupReady(botId,result)),commands:this.commands(botId),bindingsRequired,pendingBindings:bindingsRequired,pendingSources,waitSeconds:Math.max(0,...enabledConfigs.map(({plugin,config})=>plugin.policy(config.settings).waitSeconds))};
   }
   claim(now=Date.now()):PluginRunnerJob|null {
     return this.host.transaction(()=>{
-      const interrupted=this.db.prepare("SELECT * FROM plugin_jobs WHERE state='running' AND lease_until<?").all(now) as unknown as JobRow[];
+      const interrupted=this.db.prepare("SELECT * FROM plugin_jobs WHERE operation IN ('resolve','download','prepare') AND state='running' AND lease_until<?").all(now) as unknown as JobRow[];
       for(const row of interrupted)if(row.attempts>=3)this.fail(row,'PLUGIN_RUNNER_INTERRUPTED',now);else this.db.prepare("UPDATE plugin_jobs SET state='queued',lease=NULL,error='PLUGIN_RUNNER_INTERRUPTED' WHERE id=?").run(row.id);
-      const active=this.db.prepare("SELECT operation,COUNT(*) AS count FROM plugin_jobs WHERE state='running' AND lease_until>=? GROUP BY operation").all(now) as Array<{operation:string;count:number}>;
-      const rows=this.db.prepare("SELECT * FROM plugin_jobs WHERE state='queued' AND next_attempt<=? ORDER BY created_at,id LIMIT 100").all(now) as unknown as JobRow[];
+      const active=this.db.prepare("SELECT operation,COUNT(*) AS count FROM plugin_jobs WHERE operation IN ('resolve','download','prepare') AND state='running' AND lease_until>=? GROUP BY operation").all(now) as Array<{operation:string;count:number}>;
+      const rows=this.db.prepare("SELECT * FROM plugin_jobs WHERE operation IN ('resolve','download','prepare') AND state='queued' AND next_attempt<=? ORDER BY created_at,id LIMIT 100").all(now) as unknown as JobRow[];
       for(const row of rows) {
+        if(row.operation==='execute'||row.operation==='inspect')continue;
         if(active.some(item=>item.operation===row.operation&&item.count>=1))continue;
         const bot=this.host.requireBot(row.bot_id),conf=this.config(row.bot_id,row.plugin_id);
         if(bot.desiredState!=='running'||!conf.enabled||row.config_revision!==conf.revision) {this.db.prepare("UPDATE plugin_jobs SET state='cancelled',error='PLUGIN_DISABLED' WHERE id=?").run(row.id);continue;}
@@ -239,7 +272,7 @@ export class ConsolePlugins {
   }
   leased(jobId:string,lease:string,now=Date.now()):{row:JobRow;job:PluginRunnerJob} {
     const row=this.db.prepare('SELECT * FROM plugin_jobs WHERE id=?').get(jobId) as unknown as JobRow|undefined;
-    if(!row||row.state!=='running'||row.lease!==lease||row.lease_until<now)throw new Error('插件作业租约已失效');
+    if(!row||row.operation==='execute'||row.operation==='inspect'||row.state!=='running'||row.lease!==lease||row.lease_until<now)throw new Error('插件作业租约已失效');
     const bot=this.host.requireBot(row.bot_id),conf=this.config(row.bot_id,row.plugin_id);if(!conf.enabled||bot.desiredState!=='running'||conf.revision!==row.config_revision)throw new Error('插件作业已取消');
     const previous=this.db.prepare("SELECT payload_cipher FROM plugin_results WHERE bot_id=? AND plugin_id=? AND source_message_id=? AND id LIKE 'enrichment:%' ORDER BY created_at DESC LIMIT 1").get(row.bot_id,row.plugin_id,row.source_message_id) as {payload_cipher:string}|undefined;
     const content=row.content_cipher?this.host.decrypt(row.content_cipher) as PluginContent:previous?(this.host.decrypt(previous.payload_cipher) as PluginResult).content:undefined;
@@ -446,6 +479,13 @@ export class ConsolePlugins {
   }
   private cancelUnsent(botId:string,code:string,currentConversation?:string,pluginId?:string) {
     const rows=this.db.prepare('SELECT * FROM plugin_results WHERE bot_id=? AND acknowledged_at IS NULL').all(botId) as unknown as ResultRow[];
-    for(const row of rows) {const result=this.decodeResult(row);if(pluginId&&result.pluginId!==pluginId||result.kind==='enrichment'||result.delivery||currentConversation&&row.conversation_id===currentConversation)continue;if(!row.conversation_id){result.delivery={status:'failed',code};this.db.prepare('UPDATE plugin_results SET payload_cipher=? WHERE id=?').run(this.host.encrypt(result),row.id);}else this.cancel(botId,row.id,code);}
+    for(const row of rows) {
+      const result=this.decodeResult(row);
+      if(pluginId&&result.pluginId!==pluginId||result.kind==='enrichment'||result.delivery)continue;
+      // A boundary can arrive before the Worker assigns this source to a conversation.
+      if(currentConversation&&(!row.conversation_id||row.conversation_id===currentConversation))continue;
+      if(!row.conversation_id){result.delivery={status:'failed',code};this.db.prepare('UPDATE plugin_results SET payload_cipher=? WHERE id=?').run(this.host.encrypt(result),row.id);}
+      else this.cancel(botId,row.id,code);
+    }
   }
 }

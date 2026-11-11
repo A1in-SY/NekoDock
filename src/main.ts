@@ -1,4 +1,5 @@
 import { mkdirSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { managedIdentity, runManagedWorker, workerRequest, type WorkerRuntime, type ManagedIdentity } from './managed-worker.js';
 import { loadConfig, type Config } from './config.js';
@@ -33,16 +34,20 @@ import { createPluginImageReader } from './plugin-images.js';
 import { WorkerIncomingForwards } from './incoming-forwards.js';
 import type { ForwardSnapshot } from './forward-contract.js';
 import { historySharedContents } from './history-content.js';
+import { ReplyDecisionCoordinator } from './reply-decision.js';
+import type { ChatRecallEvent } from './chat-context-contract.js';
+import { incomingRecall } from './incoming-recall.js';
 
 const logger = createLogger();
 
 function createRuntime(config:Config, signal:AbortSignal, identity?:ManagedIdentity):WorkerRuntime {
-  const secrets=[config.agentApiKey,config.memory.apiKey,config.memory.embeddingApiKey,config.token,identity?.token,config.webSearch.provider==='tavily'?config.webSearch.apiKey:'',config.tts.provider==='mimo'?config.tts.apiKey:'',...proxySecrets(config.networkProxy)].filter((value):value is string=>!!value);
+  const secrets=[config.agentApiKey,config.replyDecision.apiKey,config.memory.apiKey,config.memory.embeddingApiKey,config.token,identity?.token,config.webSearch.provider==='tavily'?config.webSearch.apiKey:'',config.tts.provider==='mimo'?config.tts.apiKey:'',...proxySecrets(config.networkProxy)].filter((value):value is string=>!!value);
   const logger=createLogger({secrets});
   const imageNetwork=createNetworkClient(config.networkProxy,logger,'images');
   const speechNetwork=createNetworkClient(config.networkProxy,logger,'tts');
   const diagnostics=createNetworkClient(config.networkProxy,logger,'probe');
   const memoryNetwork=createNetworkClient(config.networkProxy,logger,'model');
+  const decisionNetwork=createNetworkClient(config.networkProxy,logger,'reply-decision');
   for (const path of [config.dataDir, config.agentHome, config.workspace]) mkdirSync(path, { recursive: true, mode: 0o700 });
   const store = new BridgeStore(join(config.dataDir, 'bridge.sqlite3'), config.target);
   store.initializeAgentRuntime();
@@ -57,6 +62,7 @@ function createRuntime(config:Config, signal:AbortSignal, identity?:ManagedIdent
   let processor: Processor;
   let memory: MemoryCoordinator;
   let plugins: PluginCoordinator | undefined;
+  let replyDecision: ReplyDecisionCoordinator | undefined;
   const incomingImages = new WorkerIncomingImages({
     dbPath: join(config.dataDir, 'bridge.sqlite3'), workspace: config.workspace,
     maxBytes: config.imageMaxBytes, timeoutMs: config.imageTimeoutMs,
@@ -80,12 +86,30 @@ function createRuntime(config:Config, signal:AbortSignal, identity?:ManagedIdent
       .catch(() => { if (!controller.signal.aborted) logEvent(logger, 'warn', 'image.cache.recovery_failed'); })
     : Promise.resolve();
   const historicalImageReleases: Array<() => void> = [];
+  const onRecall=(event:ChatRecallEvent)=>{
+    try {
+      if(store.applyRecall(event)) {
+        const source=store.chatMessageForQQ(event.messageId),pending=store.peekPendingBatch();
+        const received=source?.origin==='human'?store.getMessage(event.messageId):null;
+        if(source?.conversationId===store.recorder.conversationId
+          &&(source.origin!=='human'||pending&&received&&received.seq<=pending.throughSeq))agent.notifyRecall(event);
+        logEvent(logger,'info','message.recalled',{message_ref:fingerprint(event.messageId),event_ref:fingerprint(event.eventId)});
+      }
+    } catch {
+      logEvent(logger,'error','message.recall.persistence_failed');
+      process.exitCode=1;controller.abort();throw new Error('Message recall persistence failed.');
+    }
+  };
   const onEvent = (event:unknown, attachments?: IncomingImageDescriptor[], dispatch?: PluginDispatch, forwards?:ForwardSnapshot) => {
       try {
+        if(!identity) {
+          const recall=incomingRecall(event,config.target,id=>store.chatMessageForQQ(id)!==null);
+          if(recall){onRecall(recall);return;}
+        }
         handleIncomingEvent(event, {
           target: config.target, randomReplyProbability: config.randomReplyProbability,
           store, processor, sender: napcat, logger, signal: controller.signal,
-          dispatch,
+          dispatch, replyDecision,
           onMessage: message => {
             if(forwards?.messageId===message.messageId)incomingForwards?.receive(forwards,attachments);
             incomingImages.register(message, identity ? attachments ?? [] : undefined);
@@ -99,7 +123,7 @@ function createRuntime(config:Config, signal:AbortSignal, identity?:ManagedIdent
         throw new Error('Incoming message persistence failed.');
       }
   };
-  const napcat = identity ? new ConsoleTransport({identity,logger,reconnectMs:config.reconnectMs,actionTimeoutMs:config.actionTimeoutMs,onEvent,
+  const napcat = identity ? new ConsoleTransport({identity,logger,reconnectMs:config.reconnectMs,actionTimeoutMs:config.actionTimeoutMs,onEvent,onRecall,
     onContentUpdate:(snapshot,attachments)=>incomingForwards!.receive(snapshot,attachments)})
     : new NapCatClient({url:config.wsUrl,token:config.token,target:config.target,logger,reconnectMs:config.reconnectMs,actionTimeoutMs:config.actionTimeoutMs,onEvent});
   const agent = new PiRunner({
@@ -128,8 +152,9 @@ function createRuntime(config:Config, signal:AbortSignal, identity?:ManagedIdent
         search: async request => memoryStore.search({ ...request, includeInactive: false }),
         history: async request => {
           const result = memoryStore.history(request);
-          historicalImageReleases.push(incomingImages.retain(result.messages.flatMap(source => source.messageId ? [source.messageId] : [])));
+          historicalImageReleases.push(incomingImages.retain(result.messages.flatMap(source => source.kind!=='message_recalled'&&source.messageId ? [source.messageId] : [])));
           return { ...result, messages: result.messages.map(source => {
+            if(source.kind==='message_recalled')return source;
             const chat = source.messageId ? store.chatMessageForQQ(source.messageId) : null;
             const original = source.messageId ? store.getMessage(source.messageId) : null;
             if (!original) return chat ? { ...source, assets: chat.assets, ...historySharedContents(chat.contents) } : source;
@@ -212,6 +237,11 @@ function createRuntime(config:Config, signal:AbortSignal, identity?:ManagedIdent
   plugins = identity ? new PluginCoordinator({ identity, store, logger, notify: () => processor?.notify(),
     registerImages:(messageId,pluginId,assetIds)=>incomingImages.registerPlugin(messageId,pluginId,assetIds),
   }, controller.signal) : undefined;
+  if(config.target.type==='group' && config.replyDecision.mode==='jev') {
+    replyDecision=new ReplyDecisionCoordinator({store,config:config.replyDecision,
+      configRevision:createHash('sha256').update(JSON.stringify(config.replyDecision)).digest('hex'),
+      logger,signal:controller.signal,fetch:decisionNetwork.fetch,notify:()=>processor.notify()});
+  }
   processor = new Processor({
     store, agent, sender: napcat, logger, batchSize: config.batchSize,
     replyMaxChars: config.replyMaxChars, retryMs: config.retryMs,
@@ -235,6 +265,9 @@ function createRuntime(config:Config, signal:AbortSignal, identity?:ManagedIdent
     provider: config.tts.provider, enabled: config.voiceReplyEnabled,
     probability: config.voiceReplyEnabled ? config.voiceReplyProbability : undefined,
   });
+  logEvent(logger,'info','app.reply_strategy_configured',{mode:config.replyDecision.mode,
+    enabled:config.target.type==='group'&&config.replyDecision.mode==='jev',
+    ...(config.replyDecision.mode==='jev'?{model:config.replyDecision.model,threshold:config.replyDecision.threshold,timeout_ms:config.replyDecision.timeoutMs}:{probability:config.randomReplyProbability})});
   logEvent(logger,'info','network.configured',{enabled:config.networkProxy.enabled,revision:undefined,mode:config.networkProxy.enabled?'proxy':'direct',for_tools:config.networkProxy.forTools});
   void imageRecovery.then(() => incomingImages.start());
   napcat.start();
@@ -262,7 +295,7 @@ function createRuntime(config:Config, signal:AbortSignal, identity?:ManagedIdent
     probeNetwork:probeSignal=>probeNetwork(diagnostics,config.agentBaseUrl,AbortSignal.any([controller.signal,probeSignal])),
     stop:(beforeStoreClose)=>stopped??=(async()=>{
       clearInterval(scheduleTimer);clearInterval(embeddingTimer);controller.abort();await napcat.stop();
-      try{await done;}finally{try{await plugins?.close();await imageRecovery;await incomingImages.close();await memory.close();await memoryRecovery;await embeddings?.update(controller.signal).catch(()=>{});await scheduler?.close();scheduler?.flushEvents();await beforeStoreClose?.();scheduledStore?.close();embeddings?.close();memoryStore.close();store.close();}finally{signal.removeEventListener('abort',parentAbort);await Promise.all([imageNetwork.close(),speechNetwork.close(),diagnostics.close(),memoryNetwork.close()]);}}
+      try{await done;}finally{try{await replyDecision?.close();await plugins?.close();await imageRecovery;await incomingImages.close();await memory.close();await memoryRecovery;await embeddings?.update(controller.signal).catch(()=>{});await scheduler?.close();scheduler?.flushEvents();await beforeStoreClose?.();scheduledStore?.close();embeddings?.close();memoryStore.close();store.close();}finally{signal.removeEventListener('abort',parentAbort);await Promise.all([imageNetwork.close(),speechNetwork.close(),diagnostics.close(),memoryNetwork.close(),decisionNetwork.close()]);}}
     })(),
   };
 }

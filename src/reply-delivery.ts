@@ -1,6 +1,6 @@
 import { logEvent } from './logging.js';
 import type { SpeechProvider } from './tts.js';
-import type { Logger, MessageSegment, MessageSender, OutputMessage, ReplyPart, SegmentMessage } from './types.js';
+import type { Logger, MessageSegment, MessageSender, OutgoingDeliveryMetadata, OutputMessage, ReplyPart, SegmentMessage } from './types.js';
 
 export function splitReply(text: string, maxChars: number): string[] {
   if (!Number.isSafeInteger(maxChars) || maxChars < 1) throw new Error('无效的回复分段长度');
@@ -58,7 +58,7 @@ export function prepareReplyParts(messages:OutputMessage[],options:ReplyDelivery
       }
       const text = message.type === 'text' ? message.text
         : message.segments.filter(segment => segment.type === 'text').map(segment => segment.text).join('');
-      const useVoice = voiceReplyEnabled && speech && sender.sendVoice && text.trim().length > 0 && probability > 0
+      const useVoice = !message.replyTo && voiceReplyEnabled && speech && sender.sendVoice && text.trim().length > 0 && probability > 0
         && (probability === 1 || (options.random ?? Math.random)() < probability);
       if (!useVoice) {
         if (message.type === 'text') replies.push(...splitReply(message.text, replyMaxChars));
@@ -79,12 +79,12 @@ export function prepareReplyParts(messages:OutputMessage[],options:ReplyDelivery
     return replies;
 }
 
-export async function transmitReply(part:ReplyPart,sender:MessageSender,signal:AbortSignal) {
-  if(typeof part==='string')return sender.sendText(part,signal);
-  if(part.type==='message')return sender.sendMessage(part.segments,signal);
+export async function transmitReply(part:ReplyPart,sender:MessageSender,signal:AbortSignal,replyTo?:string,metadata?:OutgoingDeliveryMetadata) {
+  if(typeof part==='string')return sender.sendText(part,signal,replyTo,metadata);
+  if(part.type==='message')return sender.sendMessage(part.segments,signal,replyTo,metadata);
   if(part.type==='voice') {
     if(!sender.sendVoice||!part.file)throw new Error('Prepared voice sender unavailable');
-    return sender.sendVoice(part.file,signal);
+    return sender.sendVoice(part.file,signal,metadata);
   }
-  return sender.sendImage(part.file,signal);
+  return sender.sendImage(part.file,signal,metadata);
 }

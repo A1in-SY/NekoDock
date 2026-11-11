@@ -733,10 +733,10 @@ function BotCard({
           </div>
         </div>
         <div>
-          <span className="meta-label">普通消息回复概率</span>
+          <span className="meta-label">普通消息回复策略</span>
           <div className="meta-value">
             {b.targetType === "group"
-              ? Math.round(b.config.replyProbability) + "%"
+              ? b.config.replyMode === "jev" ? "Jev 判断" : Math.round(b.config.replyProbability) + "%"
               : "私聊正常回复"}{" "}
             <span className="muted" style={{ fontSize: 9 }}>
               {b.targetType === "group" ? "· 被 @ 时必回" : ""}

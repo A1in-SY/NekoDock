@@ -1,0 +1,19 @@
+{
+  "kind": "nekodock-plugin",
+  "id": "dice",
+  "name": "骰子",
+  "description": "通过 /dice 掷骰子，支持默认范围或自定义整数闭区间。",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "entries": { "console": "./index.js" },
+  "capabilities": ["commands"],
+  "resourceTypes": [],
+  "commands": [
+    {
+      "name": "/dice",
+      "description": "掷骰子，默认范围 1～100；可提供两个整数自定义闭区间，顺序不限。",
+      "executor": "console",
+      "contextPolicy": "chat"
+    }
+  ]
+}

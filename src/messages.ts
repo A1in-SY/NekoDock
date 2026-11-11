@@ -3,7 +3,8 @@ import type { SegmentMessage } from './types.js';
 export function isSegmentMessage(value: unknown): value is SegmentMessage {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const message = value as Record<string, unknown>;
-  if (Object.keys(message).length !== 2 || message.type !== 'message'
+  if (Object.keys(message).some(key=>!['type','segments','replyTo'].includes(key)) || message.type !== 'message'
+    || message.replyTo!==undefined&&(typeof message.replyTo!=='string'||!message.replyTo||message.replyTo.length>200||message.replyTo.trim()!==message.replyTo)
     || !Array.isArray(message.segments) || message.segments.length === 0) return false;
   return message.segments.every((value: unknown) => {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return false;

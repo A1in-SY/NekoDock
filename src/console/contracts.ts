@@ -11,14 +11,16 @@ export interface BotSettings {
   contextWindow: number; compactLimit: number; compactKeepRecentTokens: number; compactSummaryMaxTokens: number; persona: string;
   memoryEnabled: boolean; memoryDailyEnabled: boolean; memoryDailyTime: string; memoryTimezone: string; memoryAfterCompaction: boolean; memoryRecallTokens: number;
   memoryModel: string; memoryBaseUrl: string; memoryApiKey?: string; memoryEmbeddingProvider: 'none' | 'openai-compatible'; memoryEmbeddingBaseUrl: string; memoryEmbeddingModel: string; memoryEmbeddingApiKey?: string;
-  replyProbability: number; searchProvider: 'none' | 'tavily'; tavilyApiKey?: string; searchBaseUrl: string; searchDepth: 'basic' | 'advanced'; searchResults: number; searchTimeout: number;
+  replyMode: 'random' | 'jev'; replyProbability: number;
+  replyJudgeBaseUrl: string; replyJudgeModel: string; replyJudgeApiKey?: string; replyJudgeThreshold: number; replyJudgeTimeout: number; replyJudgeInstructions: string;
+  searchProvider: 'none' | 'tavily'; tavilyApiKey?: string; searchBaseUrl: string; searchDepth: 'basic' | 'advanced'; searchResults: number; searchTimeout: number;
   voiceEnabled: boolean; voiceProbability: number; ttsProvider: 'none' | 'edge-tts' | 'mimo'; mimoApiKey?: string; ttsBaseUrl: string; ttsModel: string; ttsVoice: string; ttsStyle: string;
   edgeVoice: string; edgeRate: string; edgePitch: string; edgeVolume: string; ttsTimeout: number; ttsMaxChars: number; ttsMaxMiB: number;
   batchSize: number; replyMaxChars: number; modelTimeout: number; actionTimeout: number; retrySeconds: number; reconnectSeconds: number; imageMaxMiB: number; imageTimeout: number;
   /** Worker retention and Console transfer limits apply independently, per instance. */
   imageCacheDays: number; imageCacheMaxMiB: number; imageTransitHours: number; imageTransitMaxMiB: number;
 }
-export const SECRET_FIELDS = ['napcatToken','modelApiKey','tavilyApiKey','mimoApiKey','proxyUsername','proxyPassword','memoryApiKey','memoryEmbeddingApiKey'] as const;
+export const SECRET_FIELDS = ['napcatToken','modelApiKey','tavilyApiKey','mimoApiKey','proxyUsername','proxyPassword','memoryApiKey','memoryEmbeddingApiKey','replyJudgeApiKey'] as const;
 export type SecretField = typeof SECRET_FIELDS[number];
 export type NapcatConnectionField = 'wsUrl' | 'napcatToken' | 'reconnectSeconds' | 'actionTimeout';
 export interface NapcatConnectionRecord {
@@ -34,7 +36,7 @@ export interface NapcatConnectionInput {
   mediaBaseUrl?: string;
 }
 export interface NapcatQueuedEvent { seq: number; event: unknown; attachments?: IncomingImageDescriptor[]; dispatch?: import('../plugin-contract.js').PluginDispatch;
-  forwards?: import('../forward-contract.js').ForwardSnapshot; update?: import('../forward-contract.js').ForwardSnapshot; }
+  forwards?: import('../forward-contract.js').ForwardSnapshot; update?: import('../forward-contract.js').ForwardSnapshot; recall?:import('../chat-context-contract.js').ChatRecallEvent; }
 export type NapcatDeliveryState = 'started' | 'acknowledged' | 'failed' | 'unconfirmed';
 export interface NapcatDeliveryRecord {
   botId: string; deliveryId: string; payloadHash: string; state: NapcatDeliveryState; result?: unknown; createdAt: number; updatedAt: number;

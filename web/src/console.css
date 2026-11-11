@@ -170,24 +170,13 @@
 .history-control .btn {
   font-size: 10px;
 }
-.conversation-image {
-  max-width: 100%;
-  max-height: 460px;
-  object-fit: contain;
-  border-radius: 8px;
-  display: block;
-}
 .incoming-image-attachments {
   display: flex;
-  flex-direction: column;
+  flex-wrap: wrap;
   align-items: flex-start;
   gap: 10px;
   margin-top: 10px;
   white-space: normal;
-}
-.incoming-image-attachments > a {
-  display: block;
-  max-width: 100%;
 }
 .forward-content {
   min-width: 0;
@@ -252,9 +241,6 @@
 }
 .forward-node-image {
   margin: 8px 0;
-}
-.forward-node-image > a {
-  display: block;
 }
 .forward-node-segments > .forward-content {
   margin-top: 8px;
@@ -400,6 +386,23 @@
   display: block;
   max-width: 100%;
 }
+.conversation-quote {
+  margin: 0 0 10px;
+  padding: 8px 12px;
+  border-left: 3px solid #a9bcae;
+  background: #f1f5f1;
+  border-radius: 0 6px 6px 0;
+  font-size: 12px;
+  color: #68776c;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+.conversation-quote > span { font-weight: 600; }
+.conversation-quote > p { margin: 3px 0 0; white-space: pre-wrap; }
+.conversation-recall-label { color: #8b8170; font-size: 11px; font-weight: 400; }
+.conversation-text > .conversation-recall-label { display: block; margin-bottom: 6px; }
+.conversation-recalled > summary { cursor: pointer; color: #8b8170; font-size: 12px; }
+.conversation-recalled[open] > div { margin-top: 10px; }
 @media (max-width: 740px) {
   .revision-state {
     font-size: 9px;

@@ -8,10 +8,11 @@ import { isMp3Snapshot } from './audio.js';
 import type { SpeechProvider } from './tts.js';
 import type { Scheduler } from './scheduler.js';
 import type { TaskTools } from './scheduled-contract.js';
-import type { AgentRunner, CommandResult, Logger, MessageSegment, MessageSender, OutputMessage, PendingCommand, ReplyPart, ReplyTools, SegmentMessage } from './types.js';
+import type { AgentRunner, CommandResult, Logger, MessageSegment, MessageSender, OutputMessage, PendingCommand, RecallToolReceipt, ReplyPart, ReplyTools, SegmentMessage } from './types.js';
 import type { ContextCommit } from './chat-context-contract.js';
 import { saveChatAsset } from './chat-assets.js';
 import { modelErrorReply } from './model-error-reply.js';
+import { ReplyToolError } from './reply-contract.js';
 
 const commandReplies: Record<CommandResult, string> = {
   help: [
@@ -40,7 +41,8 @@ export class Processor {
   private activeCommand:number|null=null;
   private drainCommand:number|null=null;
   private contextRecovery=true;
-  requestDrain():void { if(this.draining)return; this.draining=true; this.drainCommand=this.activeCommand; this.options.scheduler?.requestDrain();this.options.backgroundActions?.requestDrain?.();this.notify(); }
+  private activeReply: {messageRef:string;done:Promise<void>} | undefined;
+  requestDrain():void { if(this.draining)return; this.draining=true; this.options.store.invalidateReplyDecisions('draining'); this.drainCommand=this.activeCommand; this.options.scheduler?.requestDrain();this.options.backgroundActions?.requestDrain?.();this.notify(); }
   get isProcessing():boolean { return this.active || this.options.store.peekPendingBatch()!==null; }
   get isDrained():boolean { return this.draining && !this.active && this.options.store.peekPendingBatch()===null && this.drainCommand===null && (!this.options.scheduler||this.options.scheduler.isDrained); }
 
@@ -147,7 +149,7 @@ export class Processor {
           // Non-persistent adapters have no Pi acknowledgement channel; their successful
           // return is the explicit context boundary. Pi always acknowledges its file entry.
           if(!agent.supportsContextCommits)store.commitContext({batchId:context.batchId,conversationId:context.conversationId,
-            session:store.getSessionId()??'',entryId:`adapter:${context.batchId}`,versions:context.versions});
+            session:store.getSessionId()??'',entryId:`adapter:${context.batchId}`,versions:context.versions,recallEventIds:context.recalls?.map(event=>event.eventId)});
           stage = 'reply_prepare';
           const usedTools = store.listReplyRequests(batch.throughSeq).length > 0;
           if (usedTools && result.messages.length > 0) throw new Error('Tool replies must not be repeated in the final output.');
@@ -218,6 +220,9 @@ export class Processor {
     const tools: ReplyTools = {
       send: async (request, metadata) => {
         if (signal.aborted) throw new Error('Reply acceptance cancelled.');
+        await this.validateReplyTargets(request.messages,signal);
+        if(signal.aborted)throw new Error('Reply acceptance cancelled.');
+        this.replyTargets(request.messages);
         const requestId = randomUUID();
         const messageIndices: number[] = [];
         const parts = this.prepareReplies(request.messages, throughSeq, messageIndices);
@@ -230,7 +235,35 @@ export class Processor {
           try { await this.deliverPending(throughSeq, signal, runId); }
           catch (error) { failed = true; failure = error; }
         });
-        return { accepted: true };
+        return { accepted: true, messages:store.replyLedger.references(requestId).map(messageRef=>({messageRef,status:'queued' as const})) };
+      },
+      recall: async (request, metadata) => {
+        if(signal.aborted)throw new Error('Reply recall cancelled.');
+        const operationId=metadata?.operationId??metadata?.toolCallId??randomUUID();
+        const existing=store.beginReplyRecall(request.messageRef,operationId);
+        if(existing==='started')return {messageRef:request.messageRef,status:'unconfirmed',parts:[],code:'RECALL_INTERRUPTED'};
+        if(existing)return existing;
+        const active=this.activeReply;
+        if(active?.messageRef===request.messageRef)await active.done;
+        const parts=store.replyLedger.parts(request.messageRef,store.recorder.conversationId);
+        const cancelledParts=parts.filter(part=>part.state==='cancelled').length;
+        const sent=parts.filter(part=>['acknowledged','recalled','started','unconfirmed'].includes(part.state));
+        let result:RecallToolReceipt;
+        if(!sent.length)result={messageRef:request.messageRef,status:cancelledParts===parts.length?'cancelled':'failed',parts:[],cancelledParts,
+          ...(cancelledParts===parts.length?{}:{code:'RECALL_NOT_DELIVERED'})};
+        else if(sent.every(part=>part.state==='recalled'))result={messageRef:request.messageRef,status:'already_recalled',cancelledParts,
+          parts:sent.filter(part=>part.messageId).map(part=>({messageId:part.messageId!,partIndex:part.partIndex,status:'already_recalled'}))};
+        else if(!this.options.sender.recallMessage)result={messageRef:request.messageRef,status:'failed',parts:[],cancelledParts,code:'RECALL_UNAVAILABLE'};
+        else {
+          try {result={...await this.options.sender.recallMessage(request.messageRef,operationId,signal),cancelledParts};}
+          catch(error){result={messageRef:request.messageRef,status:'unconfirmed',parts:[],cancelledParts,
+            code:typeof (error as {code?:unknown})?.code==='string'&&/^[A-Z][A-Z0-9_]{0,99}$/.test((error as {code:string}).code)?(error as {code:string}).code:'RECALL_UNCONFIRMED'};}
+          for(const event of result.events??[])store.applyRecall(event);
+        }
+        store.finishReplyRecall(operationId,result);
+        logEvent(logger,result.status==='failed'||result.status==='unconfirmed'?'warn':'info','processor.reply.recalled',{
+          run_ref:runId,message_ref:fingerprint(request.messageRef),status:result.status,cancelled_parts:cancelledParts,part_count:result.parts.length,code:result.code});
+        return result;
       },
     };
     return { tools, async flush() { await tail; if (failed) throw failure; } };
@@ -247,6 +280,8 @@ export class Processor {
       let part = batch.replies![index]!;
       const request = store.listReplyRequests(throughSeq).find(request => request.startIndex <= index && request.endIndex > index);
       const requestRef = request ? fingerprint(request.requestId) : `final:${throughSeq}`;
+      const durable=store.replyLedger.part(throughSeq,index);
+      if(durable?.state==='cancelled'){store.skipCancelledReply(throughSeq,index);continue;}
       let stage = 'attempt_save';
       let sendStarted: number | undefined;
       let acknowledged = false;
@@ -256,6 +291,9 @@ export class Processor {
       // Persist before preparing or calling NapCat. Storage failures stop this
       // batch; they cannot turn a potentially delivered message into a retry.
       store.beginReplyAttempt(throughSeq, index);
+      let releaseActive: (()=>void)|undefined;
+      const active=durable?{messageRef:durable.messageRef,done:new Promise<void>(resolve=>{releaseActive=resolve;})}:undefined;
+      this.activeReply=active;
       try {
         if (typeof part !== 'string' && part.type === 'image' && !part.file.startsWith('base64://')) {
           stage = 'image_prepare'; progress(stage, index);
@@ -291,10 +329,14 @@ export class Processor {
         }
         if (signal.aborted) throw new Error('Reply delivery cancelled.');
         stage = 'send'; progress(stage, index);
+        let receipt: Awaited<ReturnType<typeof sender.sendText>>;
+        const latest=store.replyLedger.part(throughSeq,index);
+        if(latest?.cancelRequested){
+          store.replyLedger.status(throughSeq,index,'cancelled');store.skipCancelledReply(throughSeq,index);continue;
+        }
         sendStarted = Date.now();
         logEvent(logger, 'info', 'processor.reply.send_started', fields);
-        let receipt: Awaited<ReturnType<typeof sender.sendText>>;
-        receipt = await transmitReply(part,sender,signal);
+        receipt = await transmitReply(part,sender,signal,durable?.firstPart?durable.replyTo:undefined,durable?store.replyLedger.metadata(durable):undefined);
         acknowledged = true;
         logEvent(logger, 'info', 'processor.reply.sent', { ...fields, duration_ms: Date.now() - sendStarted, ...(receipt?.messageId ? { message_ref: receipt.messageId } : {}) });
         stage = 'reply_ack'; progress(stage, index);
@@ -311,12 +353,38 @@ export class Processor {
         logEvent(logger, 'warn', 'processor.reply.failed', { ...fields, stage, status, error_code: errorCode, retcode, duration_ms: Date.now() - attemptedAt });
         if (acknowledged) throw error;
         store.failReply(throughSeq, index, sendStarted === undefined ? 'failed' : deliveryFailureStatus(error), stage, errorCode, retcode);
+        if(durable&&/^QUOTE_TARGET_/.test(errorCode))store.cancelReply(durable.messageRef,errorCode);
+      } finally {
+        if(this.activeReply===active)this.activeReply=undefined;
+        releaseActive?.();
       }
     }
   }
 
   private prepareReplies(messages: OutputMessage[], throughSeq: number, messageIndices?:number[]): ReplyPart[] {
     return prepareReplyParts(messages,this.options,throughSeq,messageIndices);
+  }
+
+  private replyTargets(messages: OutputMessage[]): Array<{id:string;index:number}> {
+    const targets:Array<{id:string;index:number}>=[];
+    for(const [index,message] of messages.entries())if('replyTo' in message&&message.replyTo){
+      const source=this.options.store.chatMessageForQQ(message.replyTo);
+      if(!source)throw new ReplyToolError('QUOTE_TARGET_UNKNOWN','The reply target is not a recorded QQ message.',index);
+      if(source.conversationId!==this.options.store.recorder.conversationId)throw new ReplyToolError('QUOTE_TARGET_FORBIDDEN','The reply target belongs to another conversation.',index);
+      if(source.recalled)throw new ReplyToolError('QUOTE_TARGET_RECALLED','The reply target has been recalled.',index);
+      targets.push({id:message.replyTo,index});
+    }
+    return targets;
+  }
+  private async validateReplyTargets(messages: OutputMessage[], signal: AbortSignal): Promise<void> {
+    const targets=this.replyTargets(messages);
+    if(targets.length&&this.options.sender.validateReplyTargets)try {await this.options.sender.validateReplyTargets(targets.map(target=>target.id),signal);}
+    catch(error){
+      const detail=error as {code?:string;messageIndex?:number;messageId?:string};
+      if(detail.code&&/^QUOTE_TARGET_[A-Z_]+$/.test(detail.code))throw new ReplyToolError(detail.code,'The quoted message is unavailable for this reply.',
+        targets.find(target=>target.id===detail.messageId)?.index??targets[detail.messageIndex??0]?.index);
+      throw error;
+    }
   }
 
   private async processCommand(command: PendingCommand, signal: AbortSignal): Promise<void> {

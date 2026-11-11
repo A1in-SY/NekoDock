@@ -13,6 +13,8 @@ import { ConsoleIncomingForwards } from './incoming-forwards.js';
 import type { ForwardSnapshot } from '../forward-contract.js';
 import { ConsolePlugins } from './plugins.js';
 import { ConsolePluginAssets } from './plugin-assets.js';
+import { ConsoleMessageState } from './message-state.js';
+import type { ChatRecallEvent } from '../chat-context-contract.js';
 
 export interface RuntimeRecord {
   state: RuntimeState; connected: boolean; processing: boolean; drained: boolean; lastHeartbeat: number | null; error?: string;
@@ -40,6 +42,7 @@ export class ConsoleDatabase {
   readonly forwards: ConsoleIncomingForwards;
   readonly plugins: ConsolePlugins;
   readonly pluginAssets: ConsolePluginAssets;
+  readonly messageState: ConsoleMessageState;
 
   constructor(path: string, keyPath: string) {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
@@ -92,6 +95,10 @@ export class ConsoleDatabase {
         CREATE INDEX IF NOT EXISTS event_thinking ON event_projection(bot_id,conversation_id,run_id,item_id,worker_seq) WHERE type='thinking.updated';
         CREATE INDEX IF NOT EXISTS event_incoming_images ON event_projection(bot_id,conversation_id,json_extract(payload,'$.messageId'),worker_seq) WHERE type='message.images.updated';
         CREATE INDEX IF NOT EXISTS event_incoming_content ON event_projection(bot_id,conversation_id,json_extract(payload,'$.messageId'),worker_seq) WHERE type='message.content.updated';
+        CREATE INDEX IF NOT EXISTS event_message_recalled ON event_projection(bot_id,conversation_id,json_extract(payload,'$.messageId'),worker_seq) WHERE type='message.recalled';
+        CREATE INDEX IF NOT EXISTS event_delivery_request ON event_projection(bot_id,conversation_id,json_extract(payload,'$.requestId'),worker_seq) WHERE type='delivery.acknowledged';
+        CREATE INDEX IF NOT EXISTS event_cancelled_request ON event_projection(bot_id,conversation_id,json_extract(payload,'$.requestId'),worker_seq) WHERE type='delivery.cancelled';
+        CREATE INDEX IF NOT EXISTS event_quote_source ON event_projection(bot_id,conversation_id,json_extract(payload,'$.messageId'),worker_seq) WHERE type IN ('message.received','incoming','plugin.message.sent');
         CREATE TABLE IF NOT EXISTS counters (
           bot_id TEXT NOT NULL REFERENCES bots(id), kind TEXT NOT NULL, identity TEXT NOT NULL, time INTEGER NOT NULL,
           count INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(bot_id,kind,identity)
@@ -134,6 +141,7 @@ export class ConsoleDatabase {
       const botColumns = this.db.prepare('PRAGMA table_info(bots)').all() as Array<{name: string}>;
       if (!botColumns.some(column => column.name === 'connection_id')) this.db.exec('ALTER TABLE bots ADD COLUMN connection_id TEXT REFERENCES napcat_connections(id)');
       this.migrateNapcatConnections();
+      this.messageState=new ConsoleMessageState(this.db,{requireBot:id=>this.requireBot(id),connection:id=>this.getNapcatConnection(id)});
       this.memory = new ConsoleMemory(this.db, {requireBot:id=>this.requireBot(id),encrypt:value=>this.encrypt(value),decrypt:value=>this.decrypt(value),transaction:fn=>this.transaction(fn),change:(id,type)=>this.change(id,type)});
       this.tasks = new ScheduledTasks(this.db, {
         requireBot: id => this.requireBot(id), encrypt: value => this.encrypt(value), decrypt: value => this.decrypt(value),
@@ -256,19 +264,37 @@ export class ConsoleDatabase {
 
   pendingNapcatEvents(botId: string, limit = 100): NapcatQueuedEvent[] {
     this.requireBot(botId); this.pruneNapcatQueue(botId);
+    this.publishRecalls(botId);
     const count = Math.min(1000, Math.max(1, Number.isSafeInteger(limit) ? limit : 100));
     return (this.db.prepare('SELECT seq,event_cipher,content_update FROM napcat_inbound WHERE bot_id=? ORDER BY seq LIMIT ?').all(botId, count) as Array<{seq: number; event_cipher: string; content_update: number}>).map(row => {
       const event = this.decrypt(row.event_cipher);
+      if(row.content_update===2)return {seq:row.seq,event:null,recall:(event as {recall:ChatRecallEvent}).recall};
       if (row.content_update === 1) {
         const update = (event as {snapshot: ForwardSnapshot}).snapshot;
         return {seq: row.seq, event: null, update, attachments: this.images.forMessage(botId, update.messageId)};
       }
+      const packet=record(event)?event:null,bot=this.requireBot(botId),accountId=this.getNapcatConnection(bot.connectionId)?.accountId;
+      if(packet?.post_type==='message'&&accountId&&String(packet.self_id)===accountId&&packet.message_type===bot.targetType
+        &&String(bot.targetType==='group'?packet.group_id:packet.user_id)===bot.targetId&&packet.message_id!==undefined&&packet.user_id!==undefined
+        &&!this.messageState.get(botId,String(packet.message_id))?.registered)
+        this.messageState.register(botId,String(packet.message_id),String(packet.user_id),'human');
       const messageId = event && typeof event === 'object' && !Array.isArray(event) ? (event as Record<string, unknown>).message_id : undefined;
       const attachments = messageId === undefined ? [] : this.images.forMessage(botId, String(messageId));
       const dispatch=messageId===undefined?undefined:this.plugins.dispatch(botId,String(messageId));
       const forwards = messageId === undefined ? null : this.forwards.get(botId, String(messageId));
       return { seq: row.seq, event, ...(attachments.length ? { attachments } : {}),...(dispatch?{dispatch}:{}), ...(forwards ? {forwards} : {}) };
     });
+  }
+
+  publishRecalls(botId:string):void {
+    const pending=this.messageState.pending(botId);if(!pending.length)return;
+    this.transaction(()=>{for(const recall of pending) {
+      const serialized=JSON.stringify({recall});
+      const size=this.db.prepare('SELECT COUNT(*) n,COALESCE(SUM(bytes),0) bytes FROM napcat_inbound WHERE bot_id=?').get(botId) as {n:number;bytes:number};
+      if(size.n>=NAPCAT_QUEUE_LIMITS.messages||size.bytes+Buffer.byteLength(serialized)>NAPCAT_QUEUE_LIMITS.bytes)break;
+      const row=this.db.prepare('INSERT INTO napcat_inbound(bot_id,event_cipher,bytes,created_at,content_update) VALUES(?,?,?,?,2)').run(botId,this.encrypt({recall}),Buffer.byteLength(serialized),Date.now());
+      this.messageState.queued(recall.eventId,Number(row.lastInsertRowid));
+    }});
   }
 
   private enqueueForwardUpdate(botId: string, snapshot: ForwardSnapshot): boolean {
@@ -286,6 +312,7 @@ export class ConsoleDatabase {
     this.requireBot(botId);
     if (!Number.isSafeInteger(seq) || seq < 1) throw new Error('NapCat 消息确认序号无效');
     this.transaction(() => {
+      this.messageState.acknowledge(botId,seq);
       this.db.prepare('DELETE FROM napcat_inbound WHERE bot_id=? AND seq<=?').run(botId, seq);
       this.db.prepare('INSERT INTO napcat_queue_state(bot_id,acknowledged_seq) VALUES (?,?) ON CONFLICT(bot_id) DO UPDATE SET acknowledged_seq=MAX(acknowledged_seq,excluded.acknowledged_seq)').run(botId, seq);
     });
@@ -527,8 +554,45 @@ export class ConsoleDatabase {
     let more = rows.length > pageSize;
     if (more) rows.pop();
     let items: ConsoleEvent[] = []; let bytes = 0;
+    const replyPreview=(messageId:string):Record<string,unknown>|undefined=>{
+      const source=this.db.prepare("SELECT payload FROM event_projection WHERE bot_id=? AND conversation_id=? AND type IN ('message.received','incoming','plugin.message.sent') AND json_extract(payload,'$.messageId')=? ORDER BY worker_seq LIMIT 1").get(id,conversation.id,messageId) as {payload:string}|undefined;
+      const withdrawn=this.db.prepare("SELECT 1 FROM event_projection WHERE bot_id=? AND conversation_id=? AND type='message.recalled' AND json_extract(payload,'$.messageId')=? LIMIT 1").get(id,conversation.id,messageId);
+      if(!source)return undefined;
+      const value=JSON.parse(source.payload);return {messageId,...(typeof value.senderName==='string'?{senderName:value.senderName}:{}),...(typeof value.text==='string'?{text:value.text.slice(0,300)}:{}),recalled:!!withdrawn};
+    };
+    const hydrateState=(item:ConsoleEvent):ConsoleEvent=>{
+      const messageId=item.payload.messageId;
+      if(typeof messageId==='string'){
+        const recall=this.db.prepare("SELECT payload FROM event_projection WHERE bot_id=? AND conversation_id=? AND type='message.recalled' AND json_extract(payload,'$.messageId')=? ORDER BY worker_seq DESC LIMIT 1").get(id,conversation.id,messageId) as {payload:string}|undefined;
+        if(recall){const state=JSON.parse(recall.payload);item.payload={...item.payload,recalled:true,recalledAt:state.time??state.recalledAt};}
+      }
+      if(typeof item.payload.replyTo==='string'){
+        const preview=replyPreview(item.payload.replyTo);if(preview)item.payload={...item.payload,replyPreview:preview};
+      }
+      if(item.type==='reply.accepted'&&Array.isArray(item.payload.messages)){
+        const requestId=item.payload.requestId;
+        const counts=typeof requestId==='string'?this.db.prepare(`SELECT COALESCE(json_extract(a.payload,'$.logicalMessageIndex'),0) logical_index,COUNT(*) acknowledged,
+          SUM(CASE WHEN EXISTS(SELECT 1 FROM event_projection r WHERE r.bot_id=a.bot_id AND r.conversation_id=a.conversation_id AND r.type='message.recalled'
+            AND json_extract(r.payload,'$.messageId')=json_extract(a.payload,'$.messageId')) THEN 1 ELSE 0 END) recalled
+          FROM event_projection a WHERE a.bot_id=? AND a.conversation_id=? AND a.type='delivery.acknowledged' AND json_extract(a.payload,'$.requestId')=?
+          GROUP BY COALESCE(json_extract(a.payload,'$.logicalMessageIndex'),0)`).all(id,conversation.id,requestId) as Array<{logical_index:number;acknowledged:number;recalled:number}>:[];
+        const cancellations=typeof requestId==='string'?this.db.prepare(`SELECT COALESCE(json_extract(payload,'$.logicalMessageIndex'),0) logical_index,
+          COUNT(DISTINCT json_extract(payload,'$.partIndex')) cancelled FROM event_projection
+          WHERE bot_id=? AND conversation_id=? AND type='delivery.cancelled' AND json_extract(payload,'$.requestId')=?
+          GROUP BY COALESCE(json_extract(payload,'$.logicalMessageIndex'),0)`).all(id,conversation.id,requestId) as Array<{logical_index:number;cancelled:number}>:[];
+        const expected=Array.isArray(item.payload.partCounts)?item.payload.partCounts:[];
+        item.payload={...item.payload,messages:item.payload.messages.map((message,index)=>{
+          if(!record(message))return message;
+          const preview=typeof message.replyTo==='string'?replyPreview(message.replyTo):undefined;
+          const count=counts.find(value=>value.logical_index===index),total=expected[index];
+          const totalKnown=Number.isSafeInteger(total)&&Number(total)>0;
+          return {...message,...(preview?{replyPreview:preview}:{}),deliverySummary:{totalParts:totalKnown?total:null,totalKnown,acknowledgedParts:count?.acknowledged??0,recalledParts:count?.recalled??0,cancelledParts:cancellations.find(value=>value.logical_index===index)?.cancelled??0}};
+        })};
+      }
+      return item;
+    };
     for (const row of rows) {
-      const item = this.eventRecord(row);
+      const item = hydrateState(this.eventRecord(row));
       if ((item.type === 'message.received' || item.type === 'incoming') && typeof item.payload.messageId === 'string') {
         const latest = this.db.prepare(`SELECT worker_seq,payload FROM event_projection WHERE bot_id=? AND conversation_id=?
           AND type='message.images.updated' AND json_extract(payload,'$.messageId')=? ORDER BY worker_seq DESC LIMIT 1`)
@@ -545,6 +609,13 @@ export class ConsoleDatabase {
     items.reverse();
     const nextBefore = more ? items[0]?.seq ?? null : null;
     const pageStart = items[0]?.seq; const pageEnd = items.at(-1)?.seq;
+    // Logical replies need their actual QQ part IDs even if ACKs fell on another page.
+    for(const accepted of [...items].filter(item=>item.type==='reply.accepted')){
+      const requestId=accepted.payload.requestId;if(typeof requestId!=='string')continue;
+      const receipts=this.db.prepare("SELECT * FROM event_projection WHERE bot_id=? AND conversation_id=? AND type='delivery.acknowledged' AND json_extract(payload,'$.requestId')=? ORDER BY worker_seq LIMIT 100").all(id,conversation.id,requestId) as unknown as EventRow[];
+      for(const row of receipts){if(items.some(item=>item.seq===row.worker_seq))continue;const item=hydrateState(this.eventRecord(row)),size=Buffer.byteLength(JSON.stringify(item));if(bytes+size>512*1024)break;items.push(item);bytes+=size;}
+    }
+    items.sort((a,b)=>a.seq-b.seq);
     const seenThinking = new Set<string>();
     // A snapshot needs only the latest cumulative version of each model
     // message. Keep the raw event cursor for durable incremental replay.

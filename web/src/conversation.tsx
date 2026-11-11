@@ -10,6 +10,7 @@ import { conversationActivity, conversationDisplay, mergeConversationUpdate, mer
 import { compact, date, ErrorBox, fmt, Icon } from "./ui";
 import { deliveryLabels, runLabels } from "./tasks-state";
 import { IncomingImageAttachment, PluginMediaAttachment, SharedContents } from "./shared-content";
+import { ConversationImage } from "./image-preview";
 import { nativeIncomingImages } from "./shared-content-state";
 import type { TaskDeliveryStatus, TaskRunStatus } from "../../src/scheduled-contract";
 
@@ -353,24 +354,28 @@ function EventItem({ event, botId }: { event: ConsoleEvent; botId: string }) {
         <div className="conversation-author">
           {text(p.senderName) || text(p.senderId) || "QQ 用户"}
           <time>{date(typeof p.time === "number" ? p.time : event.time)}</time>
+          {p.recalled === true && <span className="conversation-recall-label">已撤回</span>}
         </div>
         <div className="conversation-text">
+          <QuotePreview value={p.replyPreview} />
+          <RecalledBody recalled={p.recalled === true}>
           {text(p.text) || "（非文字消息）"}
           {incomingImages.length > 0 && <div className="incoming-image-attachments">
             {incomingImages.map((image, index) => <IncomingImageAttachment key={text(object(image).attachmentId) || index} image={image} botId={botId} />)}
           </div>}
           {Array.isArray(p.contents) && p.contents.length > 0 && <SharedContents contents={p.contents} botId={botId} images={p.images} />}
+          </RecalledBody>
         </div>
       </article>
     );
   if (event.type === "reply.accepted")
     return <AcceptedReply payload={p} botId={botId} />;
   if (event.type === "plugin.message.sent")
-    return <article className="conversation-message from-assistant"><div className="conversation-author">{p.pluginId === 'bilibili' ? '哔哩哔哩增强' : '插件回复'}<time>{date(event.time)}</time></div><div className="conversation-text">{text(p.text)}
+    return <article className="conversation-message from-assistant"><div className="conversation-author">{p.pluginId === 'bilibili' ? '哔哩哔哩增强' : '插件回复'}<time>{date(event.time)}</time>{p.recalled === true && <span className="conversation-recall-label">已撤回</span>}</div><div className="conversation-text"><QuotePreview value={p.replyPreview} /><RecalledBody recalled={p.recalled === true}>{text(p.text)}
       {Array.isArray(p.assets) && p.assets.map((asset, index) => { const value = object(asset); return (value.type === 'video' || value.type === 'image') && typeof value.id === 'string'
         ? <PluginMediaAttachment key={value.id} asset={value} botId={botId} />
         : <span key={index}>{text(value.title)}</span>; })}
-    </div></article>;
+    </RecalledBody></div></article>;
   if (event.type === "run.failed" || event.type === "compact.failed") {
     const detail = text(p.error) || (event.type === "compact.failed"
       ? p.aborted ? "上下文压缩已中止，可在实例日志查看详细信息。" : "上下文压缩未完成，可在实例日志查看详细信息。"
@@ -424,6 +429,14 @@ function EventItem({ event, botId }: { event: ConsoleEvent; botId: string }) {
     </details>
   );
 }
+function QuotePreview({ value }: { value: unknown }) {
+  const p=object(value);
+  if(typeof p.messageId!=='string')return null;
+  return <blockquote className="conversation-quote"><span>{text(p.senderName)||'引用消息'}</span><p>{p.recalled===true?'该消息已撤回':text(p.text)||`消息 ${p.messageId}`}</p></blockquote>;
+}
+function RecalledBody({ recalled, children }: { recalled: boolean; children: React.ReactNode }) {
+  return recalled?<details className="conversation-recalled"><summary>该消息已撤回 · 查看原内容</summary><div>{children}</div></details>:<>{children}</>;
+}
 function AcceptedReply({
   payload,
   botId,
@@ -455,6 +468,10 @@ function AcceptedReply({
         return (
           <article key={index} className="conversation-message from-assistant">
             <div className="conversation-text">
+              <QuotePreview value={message.replyPreview} />
+              {message.cancelled === true && <span className="conversation-recall-label">已取消发送</span>}
+              {message.partiallyRecalled === true && <span className="conversation-recall-label">已撤回 {Number(message.recalledPartCount)} 段</span>}
+              <RecalledBody recalled={message.recalled === true}>
               <ReplyBody
                 message={
                   image
@@ -470,6 +487,7 @@ function AcceptedReply({
                   src={mediaUrl(botId, voice.mediaPath)}
                 />
               ))}
+              </RecalledBody>
             </div>
           </article>
         );
@@ -531,14 +549,7 @@ function ReplyBody({ message, botId }: { message: unknown; botId: string }) {
         : null);
     if (src)
       return m.type === "image" ? (
-        <a href={src} target="_blank" rel="noreferrer">
-          <img
-            className="conversation-image"
-            src={src}
-            alt="Bot 发送的图片"
-            loading="lazy"
-          />
-        </a>
+        <ConversationImage src={src} alt="Bot 发送的图片" />
       ) : (
         <>
           <audio controls src={src} />

@@ -1,5 +1,5 @@
 import { fingerprint, logEvent } from './logging.js';
-import { normalizeMessage } from './napcat.js';
+import { hasReplyContent, normalizeMessage } from './napcat.js';
 import type { BridgeStore } from './store.js';
 import type { IncomingMessage, Logger, MessageSender, Target } from './types.js';
 import type { PluginDispatch } from './plugin-contract.js';
@@ -17,13 +17,14 @@ interface IncomingOptions {
   random?: () => number;
   onMessage?: (message: IncomingMessage) => void;
   dispatch?: PluginDispatch;
+  replyDecision?:{enqueue(message:IncomingMessage):void};
 }
 
 /** Persist synchronously so the next event observes queued work before any network wait. */
 export function handleIncomingEvent(event: unknown, options: IncomingOptions): void {
   const { store, target, logger } = options;
   const busy = store.isBusy();
-  const message = normalizeMessage(event, target, options.randomReplyProbability, options.random, busy);
+  const message = normalizeMessage(event, target, options.replyDecision?0:options.randomReplyProbability, options.random, busy);
   if (!message) return;
   const handledByPlugin = options.dispatch?.executor === 'console' && options.dispatch.contextPolicy === 'chat'
     && options.dispatch.sourceMessageId === message.messageId;
@@ -39,6 +40,7 @@ export function handleIncomingEvent(event: unknown, options: IncomingOptions): v
     text_chars: Array.from(message.text).length, has_reply: message.replyTo !== null,
   });
   if (!inserted) return;
+  if(options.replyDecision&&!busy&&target.type==='group'&&!message.command&&!message.directlyMentioned&&!handledByPlugin&&hasReplyContent(message.rawJson))options.replyDecision.enqueue(message);
   options.processor.notify();
   if (busy && target.type === 'group' && message.directlyMentioned && !handledByPlugin) {
     // This transport-only acknowledgement never enters the conversation or TTS pipeline.

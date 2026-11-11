@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
 import { date, Icon } from './ui';
+import { ConversationImage } from './image-preview';
 import { forwardImageAttachment, forwardStatusLabel, gameFacts, gamePrices, gameScore, incomingImageUrl, liveStatusLabels, pluginAssetUrl, pluginMediaAssetId, sharedContentKind, sharedContentLink, sharedContentPlatform, sharedContentTime, sharedImageCaption } from './shared-content-state';
+import { FORWARD_LIMITS } from '../../src/forward-contract';
 
 const object = (value: unknown): Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const text = (value: unknown) => typeof value === 'string' ? value : '';
@@ -9,15 +11,13 @@ export function IncomingImageAttachment({ image, botId }: { image: unknown; botI
   const value = object(image), src = incomingImageUrl(botId, image);
   const [unavailable, setUnavailable] = useState(false);
   useEffect(() => setUnavailable(false), [src, value.status]);
-  if (src && !unavailable) return <a href={src} target="_blank" rel="noreferrer">
-    <img className="conversation-image" src={src} alt="收到的图片" loading="lazy" onError={() => setUnavailable(true)} />
-  </a>;
+  if (src && !unavailable) return <ConversationImage src={src} alt="收到的图片" onError={() => setUnavailable(true)} />;
   const label = value.status === 'pending' ? '图片保存中' : value.status === 'expired' ? '图片缓存已过期' : '图片暂不可用';
   return <div className="attachment-placeholder" role="status"><Icon name="document" />{label}</div>;
 }
 
 function ForwardRecord({ content, botId, images, depth = 1 }: { content: Record<string, unknown>; botId: string; images?: unknown; depth?: number }) {
-  const nodes = Array.isArray(content.nodes) ? content.nodes.slice(0, 200) : [];
+  const nodes = Array.isArray(content.nodes) ? content.nodes.slice(0, FORWARD_LIMITS.nodes) : [];
   const status = forwardStatusLabel(content.status);
   if (depth > 8) return <p className="forward-content-status">后续层级未展开</p>;
   return <details className="conversation-tool shared-content forward-content">
@@ -53,7 +53,7 @@ export function PluginMediaAttachment({ asset, botId, caption }: { asset: unknow
   const src = value.status === 'failed' || value.status === 'expired' || value.status === 'pending' ? undefined : pluginAssetUrl(botId, id);
   if (!src || unavailable) return <div className="attachment-placeholder" role="status"><Icon name="document" />{value.status === 'pending' ? '图片准备中' : value.type === 'video' ? '视频不可用或缓存已过期' : '图片不可用或缓存已过期'}</div>;
   if (value.type === 'video') return <video className="plugin-message-media" controls preload="metadata" style={{ maxWidth: '100%', maxHeight: 420, display: 'block' }} src={src} onError={() => setUnavailable(true)} />;
-  return <figure className="shared-content-image"><a href={src} target="_blank" rel="noreferrer"><img src={src} alt={caption || text(value.title) || '插件图片'} loading="lazy" onError={() => setUnavailable(true)} /></a>{caption && <figcaption>{caption}</figcaption>}</figure>;
+  return <figure className="shared-content-image"><ConversationImage src={src} alt={caption || text(value.title) || '插件图片'} onError={() => setUnavailable(true)} />{caption && <figcaption>{caption}</figcaption>}</figure>;
 }
 
 function ContentEmoji({ span, botId }: { span: unknown; botId: string }) {

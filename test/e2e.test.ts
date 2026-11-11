@@ -52,7 +52,8 @@ test('Pi Worker 贯通共享 NapCat、独立群聊、图片收发、批次艾特
   const group2 = starts.filter(call => call.body.model === 'provider-model-1002');
   assert.deepEqual(group1.map(call => call.batch.map(message => message.messageId)), [['g1-context', 'g1-first'], ['g1-busy', 'g1-second']]);
   assert.deepEqual(group1.map(call => call.replyTargetMessageIds), [['g1-first'], ['g1-second']]);
-  assert.deepEqual(Object.keys(group1[0]!.batch[0]!).sort(), ['assets', 'chatMessageId', 'images', 'messageId', 'origin', 'replyTo', 'revision', 'role', 'senderId', 'senderName', 'sequence', 'text', 'time']);
+  assert.deepEqual(Object.keys(group1[0]!.batch[0]!).sort(), ['assets', 'chatMessageId', 'images', 'messageId', 'origin', 'recalled', 'replyTo', 'revision', 'role', 'senderId', 'senderName', 'sequence', 'text', 'time']);
+  assert.equal(group1[0]!.batch[0]!.recalled,false);
   assert.equal(group1[0]!.images.length, 1); assert.equal(group1[0]!.images[0], `data:image/png;base64,${pngBase64}`, 'Pi 必须把真实图片字节传给供应商');
   assert.deepEqual(group1[1]!.batch.map(message => [message.senderId, message.text]), [['501', 'user-A-question-1-while-busy'], ['502', '[@999]user-B-question-2-while-busy']]);
   assert.deepEqual(group2[0]!.batch.map(message => message.messageId), ['g2-first']);

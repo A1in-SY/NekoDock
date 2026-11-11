@@ -49,6 +49,24 @@ test('plugin discovery ignores unrelated files and unmarked directories without 
   assert.match(await readFile(join(f.outputDir, 'console.ts'), 'utf8'), /createPlugin1\(pluginManifests\[1\]!\)/u);
 });
 
+test('forward inspection declarations are Console-only and cannot mix platform or command execution', async t => {
+  const f = await fixture(t);
+  const directory = await addPlugin(f.root, 'vision-check', {entries: {console: './index.js'}, capabilities: ['forward-inspection'], commands: [], resourceTypes: []});
+  assert.deepEqual((await f.generate()).plugins, ['core', 'vision-check']);
+  assert.doesNotMatch(await readFile(join(f.outputDir, 'runner.ts'), 'utf8'), /vision-check/u);
+  for (const patch of [
+    {entries: {console: './index.js', runner: './runner.js'}},
+    {capabilities: ['forward-inspection', 'content-enrichment']},
+    {resourceTypes: ['video']},
+    {commands: [{name: '/inspect', description: 'Synthetic', executor: 'console', contextPolicy: 'chat'}]},
+  ]) {
+    await writeFile(join(directory, 'nekodock.plugin.json'), JSON.stringify(declaration('vision-check', {
+      entries: {console: './index.js'}, capabilities: ['forward-inspection'], commands: [], resourceTypes: [], ...patch,
+    })));
+    await assert.rejects(f.generate());
+  }
+});
+
 test('adding and removing a declared plugin regenerates separate Console and Runner registries', async t => {
   const f = await fixture(t);
   await f.generate();
@@ -123,12 +141,18 @@ test('command declarations use the runtime and context policy supported by their
   }
 });
 
-test('API version one accepts content plugins and rejects optional command-only declarations', async t => {
-  for (const entries of [{ console: './index.js' }, { console: './index.js', runner: './runner.js' }]) {
-    const f = await fixture(t);
-    await addPlugin(f.root, 'example', { entries, capabilities: ['commands'] });
-    await assert.rejects(f.generate, /API version 1 requires non-core plugins/u);
-  }
+test('API version one accepts optional Console command plugins without creating Runner entries', async t => {
+  const command = await fixture(t);
+  await addPlugin(command.root, 'example', { entries: { console: './index.js' }, capabilities: ['commands'] });
+  assert.deepEqual((await command.generate()).plugins, ['core', 'example']);
+  assert.match(await readFile(join(command.outputDir, 'console.ts'), 'utf8'), /example\/index\.js/u);
+  assert.doesNotMatch(await readFile(join(command.outputDir, 'runner.ts'), 'utf8'), /example/u);
+  const runner = await fixture(t);
+  await addPlugin(runner.root, 'example', { capabilities: ['commands'] });
+  await assert.rejects(runner.generate, /command-only plugin executes in the Console/u);
+  const empty = await fixture(t);
+  await addPlugin(empty.root, 'example', { entries: { console: './index.js' }, capabilities: ['commands'], commands: [] });
+  await assert.rejects(empty.generate, /must declare at least one command/u);
   const f = await fixture(t);
   await addPlugin(f.root, 'example', { capabilities: ['content-enrichment'], commands: [] });
   assert.deepEqual((await f.generate()).plugins, ['core', 'example']);
@@ -218,4 +242,72 @@ test('registry output is deterministic and does not rewrite unchanged generated 
   await f.generate();
   assert.deepEqual(await Promise.all(paths.map(path => readFile(path, 'utf8'))), before);
   assert.deepEqual(await Promise.all(paths.map(async path => (await stat(path)).mtimeMs)), [1000, 1000, 1000]);
+});
+
+test('configuration parents group child fields under boolean or enum controls without changing defaults', async t => {
+  const f = await fixture(t);
+  await addPlugin(f.root, 'example', { configSchema: { type: 'object', properties: {
+    detail: { type: 'boolean', title: 'Detail', default: true, group: 'Presentation', parent: 'autoCard' },
+    autoCard: { type: 'boolean', title: 'Card', default: false, group: 'Presentation' },
+    mode: { type: 'string', title: 'Mode', enum: ['off', 'card'], default: 'off' },
+    count: { type: 'integer', title: 'Count', minimum: 1, maximum: 4, default: 2, parent: 'mode' },
+  } } });
+  await f.generate();
+  const source = await readFile(join(f.outputDir, 'catalog.ts'), 'utf8');
+  const manifests = JSON.parse(source.slice(source.indexOf('= [') + 2).replace(/;\s*$/u, ''));
+  const plugin = manifests.find((item: { id: string }) => item.id === 'example');
+  assert.deepEqual(plugin.configSchema.properties.detail, { type: 'boolean', title: 'Detail', default: true, group: 'Presentation', parent: 'autoCard' });
+  assert.deepEqual(plugin.fields[0], { key: 'detail', label: 'Detail', type: 'boolean', default: true, group: 'Presentation', parent: 'autoCard' });
+  assert.equal(plugin.fields[1].parent, undefined);
+  assert.deepEqual(plugin.fields[3], { key: 'count', label: 'Count', type: 'number', min: 1, max: 4, default: 2, parent: 'mode' });
+  assert.equal(plugin.configSchema.properties.autoCard.default, false, 'Visual grouping does not force an enabling value');
+});
+
+test('configuration parents reject missing references, incompatible groups and nested or cyclic ownership', async t => {
+  const control = { type: 'boolean', title: 'Control', default: false, group: 'Behavior' };
+  const child = { type: 'boolean', title: 'Detail', default: true, group: 'Behavior', parent: 'control' };
+  const invalid = [
+    { control, detail: { ...child, parent: '' } },
+    { control, detail: { ...child, parent: 1 } },
+    { control, detail: { ...child, parent: 'missing' } },
+    { control, detail: { ...child, parent: 'toString' } },
+    { control, detail: { ...child, parent: 'detail' } },
+    { control, detail: { ...child, group: 'Other' } },
+    { control, detail: { ...child, group: undefined } },
+    { control: { type: 'integer', title: 'Count', default: 1, group: 'Behavior' }, detail: child },
+    { control: { type: 'string', title: 'Text', group: 'Behavior' }, detail: child },
+    { control: { type: 'string', title: 'Secret', secret: true, group: 'Behavior' }, detail: child },
+    { control, detail: child, nested: { ...child, parent: 'detail' } },
+    { control: { ...control, parent: 'detail' }, detail: child },
+  ];
+  for (const properties of invalid) {
+    const f = await fixture(t);
+    await addPlugin(f.root, 'example', { configSchema: { type: 'object', properties } });
+    await assert.rejects(f.generate, /configSchema\.properties\.[A-Za-z]+\.parent/u);
+  }
+});
+
+test('content plugins keep response abilities independent and declare only game-card price ownership', async () => {
+  const plugins = await discoverPlugins(resolve('src/plugins'));
+  for (const id of ['bilibili', 'douyin']) {
+    const plugin = plugins.find((item: { manifest: { id: string } }) => item.manifest.id === id);
+    const fields = plugin.manifest.configSchema.properties;
+    assert.deepEqual(Object.keys(fields).slice(0, 3), ['enhance', 'videoDisplay', 'autoVideo']);
+    for (const key of ['enhance', 'videoDisplay', 'autoVideo']) {
+      assert.equal(fields[key].group, '视频行为');
+      assert.equal(fields[key].parent, undefined);
+    }
+    assert.equal(fields.maxMiB.group, '媒体与缓存');
+    assert.equal(fields.maxMiB.parent, undefined);
+    assert.equal(fields.maxDurationSeconds.group, '视频下载限制');
+    assert.equal(fields.timeoutSeconds.group, '处理');
+  }
+  const heybox = plugins.find((item: { manifest: { id: string } }) => item.manifest.id === 'heybox').manifest.configSchema.properties;
+  assert.equal(heybox.enhance.parent, undefined);
+  assert.equal(heybox.autoCard.parent, undefined);
+  assert.equal(heybox.showPrices.parent, 'autoCard');
+  assert.equal(heybox.showPrices.group, heybox.autoCard.group);
+  const children = plugins.flatMap((plugin: { manifest: { id: string; configSchema?: { properties: Record<string, { parent?: string }> } } }) =>
+    Object.entries(plugin.manifest.configSchema?.properties ?? {}).flatMap(([key, field]) => field.parent ? [`${plugin.manifest.id}.${key}`] : []));
+  assert.deepEqual(children, ['heybox.showPrices']);
 });

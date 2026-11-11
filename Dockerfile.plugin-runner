@@ -21,7 +21,9 @@ WORKDIR /app
 COPY --from=build /app/package.json ./
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist/src ./dist/src
+COPY src/plugin-system/render ./dist/src/plugin-system/render
 COPY src/plugins/bilibili/render ./dist/src/plugins/bilibili/render
+COPY src/plugins/douyin/render ./dist/src/plugins/douyin/render
 COPY src/plugins/heybox/render ./dist/src/plugins/heybox/render
 ENV NODE_ENV=production PLUGIN_RUNNER_WORKDIR=/runner-work
 USER node

@@ -1,8 +1,8 @@
 import { writeFile, readFile, stat } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
-import { setTimeout as delay } from 'node:timers/promises';
 import { imageExtension } from '../../images.js';
+import { renderLimited } from '../../plugin-render.js';
 import type { PluginContent, PluginContentImage, PluginExecution, PluginOutput, PluginRunnerJob } from '../../plugin-system/contracts.js';
 import { boundedBytes, imageUrl } from './api.js';
 import { contentText, validatePluginContent } from './content.js';
@@ -12,8 +12,6 @@ import type { BilibiliConfig, BilibiliResource } from './types.js';
 export const BILIBILI_IMAGE_LIMITS = { sourceImages:4, assets:16, perImageBytes:10*1024*1024,totalBytes:32*1024*1024,maxPixels:24_000_000,pages:3 } as const;
 export type BilibiliRun=(command:string,args:string[],options:{cwd:string;env:NodeJS.ProcessEnv;signal:AbortSignal;timeoutMs:number})=>Promise<string>;
 interface Target {image:PluginContentImage;references:Array<Record<string,any>>;}
-let rendering=false;
-async function renderLimited<T>(action:()=>Promise<T>,signal:AbortSignal):Promise<T>{while(rendering)await delay(25,undefined,{signal});signal.throwIfAborted();rendering=true;try{return await action();}finally{rendering=false;}}
 function allTargets(content:PluginContent,decorations:boolean):Target[] {
   const targets:Target[]=[];
   const visit=(c:PluginContent)=>{
@@ -69,17 +67,20 @@ export async function preparePresentation(job:PluginRunnerJob&{config:BilibiliCo
     }catch(error){signal.throwIfAborted();failed=true;for(const ref of target.references)if('role'in ref)Object.assign(ref,{status:'failed',error:error instanceof BilibiliError?error.code:'BILIBILI_IMAGE_FAILED'});}
   }
   if(failed)content.retrieval={status:'partial',error:'BILIBILI_IMAGES_PARTIAL'};
+  const fallbackContent=content.type==='video'&&content.description&&Array.from(content.description).length>600
+    ?{...content,description:Array.from(content.description).slice(0,600).join('')+'…'}:content;
   const original=():PluginOutput[]=>[
-    {kind:'reply',text:[contentText(content),...(failed?['部分图片未能取得，已保留可用内容。']:[])].join('\n')},
-    ...sourceTargets(content).slice(0,BILIBILI_IMAGE_LIMITS.sourceImages).map(image=>({kind:'image' as const,assetKey:image.assetKey,assetRole:image.role})),
+    {kind:'reply',text:[contentText(fallbackContent),...(failed?['部分图片未能取得，已保留可用内容。']:[])].join('\n')},
+    ...(content.type==='video'?[]:sourceTargets(content).slice(0,BILIBILI_IMAGE_LIMITS.sourceImages).map(image=>({kind:'image' as const,assetKey:image.assetKey,assetRole:image.role}))),
   ];
   if(mode==='none')return {content,files};
   if(mode==='original')return {content,files,outputs:original()};
   try {
-    const request=join(directory,'render.json');await writeFile(request,JSON.stringify({content,paths,maxPages:BILIBILI_IMAGE_LIMITS.pages}),{mode:0o600});
+    const maxPages=content.type==='video'?1:BILIBILI_IMAGE_LIMITS.pages;
+    const request=join(directory,'render.json');await writeFile(request,JSON.stringify({content,paths,maxPages}),{mode:0o600});
     const raw=await renderLimited(()=>execute('python3',[script,'render',request],{cwd:directory,env,signal,timeoutMs:Math.min(job.config.timeoutSeconds*1000,30000)}),signal);
     const result=JSON.parse(raw) as {files:string[]};
-    if(!Array.isArray(result.files)||!result.files.length||result.files.length>BILIBILI_IMAGE_LIMITS.pages)throw new BilibiliError('BILIBILI_RENDER_LIMIT');
+    if(!Array.isArray(result.files)||!result.files.length||result.files.length>maxPages)throw new BilibiliError('BILIBILI_RENDER_LIMIT');
     const outputs:PluginOutput[]=[];
     for(const [index,name] of result.files.entries()) {
       if(!/^card-\d+\.png$/u.test(name))throw new BilibiliError('BILIBILI_RENDER_INVALID');

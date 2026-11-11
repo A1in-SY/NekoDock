@@ -8,6 +8,7 @@ import { fingerprint, logEvent } from './logging.js';
 
 export interface ImageOptions { workspace: string; maxBytes: number; timeoutMs: number; logger?: Logger; fetch?: typeof globalThis.fetch }
 export type IncomingImage = { path: string } | { error: string };
+const cacheWrites = new Map<string, Promise<string>>();
 
 class ImageError extends Error {}
 
@@ -120,11 +121,31 @@ async function localImage(source: string, options: ImageOptions, signal: AbortSi
 }
 
 export async function cacheImage(bytes: Buffer, options: ImageOptions, signal: AbortSignal): Promise<string> {
+  signal.throwIfAborted();
   const extension = imageExtension(bytes);
   const directory = resolve(options.workspace, '.qq-images');
   await mkdir(directory, { recursive: true, mode: 0o700 });
   if ((await lstat(directory)).isSymbolicLink()) throw new ImageError('图片缓存路径不允许');
   const path = join(directory, `${createHash('sha256').update(bytes).digest('hex')}.${extension}`);
+  const previous = cacheWrites.get(path) ?? Promise.resolve(path);
+  const work = previous.catch(() => path).then(async () => {
+    signal.throwIfAborted();
+    try {
+      const existing = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        const stat = await existing.stat();
+        if (stat.isFile() && stat.size === bytes.length && (await existing.readFile({ signal })).equals(bytes)) return path;
+      } finally { await existing.close(); }
+    } catch { signal.throwIfAborted(); }
+    return writeCachedImage(path, bytes, signal);
+  });
+  cacheWrites.set(path, work);
+  try { return await work; }
+  finally { if (cacheWrites.get(path) === work) cacheWrites.delete(path); }
+}
+
+async function writeCachedImage(path: string, bytes: Buffer, signal: AbortSignal): Promise<string> {
+  const directory = resolve(path, '..');
   const temporary = join(directory, `${randomUUID()}.tmp`);
   try {
     const handle = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);

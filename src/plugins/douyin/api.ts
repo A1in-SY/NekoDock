@@ -14,7 +14,7 @@ const sourceHosts = new Set(['douyin.com','www.douyin.com','m.douyin.com','iesdo
 interface Visitor { cookie: string; expiresAt: number; }
 interface SessionEntry { visitor?: Visitor; pending?: Promise<Visitor>; controller?: AbortController; waiters: number; usedAt: number; }
 export interface DouyinVisitorTransport { fetch: typeof fetch; close(): Promise<void>; }
-export interface DouyinInfo { content: PluginContent; item: Record<string,any>; covers: string[]; }
+export interface DouyinInfo { content: PluginContent; item: Record<string,any>; covers: string[]; avatars: string[]; }
 export interface DouyinState {
   sessions: Map<string,SessionEntry>;
   metadata: Map<string,{ info: DouyinInfo; expiresAt: number }>;
@@ -191,11 +191,17 @@ export function parseDouyinInfo(router: unknown, videoId: string): DouyinInfo {
   const duration = Number(video.duration ?? item.duration);
   if (Number.isFinite(duration) && duration > 0) content.durationSeconds = duration / 1000;
   const covers = (Array.isArray(object(video.cover).url_list) ? object(video.cover).url_list : []).flatMap((url: unknown) => { const safe = imageUrl(url); return safe ? [safe] : []; }).slice(0,4) as string[];
+  const avatars = ['avatar_larger', 'avatar_medium', 'avatar_thumb'].flatMap(key => {
+    const value = object(author[key]);
+    return (Array.isArray(value.url_list) ? value.url_list.slice(0,4) : []).flatMap((url: unknown) => { const safe = imageUrl(url); return safe ? [safe] : []; });
+  }).slice(0,4);
+  const avatar = publicImageUrl(avatars[0]);
+  if (avatar) content.authorAvatar = { id: `video:${videoId}:avatar`, role: 'avatar', url: avatar, status: 'pending' };
   const cover = publicImageUrl(covers[0]);
   content.blocks = [...(caption ? [{ type: 'paragraph' as const, text: caption }] : []),
     ...(cover ? [{ type: 'image' as const, image: { id: `video:${videoId}:cover`, role: 'cover' as const, url: cover, status: 'pending' as const } }] : [])];
   if (!content.blocks.length) delete content.blocks;
-  return { content, item, covers };
+  return { content, item, covers, avatars };
 }
 export async function resolveDouyinUrl(resource: DouyinResource, fetcher: typeof fetch, signal: AbortSignal): Promise<DouyinResource> {
   let current = resource;

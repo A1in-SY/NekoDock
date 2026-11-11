@@ -29,7 +29,7 @@ export interface ForwardSnapshot {
   deadline: number;
 }
 
-export const FORWARD_LIMITS = { depth: 8, nodes: 200, bytes: 128 * 1024, timeoutMs: 15_000, concurrency: 2 } as const;
+export const FORWARD_LIMITS = { depth: 8, nodes: 400, bytes: 256 * 1024, timeoutMs: 15_000, concurrency: 2 } as const;
 
 export function isForwardSnapshot(value: unknown): value is ForwardSnapshot {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;

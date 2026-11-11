@@ -5,7 +5,7 @@ import { DatabaseSync } from 'node:sqlite';
 import type { MemoryBatch, MemoryChange, MemoryControl, MemoryHistorySearch, MemoryItem, MemoryJob, MemoryProposal, MemorySearch, MemorySource, MemoryView } from './memory-contract.js';
 import { memoryFtsQuery, memoryIndexText, memoryRelevance, memoryTerms } from './memory-search.js';
 
-interface SourceRow { seq:number; id:string; message_id:string|null; sender_id:string; sender_name:string; role:'user'|'assistant'; time:number; text:string; }
+interface SourceRow { seq:number; id:string; message_id:string|null; sender_id:string; sender_name:string; role:MemorySource['role']; time:number; text:string; }
 interface ItemRow { id:string; scope:'person'|'conversation'; subject_user_id:string|null; kind:MemoryItem['kind']; topic:string; content:string; occurred_at:number|null; valid_from:number|null; valid_to:number|null; status:MemoryItem['status']; revision:number; created_at:number; updated_at:number; last_source_seq:number; manual_seq:number; }
 interface JobRow { id:string; reason:MemoryJob['reason']; status:MemoryJob['status']; from_seq:number; through_seq:number; processed_seq:number; attempts:number; error:string|null; created_at:number; started_at:number|null; finished_at:number|null; next_attempt:number; }
 const MAX_CHANGES=100;
@@ -32,6 +32,7 @@ export class MemoryStore {
   readonly db:DatabaseSync;
   private closed=false;
   private depth=0;
+  private recallProjection=false;
   constructor(path:string) {
     if(path!==':memory:')mkdirSync(dirname(path),{recursive:true,mode:0o700});
     this.db=new DatabaseSync(path);
@@ -107,6 +108,19 @@ export class MemoryStore {
             text||char(10)||'[Shared content]'||char(10)||contents_json
           FROM chat_messages WHERE contents_json<>'[]' ORDER BY seq;
       `);
+      this.recallProjection=!!this.db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='chat_recall_events'").get();
+      if(this.recallProjection)this.db.exec(`
+        CREATE TRIGGER IF NOT EXISTS memory_ingest_chat_recall AFTER INSERT ON chat_recall_events BEGIN
+          INSERT OR IGNORE INTO memory_ingest(id,message_id,sender_id,sender_name,role,time,text)
+          VALUES('recall:'||NEW.event_id,NEW.message_id,'system','Chat state','system',CAST(NEW.time*1000 AS INTEGER),
+            json_object('type','message_recalled','eventId',NEW.event_id,'messageId',NEW.message_id,'recalled',json('true'),'time',NEW.time));
+          UPDATE memory_state SET version=version+changes() WHERE id=1;
+        END;
+        INSERT OR IGNORE INTO memory_ingest(id,message_id,sender_id,sender_name,role,time,text)
+          SELECT 'recall:'||event_id,message_id,'system','Chat state','system',CAST(time*1000 AS INTEGER),
+            json_object('type','message_recalled','eventId',event_id,'messageId',message_id,'recalled',json('true'),'time',time)
+          FROM chat_recall_events ORDER BY rowid;
+      `);
     });
   }
   close():void {if(!this.closed){this.closed=true;this.db.close();}}
@@ -134,7 +148,16 @@ export class MemoryStore {
   highWater():number{return Number(this.db.prepare('SELECT COALESCE(MAX(seq),0) AS n FROM memory_ingest').get()!.n);}
   cursor():number{return Number(this.db.prepare('SELECT cursor FROM memory_state WHERE id=1').get()!.cursor);}
   private row(id:string):ItemRow|null{return this.db.prepare('SELECT * FROM memory_items WHERE id=?').get(id) as unknown as ItemRow|undefined??null;}
-  private item(row:ItemRow):MemoryItem {return {id:row.id,scope:row.scope,subjectUserId:row.subject_user_id,kind:row.kind,topic:row.topic,content:row.content,occurredAt:row.occurred_at,validFrom:row.valid_from,validTo:row.valid_to,status:row.status,revision:row.revision,sources:this.db.prepare('SELECT source_id AS sourceId,quote FROM memory_sources WHERE memory_id=? ORDER BY source_id,quote').all(row.id) as Array<{sourceId:string;quote:string}>,createdAt:row.created_at,updatedAt:row.updated_at};}
+  private recallState(messageId:string|null):{recalled?:true;recalledAt?:number} {
+    if(!this.recallProjection||!messageId)return {};
+    const event=this.db.prepare('SELECT time FROM chat_recall_events WHERE message_id=?').get(messageId);
+    return event?{recalled:true,recalledAt:Number(event.time)*1000}:{};
+  }
+  private source(row:SourceRow):MemorySource {
+    const source=sourceValue(row);
+    return row.role==='system'&&row.id.startsWith('recall:')?{...source,kind:'message_recalled'}:{...source,...this.recallState(row.message_id)};
+  }
+  private item(row:ItemRow):MemoryItem {return {id:row.id,scope:row.scope,subjectUserId:row.subject_user_id,kind:row.kind,topic:row.topic,content:row.content,occurredAt:row.occurred_at,validFrom:row.valid_from,validTo:row.valid_to,status:row.status,revision:row.revision,sources:(this.db.prepare('SELECT s.source_id AS sourceId,s.quote,i.message_id FROM memory_sources s LEFT JOIN memory_ingest i ON i.id=s.source_id WHERE s.memory_id=? ORDER BY s.source_id,s.quote').all(row.id) as Array<{sourceId:string;quote:string;message_id:string|null}>).map(source=>({sourceId:source.sourceId,quote:source.quote,...this.recallState(source.message_id)})),createdAt:row.created_at,updatedAt:row.updated_at};}
   get(id:string):MemoryItem|null {const row=this.row(id);return row?this.item(row):null;}
   activeItems(limit=10000,afterId=''):MemoryItem[]{return (this.db.prepare("SELECT * FROM memory_items WHERE status='active' AND id>? ORDER BY id LIMIT ?").all(afterId,Math.max(1,Math.min(10000,limit))) as unknown as ItemRow[]).map(row=>this.item(row));}
   job(id:string):MemoryJob|null {const row=this.db.prepare('SELECT * FROM memory_jobs WHERE id=?').get(id) as unknown as JobRow|undefined;return row?jobValue(row):null;}
@@ -177,7 +200,7 @@ export class MemoryStore {
     if(!rows.length)return null;
     const sources:MemorySource[]=[];let used=0,nextOffset=0;
     for(const row of rows){
-      const source=sourceValue(row),offset=sources.length?0:Number(range.source_offset??0);
+      const source=this.source(row),offset=sources.length?0:Number(range.source_offset??0);
       if(offset){source.text=source.text.slice(offset);source.textOffset=offset;}
       const size=Buffer.byteLength(JSON.stringify(source));if(sources.length&&used+size>maxBytes)break;
       if(size>maxBytes){const length=Math.max(100,Math.floor(maxBytes/4));source.text=source.text.slice(0,length);source.textOffset=offset;source.truncated=offset+source.text.length<row.text.length;nextOffset=source.truncated?offset+source.text.length:0;}
@@ -248,7 +271,7 @@ export class MemoryStore {
     for(const evidence of change.sources){
       if(!evidence||!text(evidence.sourceId,300)||!text(evidence.quote,4000))throw new Error('MEMORY_SOURCE_INVALID');
       const row=this.db.prepare('SELECT * FROM memory_ingest WHERE id=? AND seq>? AND seq<=?').get(evidence.sourceId,job.processedSeq,batchThrough) as unknown as SourceRow|undefined;
-      if(!row||!row.text.includes(evidence.quote)||range.from_time!==null&&row.time<Number(range.from_time)||range.to_time!==null&&row.time>=Number(range.to_time))throw new Error('MEMORY_SOURCE_INVALID');sources.push(sourceValue(row));
+      if(!row||!row.text.includes(evidence.quote)||range.from_time!==null&&row.time<Number(range.from_time)||range.to_time!==null&&row.time>=Number(range.to_time))throw new Error('MEMORY_SOURCE_INVALID');sources.push(this.source(row));
     }
     const previous=change.id?this.row(change.id):null;
     if(change.id&&(!previous||!integer(change.expectedRevision,1)||previous.revision!==change.expectedRevision))throw new Error('MEMORY_VERSION_CONFLICT');
@@ -333,7 +356,7 @@ export class MemoryStore {
     const rows=this.db.prepare(`SELECT * FROM memory_ingest WHERE ${clause} ORDER BY seq LIMIT ?`).all(...params,limit) as unknown as SourceRow[];
     const offset=integer(request.textOffset,0)?request.textOffset:0;
     const messages:MemorySource[]=[];let remaining=24*1024-512;
-    for(const row of rows){const source=sourceValue(row),fullLength=source.text.length;source.text=source.text.slice(offset,offset+8000);source.senderName=source.senderName.slice(0,200);if(offset)source.textOffset=offset;
+    for(const row of rows){const source=this.source(row),fullLength=source.text.length;source.text=source.text.slice(offset,offset+8000);source.senderName=source.senderName.slice(0,200);if(offset)source.textOffset=offset;
       let size=Buffer.byteLength(JSON.stringify(source));
       if(size>remaining&&messages.length)break;
       if(size>remaining){source.text=source.text.slice(0,Math.max(0,Math.floor((remaining-500)/4)));size=Buffer.byteLength(JSON.stringify(source));}

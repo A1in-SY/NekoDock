@@ -1,7 +1,7 @@
 import { lstat, readFile, readdir, realpath, stat } from 'node:fs/promises';
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 
-const capabilities = new Set(['commands', 'content-enrichment', 'video-download']);
+const capabilities = new Set(['commands', 'content-enrichment', 'video-download', 'forward-inspection']);
 const resourceTypes = new Set(['video', 'article', 'post', 'live', 'game']);
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const fail = (directory, field, reason) => { throw new Error(`Invalid plugin declaration ${directory}: ${field} ${reason}`); };
@@ -28,7 +28,7 @@ function configSchema(value, directory) {
   for (const [name, field] of Object.entries(value.properties)) {
     if (!/^[a-z][A-Za-z0-9]*$/u.test(name)) fail(directory, 'configSchema.properties', 'contains an invalid field name');
     const path = `configSchema.properties.${name}`;
-    keys(field, ['type', 'title', 'description', 'minimum', 'maximum', 'default', 'secret', 'enum', 'enumLabels', 'group'], directory, path);
+    keys(field, ['type', 'title', 'description', 'minimum', 'maximum', 'default', 'secret', 'enum', 'enumLabels', 'group', 'parent'], directory, path);
     if (!['boolean', 'integer', 'string'].includes(field.type)) fail(directory, path + '.type', 'is unsupported');
     text(field.title, directory, path + '.title', 160);
     if (field.description !== undefined) text(field.description, directory, path + '.description');
@@ -50,6 +50,16 @@ function configSchema(value, directory) {
         : typeof field.default === field.type;
       if (!valid || field.secret || field.enum && !field.enum.includes(field.default)) fail(directory, path + '.default', 'does not match a non-secret field');
     }
+  }
+  for (const [name, field] of Object.entries(value.properties)) {
+    if (field.parent === undefined) continue;
+    const path = `configSchema.properties.${name}.parent`;
+    if (typeof field.parent !== 'string' || !Object.hasOwn(value.properties, field.parent)) fail(directory, path, 'must reference an existing field');
+    if (field.parent === name) fail(directory, path, 'must not reference itself');
+    const parent = value.properties[field.parent];
+    if ((field.group ?? '') !== (parent.group ?? '')) fail(directory, path, 'must stay in the same group');
+    if (parent.parent !== undefined) fail(directory, path, 'must reference a root field');
+    if (parent.secret || parent.type !== 'boolean' && !Array.isArray(parent.enum)) fail(directory, path, 'requires a non-secret boolean or enum control');
   }
   return value;
 }
@@ -85,8 +95,14 @@ export function validatePluginDeclaration(input, directory) {
     if (command.executor !== (core ? 'worker' : 'console') || command.contextPolicy !== (core ? 'control' : 'chat')) fail(directory, 'commands', core ? 'must use worker/control routing' : 'must use console/chat routing');
   }
   if (commands.length && !declaredCapabilities.includes('commands')) fail(directory, 'commands', 'require the commands capability');
-  if (input.id !== 'core' && !declaredCapabilities.some(capability => capability === 'content-enrichment' || capability === 'video-download')) fail(directory, 'capabilities', 'API version 1 requires non-core plugins to declare content-enrichment or video-download');
-  if (declaredCapabilities.some(capability => capability !== 'commands') && !input.entries.runner) fail(directory, 'entries.runner', 'is required for content or download execution');
+  const commandOnly = declaredCapabilities.length === 1 && declaredCapabilities[0] === 'commands';
+  const observerOnly = declaredCapabilities.length === 1 && declaredCapabilities[0] === 'forward-inspection';
+  if (observerOnly && (commands.length || input.entries.runner || input.resourceTypes?.length)) fail(directory, 'capabilities', 'forward inspection executes in the Console without commands or platform resources');
+  if (declaredCapabilities.includes('forward-inspection') && !observerOnly) fail(directory, 'capabilities', 'forward inspection cannot mix execution types');
+  if (input.id !== 'core' && !declaredCapabilities.some(capability => capability === 'content-enrichment' || capability === 'video-download') && !commandOnly && !observerOnly) fail(directory, 'capabilities', 'requires command, content-enrichment, video-download or forward-inspection execution');
+  if (commandOnly && !commands.length) fail(directory, 'commands', 'a command-only plugin must declare at least one command');
+  if (commandOnly && input.entries.runner) fail(directory, 'entries.runner', 'a command-only plugin executes in the Console');
+  if (!observerOnly && declaredCapabilities.some(capability => capability !== 'commands') && !input.entries.runner) fail(directory, 'entries.runner', 'is required for content or download execution');
   if (input.id === 'core' && (input.entries.runner || declaredCapabilities.length !== 1 || declaredCapabilities[0] !== 'commands')) fail(directory, 'core', 'must be a command-only plugin');
   return {
     ...input,
@@ -146,6 +162,7 @@ export function publicPluginManifest(declaration) {
       ...(field.default === undefined ? {} : { default: field.default }),
       ...(field.enum === undefined ? {} : { options: field.enum.map((value, index) => ({ value, label: field.enumLabels?.[index] ?? value })) }),
       ...(field.group === undefined ? {} : { group: field.group }),
+      ...(field.parent === undefined ? {} : { parent: field.parent }),
     })),
   };
 }

@@ -4,12 +4,14 @@ import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { isMp3Snapshot } from './audio.js';
 import { isSegmentMessage } from './messages.js';
-import type { BridgeCommand, CommandResult, IncomingMessage, OutputMessage, PendingBatch, PendingCommand, ReplyPart, ReplyRequestRecord, StoredMessage, Target } from './types.js';
+import type { BridgeCommand, CommandResult, IncomingMessage, OutputMessage, PendingBatch, PendingCommand, RecallToolReceipt, ReplyPart, ReplyRequestRecord, StoredMessage, Target } from './types.js';
 import type { TaskChatMessage } from './scheduled-contract.js';
 import type { CachedIncomingImage } from './incoming-image-contract.js';
 import { ChatStore } from './chat-store.js';
-import type { ChatAsset, ChatContextMessage, ContextCommit, ContextSubmission, PluginChatReply } from './chat-context-contract.js';
+import type { ChatAsset, ChatContextMessage, ChatRecallEvent, ContextCommit, ContextSubmission, PluginChatReply } from './chat-context-contract.js';
 import type { ForwardSnapshot } from './forward-contract.js';
+import type { ReplyDecisionCandidate, ReplyDecisionOutcome } from './reply-decision.js';
+import { ReplyLedger } from './reply-ledger.js';
 
 type StateRow = {
   target_type: string;
@@ -60,8 +62,11 @@ export class BridgeStore {
   private readonly db: DatabaseSync;
   private closed = false;
   private scheduledBusy=false;
+  private decisionEpoch=0;
+  private readonly decisionListeners=new Set<(reason:string)=>void>();
   recorder!: ConversationRecorder;
   private chats!: ChatStore;
+  replyLedger!: ReplyLedger;
 
   constructor(filePath: string, target: Target) {
     if (filePath !== ':memory:') mkdirSync(dirname(filePath), { recursive: true });
@@ -97,6 +102,13 @@ export class BridgeStore {
         );
         CREATE INDEX IF NOT EXISTS outgoing_history_time ON outgoing_history(time);
         CREATE INDEX IF NOT EXISTS messages_time ON messages(time);
+        CREATE TABLE IF NOT EXISTS reply_decisions (
+          message_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, message_seq INTEGER NOT NULL,
+          config_revision TEXT NOT NULL, epoch INTEGER NOT NULL, created_at REAL NOT NULL, expires_at REAL NOT NULL,
+          status TEXT NOT NULL, reason TEXT, score REAL
+        );
+        CREATE INDEX IF NOT EXISTS reply_decisions_status ON reply_decisions(status);
+
         CREATE TABLE IF NOT EXISTS pending_batch (
           id INTEGER PRIMARY KEY CHECK (id = 1),
           through_seq INTEGER NOT NULL,
@@ -119,6 +131,7 @@ export class BridgeStore {
         this.initializeReplySchema();
         this.recorder = new ConversationRecorder(this.db,filePath===':memory:'?undefined:join(dirname(filePath),'console-media'));
         this.chats = new ChatStore(this.db);
+        this.replyLedger = new ReplyLedger(this.db);
         this.backfillChatMessages();
       });
     } catch (error) {
@@ -128,7 +141,7 @@ export class BridgeStore {
   }
 
   insert(message: IncomingMessage): boolean {
-    return this.transaction(() => {
+    const inserted=this.transaction(() => {
       const existing = this.db.prepare(`
         SELECT 1 FROM messages WHERE message_id = ?
         UNION ALL SELECT 1 FROM control_commands WHERE message_id = ? LIMIT 1
@@ -154,6 +167,85 @@ export class BridgeStore {
       }
       return true;
     });
+    if(inserted&&(message.command||message.trigger))this.invalidateReplyDecisions('hard_trigger');
+    return inserted;
+  }
+
+  /** Decision records are operational metadata, never conversation facts. */
+  initializeReplyDecisions():void {this.invalidateReplyDecisions('restarted');}
+
+  onReplyDecisionInvalidated(listener:(reason:string)=>void):()=>void {
+    this.decisionListeners.add(listener);return ()=>this.decisionListeners.delete(listener);
+  }
+
+  invalidateReplyDecisions(reason:string):void {
+    this.decisionEpoch++;
+    this.db.prepare("UPDATE reply_decisions SET status='stale',reason=? WHERE status IN ('queued','running')").run(reason);
+    for(const listener of this.decisionListeners)listener(reason);
+  }
+
+  createReplyDecision(messageId:string,configRevision:string,now:number,expiresAt:number):ReplyDecisionCandidate|null {
+    return this.transaction(()=>{
+      if(this.isBusy())return null;
+      const row=this.db.prepare('SELECT * FROM messages WHERE message_id=? AND trigger=0 AND seq>?').get(messageId,this.getCursor()) as MessageRow|undefined;
+      if(!row||this.chats.get(`in:${messageId}`)?.conversationId!==this.recorder.conversationId)return null;
+      const result=this.db.prepare(`INSERT OR IGNORE INTO reply_decisions(message_id,conversation_id,message_seq,config_revision,epoch,created_at,expires_at,status)
+        VALUES(?,?,?,?,?,?,?,'queued')`).run(messageId,this.recorder.conversationId,row.seq,configRevision,this.decisionEpoch,now,expiresAt);
+      return result.changes?{messageId,conversationId:this.recorder.conversationId,seq:row.seq,configRevision,epoch:this.decisionEpoch,createdAt:now,expiresAt}:null;
+    });
+  }
+
+  claimReplyDecisions(candidates:ReplyDecisionCandidate[],now:number):ReplyDecisionCandidate[] {
+    return this.transaction(()=>candidates.filter(candidate=>{
+      if(!this.validReplyDecision(candidate,now)) {
+        this.finishReplyDecision(candidate,'stale');return false;
+      }
+      return !!this.db.prepare("UPDATE reply_decisions SET status='running' WHERE message_id=? AND status='queued'").run(candidate.messageId).changes;
+    }));
+  }
+
+  private validReplyDecision(candidate:ReplyDecisionCandidate,now:number):boolean {
+    const row=this.db.prepare('SELECT * FROM reply_decisions WHERE message_id=?').get(candidate.messageId);
+    return !!row&&['queued','running'].includes(String(row.status))&&row.config_revision===candidate.configRevision
+      &&Number(row.epoch)===candidate.epoch&&candidate.epoch===this.decisionEpoch&&Number(row.expires_at)===candidate.expiresAt&&candidate.expiresAt>now
+      &&row.conversation_id===candidate.conversationId
+      &&candidate.conversationId===this.recorder.conversationId&&Number(row.message_seq)===candidate.seq
+      &&candidate.seq>this.getCursor()&&!this.isBusy()
+      &&!this.db.prepare('SELECT 1 FROM pending_batch WHERE through_seq>=?').get(candidate.seq);
+  }
+
+  finishReplyDecision(candidate:ReplyDecisionCandidate,reason:string):void {
+    this.db.prepare("UPDATE reply_decisions SET status='failed',reason=? WHERE message_id=? AND status IN ('queued','running')").run(reason,candidate.messageId);
+  }
+
+  commitReplyDecisions(candidates:ReplyDecisionCandidate[],outcomes:ReplyDecisionOutcome[],threshold:number,now:number):string[] {
+    return this.transaction(()=>{
+      const allowed:string[]=[];
+      for(let index=0;index<candidates.length;index++) {
+        const candidate=candidates[index]!,outcome=outcomes[index];
+        if(!this.validReplyDecision(candidate,now)) {this.finishReplyDecision(candidate,'stale');continue;}
+        if(!outcome||!Number.isFinite(outcome.score)||outcome.score<0||outcome.score>1) {this.finishReplyDecision(candidate,'invalid_response');continue;}
+        const yes=outcome.score>=threshold;
+        this.db.prepare('UPDATE reply_decisions SET status=?,reason=?,score=? WHERE message_id=?').run(yes?'allowed':'declined',yes?'threshold_met':'below_threshold',outcome.score,candidate.messageId);
+        if(yes)allowed.push(candidate.messageId);
+      }
+      // Validate the whole result before any trigger makes the instance busy.
+      for(const id of allowed)this.db.prepare('UPDATE messages SET trigger=1 WHERE message_id=?').run(id);
+      if(allowed.length)this.invalidateReplyDecisions('reply_selected');
+      return allowed;
+    });
+  }
+
+  replyDecisionMessages(ids:string[]):import('./chat-context-contract.js').ChatContextMessage[] {
+    return ids.map(id=>this.chats.get(`in:${id}`)).filter((value):value is import('./chat-context-contract.js').ChatContextMessage=>value!==null);
+  }
+
+  replyDecisionHistory(now:number,excludeIds:string[]):import('./chat-context-contract.js').ChatContextMessage[] {
+    const excluded=new Set(excludeIds);
+    const rows=this.db.prepare(`SELECT id FROM chat_messages WHERE conversation_id=? AND time>=? AND time<=?
+      AND origin IN ('human','model','scheduled','plugin') ORDER BY time DESC,seq DESC LIMIT 80`)
+      .all(this.recorder.conversationId,now/1000-15*60,now/1000);
+    return rows.map(row=>this.chats.get(String(row.id))).filter((value):value is import('./chat-context-contract.js').ChatContextMessage=>value!==null&&!excluded.has(value.messageId??'')).slice(0,20).reverse();
   }
 
   getPendingCommand(): PendingCommand | null {
@@ -170,6 +262,7 @@ export class BridgeStore {
       if (command.result !== null) throw new Error('Command result has already been saved.');
       this.db.prepare('UPDATE instance_state SET session_id = NULL, cursor = MAX(cursor, ?) WHERE id = 1')
         .run(command.through_seq);
+      const pending=this.readBatch();if(pending)this.replyLedger.abandon(pending.throughSeq);
       this.db.prepare('DELETE FROM pending_batch WHERE id = 1').run();
       this.db.prepare('DELETE FROM reply_requests').run();
       this.db.prepare('DELETE FROM reply_part_sources').run();
@@ -253,6 +346,24 @@ export class BridgeStore {
   }
   chatMessageForQQ(messageId: string): ChatContextMessage | null { return this.chats.forQQ(messageId); }
   getChatMessage(chatMessageId: string): ChatContextMessage | null { return this.chats.get(chatMessageId); }
+  applyRecall(event: ChatRecallEvent): boolean {
+    return this.transaction(()=>{
+      const changed=this.chats.recall(event);
+      this.replyLedger.recalled(event.messageId);
+      this.replyLedger.cancelQuoted(event.messageId);
+      if(changed){
+        const message=this.chats.forQQ(event.messageId);
+        const source=this.replyLedger.forQQ(event.messageId),parts=source?this.replyLedger.parts(source.messageRef):[];
+        this.recorder.append('message.recalled',{...event,...(message?{chatMessageId:message.chatMessageId,
+          ...(message.toolCallId?{toolCallId:message.toolCallId}:{}),...(message.logicalMessageIndex!==undefined?{logicalMessageIndex:message.logicalMessageIndex}:{}),
+          ...(message.partIndex!==undefined?{partIndex:message.partIndex}:{})}:{}),...(source?{requestId:source.requestId,messageRef:source.messageRef,
+          logicalMessageIndex:source.logicalMessageIndex,partIndex:source.partIndex,logicalPartCount:parts.length,
+          logicalRecallCount:parts.filter(part=>part.state==='recalled').length,logicalCancelledCount:parts.filter(part=>part.state==='cancelled').length}:{})},`recall:${event.eventId}`,
+          {time:event.time*1000,itemId:event.messageId,...(message?{conversationId:message.conversationId}:{})});
+      }
+      return changed;
+    });
+  }
   prepareContext(batch: PendingBatch): ContextSubmission {
     return this.transaction(()=>this.chats.prepare(batch.messages,this.recorder.conversationId,this.getSessionId()));
   }
@@ -336,20 +447,21 @@ export class BridgeStore {
     return row?.busy === 1;
   }
 
-  setScheduledBusy(value:boolean):void {this.scheduledBusy=value;}
+  setScheduledBusy(value:boolean):void {this.scheduledBusy=value;if(value)this.invalidateReplyDecisions('work_started');}
   senderForMessage(id:string):string|null {return (this.db.prepare('SELECT sender_id FROM messages WHERE message_id=?').get(id)?.sender_id as string|undefined)??null;}
-  recordTaskReply(id:string,text:string,taskId:string,conversationId:string,messageId?:string,assets:ChatAsset[]=[]):void {
+  recordTaskReply(id:string,text:string,taskId:string,conversationId:string,messageId?:string,assets:ChatAsset[]=[],replyTo?:string):void {
     this.transaction(()=>{
       this.db.prepare('INSERT OR IGNORE INTO outgoing_history(id,time,text,message_id,conversation_id,task_id) VALUES(?,?,?,?,?,?)')
         .run(id,Date.now(),text,messageId??null,conversationId,taskId);
-      this.chats.outgoing(id,text,conversationId,'scheduled',messageId,assets);
+      this.chats.outgoing(id,text,conversationId,'scheduled',messageId,assets,undefined,undefined,Date.now()/1000,{replyTo:replyTo??null});
     });
   }
   takeExternalMessages():TaskChatMessage[] {
     return this.transaction(()=>{
       const rows=this.db.prepare('SELECT * FROM outgoing_history WHERE task_id IS NOT NULL AND context_consumed=0 AND conversation_id=? ORDER BY time,id').all(this.recorder.conversationId) as Array<{id:string;time:number;text:string;message_id:string|null}>;
       // Compatibility read only: production context consumption is acknowledged by Pi.
-      return rows.slice(0,30).map(row=>({id:row.message_id??row.id,senderId:'self',senderName:'Assistant',time:row.time,text:row.text.slice(0,4000),replyTo:null,role:'assistant'}));
+      return rows.slice(0,30).map(row=>{const chat=this.chats.get(`out:${row.id}`);return {id:row.message_id??row.id,senderId:'self',senderName:'Assistant',time:row.time,text:row.text.slice(0,4000),replyTo:chat?.replyTo??null,role:'assistant' as const,
+        ...(chat?.recalled?{recalled:true,recalledAt:chat.recalledAt}:{})};});
     });
   }
   readTaskChat(from:number,to:number,includeBotReplies:boolean,limit:number,excludeTaskId=''):{messages:TaskChatMessage[];availableCount:number} {
@@ -359,7 +471,7 @@ export class BridgeStore {
     const availableCount=Number(this.db.prepare('SELECT COUNT(*) AS n FROM messages WHERE time>=? AND time<?').get(start,end)!.n)
       +(includeBotReplies?Number(this.db.prepare('SELECT COUNT(*) AS n FROM outgoing_history WHERE time>=? AND time<? AND (task_id IS NULL OR task_id<>?)').get(from,to,excludeTaskId)!.n):0);
     const details=(id:string,fallback:string)=>{const chat=this.chats.get(id);return {text:chat?.text??fallback,
-      ...(chat?.assets?.length?{assets:chat.assets}:{}),...(chat?.contents?.length?{contents:chat.contents}:{})};};
+      ...(chat?.assets?.length?{assets:chat.assets}:{}),...(chat?.contents?.length?{contents:chat.contents}:{}),...(chat?.recalled?{recalled:true,recalledAt:chat.recalledAt}:{})};};
     const messages:TaskChatMessage[]=[...users.map(row=>({id:row.message_id,senderId:row.sender_id,senderName:row.sender_name,time:row.time*1000,...details(`in:${row.message_id}`,row.text),replyTo:row.reply_to,role:'user' as const})),
       ...replies.map(row=>({id:row.message_id??row.id,senderId:'self',senderName:'Assistant',time:row.time,...details(`out:${row.id}`,row.text),replyTo:this.chats.get(`out:${row.id}`)?.replyTo??null,role:'assistant' as const}))];
     messages.sort((a,b)=>a.time-b.time||a.id.localeCompare(b.id));return {messages:messages.slice(-limit),availableCount};
@@ -381,6 +493,7 @@ export class BridgeStore {
         .all(cursor, limit) as MessageRow[];
       const last = rows.at(-1);
       if (!last) throw new Error('Triggered message batch is unexpectedly empty.');
+      this.invalidateReplyDecisions('work_started');
       this.db.prepare(`
         INSERT INTO pending_batch (id, through_seq, reply_allowed) VALUES (1, ?, ?)
       `).run(last.seq, rows.some((row) => row.trigger === 1) ? 1 : 0);
@@ -403,7 +516,11 @@ export class BridgeStore {
       }
       this.db.prepare('UPDATE pending_batch SET replies_json = ?, generation_done = 1 WHERE id = 1').run(encoded);
       this.saveReplySources(throughSeq,0,parts.length,messageIndices);
-      if(parts.length) this.recorder.append('reply.accepted',{requestId:`final:${throughSeq}`,messages:logicalMessages??parts.map(part=>typeof part==='string'?{type:'text',text:part}:part.type==='voice'?{type:'text',text:part.text}:part)},`reply:${throughSeq}:final`,{itemId:`final:${throughSeq}`});
+      if(parts.length){
+        const messages=logicalMessages??parts.map(part=>typeof part==='string'?{type:'text' as const,text:part}:part.type==='voice'?{type:'text' as const,text:part.text}:part) as OutputMessage[];
+        const refs=this.replyLedger.register(throughSeq,`final:${throughSeq}`,this.recorder.conversationId,messages,0,parts.length,messageIndices);
+        this.recorder.append('reply.accepted',{requestId:`final:${throughSeq}`,messages,partCounts:refs.map(ref=>this.replyLedger.parts(ref).length),messageRefs:refs},`reply:${throughSeq}:final`,{itemId:`final:${throughSeq}`});
+      }
     });
   }
 
@@ -439,6 +556,7 @@ export class BridgeStore {
       const pending = this.requireBatch(throughSeq);
       if (!pending.replies || index !== pending.nextReplyIndex || index >= pending.replies.length) throw new Error('Pending reply index is invalid.');
       this.db.prepare('INSERT INTO reply_attempts(through_seq,part_index,status) VALUES(?,?,?)').run(throughSeq, index, 'started');
+      this.replyLedger.status(throughSeq,index,'started');
       this.db.prepare(`UPDATE reply_requests SET send_started = 1
         WHERE through_seq = ? AND start_index <= ? AND end_index > ?`).run(throughSeq, index, index);
       this.recorder.append('delivery.attempted', { deliveryId: `${throughSeq}:${index}`, partIndex: index }, `delivery-attempt:${throughSeq}:${index}`);
@@ -450,8 +568,11 @@ export class BridgeStore {
       const pending = this.requireBatch(throughSeq);
       if (index !== pending.nextReplyIndex || !pending.replies || index >= pending.replies.length) throw new Error('Pending reply index is invalid.');
       this.db.prepare('UPDATE reply_attempts SET status=? WHERE through_seq=? AND part_index=?').run(status, throughSeq, index);
+      this.replyLedger.status(throughSeq,index,status);
       this.db.prepare('UPDATE pending_batch SET next_reply_index=? WHERE id=1').run(index + 1);
-      this.recorder.append('delivery.failed', { deliveryId: `${throughSeq}:${index}`, partIndex: index, status, stage, errorCode, ...(retcode !== undefined ? { retcode } : {}) }, `delivery-result:${throughSeq}:${index}`);
+      const source=this.replyLedger.part(throughSeq,index);
+      this.recorder.append('delivery.failed', { deliveryId: `${throughSeq}:${index}`, partIndex: index, status, stage, errorCode,
+        ...(source?{requestId:source.requestId,messageRef:source.messageRef,logicalMessageIndex:source.logicalMessageIndex}:{}),...(retcode !== undefined ? { retcode } : {}) }, `delivery-result:${throughSeq}:${index}`);
     });
   }
 
@@ -498,7 +619,8 @@ export class BridgeStore {
         VALUES (?, ?, ?, ?, ?,?)
       `).run(throughSeq, requestId, encoded, startIndex, endIndex,toolCallId??null);
       this.saveReplySources(throughSeq,startIndex,parts.length,messageIndices);
-      this.recorder.append('reply.accepted',{requestId,messages},`reply:${throughSeq}:${requestId}`,{itemId:requestId});
+      const refs=this.replyLedger.register(throughSeq,requestId,this.recorder.conversationId,messages,startIndex,parts.length,messageIndices);
+      this.recorder.append('reply.accepted',{requestId,messages,partCounts:refs.map(ref=>this.replyLedger.parts(ref).length),messageRefs:refs},`reply:${throughSeq}:${requestId}`,{itemId:requestId});
       return { requestId, messages: JSON.parse(encoded) as OutputMessage[], startIndex, endIndex, sendStarted: false,...(toolCallId?{toolCallId}:{}) };
     });
   }
@@ -512,6 +634,30 @@ export class BridgeStore {
       this.db.prepare(`UPDATE reply_requests SET send_started = 1
         WHERE through_seq = ? AND start_index <= ? AND end_index > ?`).run(throughSeq, index, index);
     });
+  }
+
+  skipCancelledReply(throughSeq: number, index: number): void {
+    this.transaction(()=>{
+      const batch=this.requireBatch(throughSeq),part=this.replyLedger.part(throughSeq,index);
+      if(!batch.replies||batch.nextReplyIndex!==index||!part||part.state!=='cancelled')throw new Error('Reply cancellation does not match the pending item.');
+      this.db.prepare('UPDATE pending_batch SET next_reply_index=? WHERE id=1').run(index+1);
+      const recalled=part.cancelCode==='QUOTE_TARGET_RECALLED';
+      this.recorder.append(recalled?'delivery.failed':'delivery.cancelled',{deliveryId:`${throughSeq}:${index}`,requestId:part.requestId,
+        messageRef:part.messageRef,logicalMessageIndex:part.logicalMessageIndex,partIndex:index,status:'skipped',errorCode:part.cancelCode??'REPLY_CANCELLED'},`delivery-result:${throughSeq}:${index}`);
+    });
+  }
+
+  cancelReply(messageRef: string, code?:string): void { this.transaction(()=>this.replyLedger.cancel(messageRef,code)); }
+  beginReplyRecall(messageRef: string, operationId: string): RecallToolReceipt | 'started' | null {
+    return this.transaction(()=>{
+      this.replyLedger.parts(messageRef,this.recorder.conversationId);
+      const existing=this.replyLedger.beginRecall(operationId,messageRef);
+      if(existing===null)this.replyLedger.cancel(messageRef);
+      return existing;
+    });
+  }
+  finishReplyRecall(operationId: string, result: RecallToolReceipt): void {
+    this.transaction(()=>this.replyLedger.finishRecall(operationId,result));
   }
 
   finishGeneration(throughSeq: number): void {
@@ -574,22 +720,27 @@ export class BridgeStore {
       if (index !== pending.nextReplyIndex) throw new Error('Reply acknowledgements must be in order.');
       this.db.prepare('UPDATE pending_batch SET next_reply_index = ? WHERE id = 1').run(index + 1);
       this.db.prepare("UPDATE reply_attempts SET status='acknowledged' WHERE through_seq=? AND part_index=?").run(throughSeq,index);
+      this.replyLedger.status(throughSeq,index,'acknowledged',messageId);
       const part=pending.replies[index]!;
       const request=this.listReplyRequests(throughSeq).find(request=>request.startIndex<=index&&request.endIndex>index);
       const source=this.db.prepare('SELECT message_index FROM reply_part_sources WHERE through_seq=? AND part_index=?').get(throughSeq,index);
+      const durable=this.replyLedger.part(throughSeq,index);
       let mediaPath: string | undefined;
       if (typeof part !== 'string' && (part.type === 'image' || part.type === 'voice') && part.file) {
         try { mediaPath = this.recorder.mediaSnapshot(part.file, part.type); }
         catch { mediaSaved = false; }
       }
       this.recorder.append('delivery.acknowledged',{deliveryId:`${throughSeq}:${index}`,requestId:request?.requestId ?? `final:${throughSeq}`,
-        partIndex:index,...(source?{logicalMessageIndex:Number(source.message_index)}:{}),kind:typeof part==='string'?'text':part.type,normal:true,...(messageId?{messageId}:{}),...(mediaPath?{mediaPath}:{})},`ack:${throughSeq}:${index}`);
+        partIndex:index,...(source?{logicalMessageIndex:Number(source.message_index)}:{}),...(durable?{messageRef:durable.messageRef}:{}),
+        ...(durable?.firstPart&&durable.replyTo?{replyTo:durable.replyTo}:{}),kind:typeof part==='string'?'text':part.type,normal:true,...(messageId?{messageId}:{}),...(mediaPath?{mediaPath}:{})},`ack:${throughSeq}:${index}`);
       const text=typeof part==='string'?part:part.type==='voice'?part.text:part.type==='image'?'[image]':part.segments.map(segment=>segment.type==='text'?segment.text:`@${segment.userId}`).join('');
       this.db.prepare('INSERT OR IGNORE INTO outgoing_history(id,time,text,message_id,conversation_id,task_id,context_consumed) VALUES(?,?,?,?,?,NULL,1)')
         .run(`chat:${throughSeq}:${index}`,Date.now(),text,messageId??null,this.recorder.conversationId);
       const assets:ChatAsset[]=chatAssets??(mediaPath&&typeof part!=='string'&&(part.type==='image'||part.type==='voice')?[{id:`chat-media:${throughSeq}:${index}`,type:part.type,path:mediaPath,status:'ready'}]:[]);
       this.chats.outgoing(`chat:${throughSeq}:${index}`,text,this.recorder.conversationId,'model',messageId,assets,undefined,undefined,Date.now()/1000,
-        {toolCallId:request?.toolCallId,logicalMessageIndex:source?Number(source.message_index):undefined,partIndex:index});
+        {toolCallId:request?.toolCallId,logicalMessageIndex:source?Number(source.message_index):undefined,partIndex:index,
+          replyTo:durable?.firstPart?durable.replyTo??null:null});
+      if(messageId&&this.chats.forQQ(messageId)?.recalled)this.replyLedger.recalled(messageId);
     });
     return { mediaSaved };
   }
@@ -656,6 +807,7 @@ export class BridgeStore {
   }
 
   private clearBatch(throughSeq: number): void {
+    this.replyLedger.abandon(throughSeq);
     this.db.prepare('UPDATE instance_state SET cursor = ? WHERE id = 1').run(throughSeq);
     this.db.prepare('DELETE FROM pending_batch WHERE id = 1').run();
     this.db.prepare('DELETE FROM reply_requests WHERE through_seq = ?').run(throughSeq);
@@ -778,10 +930,11 @@ function toReplyRequest(row: ReplyRequestRow): ReplyRequestRecord {
 
 function isOutputMessage(message: unknown): message is OutputMessage {
   if (isSegmentMessage(message)) return true;
-  if (!message || typeof message !== 'object' || Array.isArray(message) || Object.keys(message).length !== 2) return false;
+  if (!message || typeof message !== 'object' || Array.isArray(message)) return false;
   const value = message as Record<string, unknown>;
-  if (value.type === 'text') return typeof value.text === 'string' && value.text.trim().length > 0;
-  return value.type === 'image' && typeof value.path === 'string' && value.path.trim().length > 0;
+  if (value.type === 'text') return Object.keys(value).every(key=>['type','text','replyTo'].includes(key))&&typeof value.text === 'string' && value.text.trim().length > 0
+    &&(value.replyTo===undefined||typeof value.replyTo==='string'&&value.replyTo.length>0&&value.replyTo.length<=200&&value.replyTo.trim()===value.replyTo);
+  return Object.keys(value).length===2&&value.type === 'image' && typeof value.path === 'string' && value.path.trim().length > 0;
 }
 
 function isInitialReplyPart(part: unknown): part is ReplyPart {

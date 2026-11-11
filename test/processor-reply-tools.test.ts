@@ -13,6 +13,10 @@ const incoming = (id: number, trigger = true): IncomingMessage => ({
   text: `question-${id}`, replyTo: null, trigger, rawJson: '{}',
 });
 const request = (text: string): ReplyToolRequest => ({ messages: [{ type: 'text', text }] });
+function accepted(receipt: ReplyToolReceipt) {
+  assert.equal(receipt.accepted,true);assert.equal(receipt.messages?.length,1);
+  assert.match(receipt.messages![0]!.messageRef,/^reply:.+:0$/);assert.equal(receipt.messages![0]!.status,'queued');
+}
 const mp3 = `base64://${Buffer.from([0xff, 0xfb, 0x90, 0x64, 0, 0, 0, 0]).toString('base64')}`;
 async function until(check: () => boolean) {
   const end = Date.now() + 3000;
@@ -49,7 +53,7 @@ test('tool acceptance returns before QQ ACK while messages send in order during 
   const processor = f.start({ async run(batch, _session, onSession, _signal, tools) {
     assert.ok(tools); onSession('session'); calls++;
     if (batch.throughSeq === 1) {
-      assert.deepEqual(await tools.send(request('important result')), { accepted: true });
+      accepted(await tools.send(request('important result')));
       assert.equal(f.store.getCursor(), 0);
       assert.equal(f.store.getBatch(1).generationDone, false);
       await generation.promise;
@@ -72,7 +76,7 @@ test('generation failure after accepting a reply does not rerun CLI or redraw TT
   let calls = 0; let synthesis = 0; let draws = 0; const sent: string[] = [];
   f.start({ async run(_batch, _session, _onSession, _signal, tools) {
     assert.ok(tools); calls++;
-    assert.deepEqual(await tools.send(request('private-outgoing-body')), { accepted: true });
+    accepted(await tools.send(request('private-outgoing-body')));
     throw new Error('private-provider-error');
   } }, { async sendVoice(file) { sent.push(file); } }, {
     voiceReplyEnabled: true, voiceReplyProbability: 0.5, random: () => { draws++; return 0; },
@@ -88,7 +92,7 @@ test('concurrent tool requests are accepted independently and delivered serially
   f.start({ async run(_batch, _session, _onSession, _signal, tools) {
     assert.ok(tools);
     const receipts = await Promise.all([tools.send(request('A')), tools.send(request('B')), tools.send(request('C'))]);
-    assert.deepEqual(receipts, [{ accepted: true }, { accepted: true }, { accepted: true }]);
+    receipts.forEach(accepted);assert.equal(new Set(receipts.map(receipt=>receipt.messages![0]!.messageRef)).size,3);
     return { messages: [] };
   } }, { async sendText(text) { assert.equal(++active, 1); await delay(2); sent.push(text); active--; } });
   await until(() => f.store.getCursor() === 1); assert.deepEqual(sent, ['A', 'B', 'C']);
@@ -104,7 +108,7 @@ test('unconfirmed part is attempted once and later parts continue without model 
     return { messages: [] };
   } }, { async sendText(text) { attempted.push(text); if (text === 'def') throw new Error('response lost'); } }, { replyMaxChars: 3 });
   await until(() => f.store.getCursor() === 1);
-  assert.deepEqual(receipt, { accepted: true });
+  accepted(receipt!);
   assert.deepEqual(attempted, ['abc', 'def', 'ghi']); assert.equal(calls, 1);
   assert.match(f.logs.join('\n'), /processor\.reply\.failed .*reply_index=1.*status="unconfirmed"/);
 });
@@ -114,7 +118,7 @@ test('missing image preparation terminates the item and releases later messages'
   const processor = f.start({ async run(batch, _session, _onSession, _signal, tools) {
     assert.ok(tools); calls++;
     if (batch.throughSeq === 1) {
-      assert.deepEqual(await tools.send({ messages: [{ type: 'image', path: 'missing.png' }] }), { accepted: true });
+      accepted(await tools.send({ messages: [{ type: 'image', path: 'missing.png' }] }));
       await tools.send(request('still useful'));
     } else await tools.send(request('new answer'));
     return { messages: [] };

@@ -72,7 +72,8 @@ const metadataFields=new Set(('botId bot_id connection_id seq outcome revision a
  'bytes image_index direction source_type provider text_chars voice model probability selected enabled timeout_ms retry_ms waiter_count pending_count echo segment_count '+
  'error_code retcode code has_session cursor batch_size reply_count command_id kind result replayed draining signal connected sent_count attempted_count skipped_count '+
  'web_search_provider tts_provider target random_reply_probability queue_size processing item_hash item_type server server_hash tool_hash http_status source_count '+
- 'next_reply_index total has_reply pending_command part_count delivery_status close_code ready_state operation api accepted_requests item_ref aborted mode timeout confirmation_only reconnecting category target_ref for_tools').split(' '));
+ 'next_reply_index total has_reply pending_command part_count delivery_status close_code ready_state operation api accepted_requests item_ref aborted mode timeout confirmation_only reconnecting category target_ref for_tools '+
+ 'candidate_count score threshold decision actual_model').split(' '));
 function safeMessage(raw:string,secrets:readonly string[]):{message:string;level:LogLine['level']}|null {
  const app=/^\d{4}-\d\d-\d\dT\S+ (INFO|WARN|ERROR|DEBUG) ([a-z][a-z0-9_.-]{0,100})(?: (.*))?$/u.exec(raw);
  let message:string,level:LogLine['level'];

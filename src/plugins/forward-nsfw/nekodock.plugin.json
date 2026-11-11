@@ -1,0 +1,26 @@
+{
+  "kind": "nekodock-plugin",
+  "id": "forward-nsfw",
+  "name": "转发图片检查",
+  "description": "转发中的图片数量达到检查门槛时，抽样检查图片；命中 NSFW 后发送提醒，确认发送成功后进入聊天上下文。",
+  "version": "1.2.0",
+  "apiVersion": 1,
+  "entries": { "console": "./index.js" },
+  "capabilities": ["forward-inspection"],
+  "resourceTypes": [],
+  "commands": [],
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "minImages": { "type": "integer", "title": "最少图片数（张）", "description": "转发中的图片总数达到此值时检查，与文字消息条数无关；图片形式的表情包也计入。", "minimum": 1, "maximum": 1000, "default": 1, "group": "检查条件" },
+      "maxImages": { "type": "integer", "title": "一次最多检查图片数", "description": "图片更多时随机抽样；恢复任务沿用已保存的样本。图片形式的表情包也参与检查，动画只检查首帧。", "minimum": 1, "maximum": 16, "default": 4, "group": "检查条件" },
+      "nsfwThresholdPercent": { "type": "integer", "title": "NSFW 判定阈值（%）", "description": "任意样本的判定分值达到此值时提醒。该分值不代表经过校准的概率。", "minimum": 0, "maximum": 100, "default": 80, "group": "检查条件" },
+      "baseUrl": { "type": "string", "title": "Base URL", "description": "填写 Jev API 根路径；程序追加 /systemone。端点需要支持 Jev 图片输入。使用实例网络代理。", "default": "https://api.typesafe.ai/v1", "group": "Jev 服务" },
+      "model": { "type": "string", "title": "Model", "default": "jev-latest", "group": "Jev 服务" },
+      "apiKey": { "type": "string", "title": "API Key", "secret": true, "group": "Jev 服务" },
+      "timeoutSeconds": { "type": "integer", "title": "单张图片请求超时（秒）", "description": "每张图片独立请求，最多同时处理 2 张；一张失败不会丢失其他图片的有效结果。等待请求名额不计入此超时。", "minimum": 1, "maximum": 60, "default": 60, "group": "Jev 服务" },
+      "instructions": { "type": "string", "title": "补充判断说明", "description": "默认检查明确色情，以及不适合公开查看的明显性暗示、色情化姿势或挑逗性暴露。普通肖像、日常衣服、非性化泳装和艺术不默认命中；真人和绘画/动漫使用相同标准。可在此补充边界。", "default": "", "group": "Jev 服务" },
+      "warningText": { "type": "string", "title": "提醒文案", "description": "直接发送文字并引用外层转发，确认发送成功后进入聊天上下文。检查过程和分值仅留插件记录，不额外唤醒主模型、不转语音。", "default": "这条转发里可能有不适合公开场合查看的图片，打开前留意一下哦。", "group": "提醒" }
+    }
+  }
+}

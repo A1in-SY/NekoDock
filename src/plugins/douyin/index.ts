@@ -15,7 +15,7 @@ export default function createPlugin(manifest: PluginManifest): ContentPluginDef
     contentText, errorText,
     failureContent: (source,error) => ({ type: 'video', platform: 'douyin', resourceId: source.id, url: source.url,
       title: source.title?.slice(0,500) ?? '抖音视频', subtitle: { status: 'absent' }, retrieval: { status: 'failed', error } }),
-    shouldProcess: config => { const value = validateDouyinConfig(config); return value.enhance || value.autoVideo; },
+    shouldProcess: config => { const value = validateDouyinConfig(config); return value.enhance || value.autoVideo || value.videoDisplay === 'card'; },
     policy: config => { const value = validateDouyinConfig(config); return { timeoutSeconds: value.timeoutSeconds, waitSeconds: value.waitSeconds,
       maxAssetBytes: value.maxMiB * 1024 * 1024, cacheMaxBytes: value.cacheMaxMiB * 1024 * 1024, cacheHours: value.cacheHours }; },
     summarize: (source,content) => {
@@ -27,7 +27,8 @@ export default function createPlugin(manifest: PluginManifest): ContentPluginDef
     afterResolve: (_command,source,config,content) => {
       const value = validateDouyinConfig(config), cover = content.blocks?.some(block => block.type === 'image' && block.image.role === 'cover');
       return { provideContext: value.enhance,
-        ...(value.enhance && cover ? { prepare: { mode: 'none' as const, provideContext: true } } : {}),
+        ...(value.videoDisplay === 'card' ? { prepare: { mode: 'card' as const, provideContext: value.enhance } }
+          : value.enhance && cover ? { prepare: { mode: 'none' as const, provideContext: true } } : {}),
         ...(value.autoVideo && content.durationSeconds !== undefined && content.durationSeconds > 0 && content.durationSeconds <= value.maxDurationSeconds
           ? { download: { ...source, kind: 'video', id: content.resourceId, url: content.url, title: content.title } } : {}) };
     },

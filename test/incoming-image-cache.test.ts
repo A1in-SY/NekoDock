@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -138,6 +138,82 @@ test('a failed media ACK retries after restart without downloading or losing the
   await until(() => attempts > 1, 4000);
   assert.equal(remote.contentReads(), 1);
   assert.equal((await restored.prepare([message()], signal())).files.length, 1);
+});
+
+test('different managed messages share verified content and retain independent attachment ACKs', async t => {
+  const descriptors: IncomingImageDescriptor[] = ['1', '2', '3'].map(messageId => ({id: `remote-${messageId}`, messageId, index: 0, status: 'ready', sha256, size: png.length, mimeType: 'image/png'}));
+  const acknowledged = new Set<string>(), logs: string[] = [];
+  let reads = 0;
+  const {cache} = await fixture(t, {logger: {info: s => logs.push(s), warn() {}, error() {}}, remote: {
+    async list() { return []; },
+    async get(id) { return descriptors.find(d => d.id === id)!; },
+    async content() { reads++; await new Promise(resolve => setTimeout(resolve, 20)); return png; },
+    async acknowledge(id, digest) { assert.equal(digest, sha256); acknowledged.add(id); },
+  }});
+  cache.start();
+  cache.register(message('1'), [descriptors[0]!]);
+  await until(() => acknowledged.has('remote-1'));
+  const path = cache.lookup('1')[0]!.path!, previous = new Date('2025-01-01T00:00:00Z');
+  await utimes(path, previous, previous);
+  cache.register(message('2'), [descriptors[1]!]);
+  cache.register(message('3'), [descriptors[2]!]);
+  await until(() => acknowledged.size === 3);
+  assert.equal(reads, 1);
+  assert.equal((await stat(path)).mtimeMs, previous.getTime());
+  assert.deepEqual(['1', '2', '3'].map(id => cache.lookup(id)[0]!.path), [path, path, path]);
+  assert.deepEqual(['1', '2', '3'].map(id => cache.lookup(id)[0]!.attachmentId), descriptors.map(d => d.id));
+  assert.equal(logs.filter(s => s.startsWith('image.cache.started ')).length, 1);
+  assert.equal(logs.filter(s => s.startsWith('image.cache.hit ')).length, 2);
+});
+
+test('simultaneous managed messages download shared content once and cache damage is repaired on the next message', async t => {
+  const descriptors: IncomingImageDescriptor[] = ['1', '2', '3', '4'].map(messageId => ({id: `remote-${messageId}`, messageId, index: 0, status: 'ready', sha256, size: png.length, mimeType: 'image/png'}));
+  const acknowledged = new Set<string>(); let reads = 0;
+  const {cache} = await fixture(t, {remote: {
+    async list() { return []; }, async get(id) { return descriptors.find(d => d.id === id)!; },
+    async content() { reads++; await new Promise(resolve => setTimeout(resolve, 20)); return png; },
+    async acknowledge(id) { acknowledged.add(id); },
+  }});
+  cache.start();
+  cache.register(message('1'), [descriptors[0]!]); cache.register(message('2'), [descriptors[1]!]);
+  await until(() => acknowledged.size === 2);
+  assert.equal(reads, 1);
+  const path = cache.lookup('1')[0]!.path!;
+  await writeFile(path, Buffer.alloc(png.length));
+  cache.register(message('3'), [descriptors[2]!]); await until(() => acknowledged.has('remote-3'));
+  assert.equal(reads, 2); assert.deepEqual(await readFile(path), png);
+  await rm(path);
+  cache.register(message('4'), [descriptors[3]!]); await until(() => acknowledged.has('remote-4'));
+  assert.equal(reads, 3); assert.deepEqual(await readFile(path), png);
+});
+
+test('waiting for managed descriptors does not log a content download', async t => {
+  const logs: string[] = [];
+  const {cache} = await fixture(t, {logger: {info: s => logs.push(s), warn() {}, error() {}}, remote: {
+    async list() { return []; }, async get() { throw new Error('No descriptor'); }, async content() { throw new Error('No content'); }, async acknowledge() {},
+  }});
+  cache.start(); cache.register(message(), []);
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(logs.filter(s => s.startsWith('image.cache.started ')).length, 0);
+});
+
+test('Worker content reuse distinguishes different hashes and never crosses instance workspaces', async t => {
+  const other = Buffer.concat([png, Buffer.from('different-synthetic-picture')]);
+  const descriptors: IncomingImageDescriptor[] = [{id: 'shared-id', messageId: '1', index: 0, status: 'ready', sha256, mimeType: 'image/png', size: png.length},
+    {id: 'different-id', messageId: '2', index: 0, status: 'ready', sha256: createHash('sha256').update(other).digest('hex'), mimeType: 'image/png', size: other.length}];
+  const reads = [0, 0], acks = [0, 0];
+  const caches = await Promise.all([0, 1].map(async index => fixture(t, {remote: {
+    async list() { return []; }, async get(id) { return descriptors.find(d => d.id === id)!; },
+    async content(id) { reads[index] = (reads[index] ?? 0) + 1; return id === 'different-id' ? other : png; }, async acknowledge() { acks[index] = (acks[index] ?? 0) + 1; },
+  }})));
+  for (const {cache} of caches) { cache.start(); cache.register(message('1'), [descriptors[0]!]); }
+  await until(() => acks.every(n => n === 1));
+  assert.deepEqual(reads, [1, 1]);
+  assert.notEqual(caches[0]!.cache.lookup('1')[0]!.path, caches[1]!.cache.lookup('1')[0]!.path);
+  caches[0]!.cache.register(message('2'), [descriptors[1]!]);
+  await until(() => acks[0] === 2);
+  assert.deepEqual(reads, [2, 1]);
+  assert.deepEqual(await readFile(caches[0]!.cache.lookup('2')[0]!.path!), other);
 });
 
 test('content hash mismatch does not acknowledge a Console snapshot or expose response details', async t => {

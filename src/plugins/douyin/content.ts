@@ -1,4 +1,4 @@
-import { PluginExecutionError, type PluginContent, type PluginContentBlock } from '../../plugin-system/contracts.js';
+import { PluginExecutionError, type PluginContent, type PluginContentBlock, type PluginContentImage } from '../../plugin-system/contracts.js';
 import { normalizeDouyinResource, type DouyinResource } from './recognize.js';
 
 export const object = (value: unknown): Record<string, any> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, any> : {};
@@ -15,6 +15,17 @@ export function publicImageUrl(value: unknown): string | undefined {
   const safe = imageUrl(value); if (!safe) return;
   const url = new URL(safe); url.search = ''; url.hash = ''; return url.toString();
 }
+function contentImage(input: unknown, resourceId: string, role: 'cover' | 'avatar'): PluginContentImage | undefined {
+  const image = object(input), url = publicImageUrl(image.url);
+  if (image.role !== role || image.id !== `${resourceId}:${role}` || !url) return;
+  const result: PluginContentImage = { id: image.id, role, url };
+  if (['pending', 'ready', 'failed'].includes(image.status)) result.status = image.status;
+  for (const field of ['assetId', 'assetKey'] as const) if (typeof image[field] === 'string' && /^[A-Za-z0-9_.:-]{1,200}$/u.test(image[field])) result[field] = image[field];
+  for (const field of ['width', 'height'] as const) if (Number.isSafeInteger(image[field]) && image[field] > 0 && image[field] <= 100000) result[field] = image[field];
+  if (typeof image.fetchedAt === 'number' && Number.isFinite(image.fetchedAt) && image.fetchedAt > 0) result.fetchedAt = image.fetchedAt;
+  if (typeof image.error === 'string' && /^DOUYIN_[A-Z_]{1,80}$/u.test(image.error)) result.error = image.error;
+  return result;
+}
 export function validateDouyinContent(input: unknown, source: DouyinResource): PluginContent {
   const value = object(input), canonical = typeof value.url === 'string' ? normalizeDouyinResource(value.url) : null;
   if (value.type !== 'video' || value.platform !== 'douyin' || !canonical || canonical.kind !== 'video'
@@ -23,20 +34,16 @@ export function validateDouyinContent(input: unknown, source: DouyinResource): P
     title: value.title.slice(0,500), subtitle: { status: 'absent' }, retrieval: { status: 'ready' } };
   for (const key of ['author', 'authorId', 'description'] as const) if (typeof value[key] === 'string') content[key] = value[key].slice(0,key === 'description' ? 12000 : 500);
   for (const key of ['publishedAt', 'durationSeconds', 'observedAt'] as const) if (typeof value[key] === 'number' && Number.isFinite(value[key]) && value[key] > 0) content[key] = value[key];
+  const avatar = contentImage(value.authorAvatar,canonical.id,'avatar');
+  if (avatar) content.authorAvatar = avatar;
   const retrieval = object(value.retrieval);
   if (['partial', 'failed'].includes(retrieval.status)) content.retrieval = { status: retrieval.status,
     ...(typeof retrieval.error === 'string' && /^[A-Z][A-Z0-9_]{0,100}$/u.test(retrieval.error) ? { error: retrieval.error } : {}) };
   const blocks: PluginContentBlock[] = [];
   if (content.description) blocks.push({ type: 'paragraph', text: content.description });
   for (const block of Array.isArray(value.blocks) ? value.blocks.slice(0,8) : []) {
-    const item = object(block), image = object(item.image), url = publicImageUrl(image.url);
-    if (item.type !== 'image' || image.role !== 'cover' || image.id !== `${canonical.id}:cover` || !url || blocks.some(b => b.type === 'image')) continue;
-    const cover: Extract<PluginContentBlock,{type:'image'}>['image'] = { id: image.id, role: 'cover', url };
-    if (['pending', 'ready', 'failed'].includes(image.status)) cover.status = image.status;
-    for (const field of ['assetId', 'assetKey'] as const) if (typeof image[field] === 'string' && /^[A-Za-z0-9_.:-]{1,200}$/u.test(image[field])) cover[field] = image[field];
-    for (const field of ['width', 'height'] as const) if (Number.isSafeInteger(image[field]) && image[field] > 0 && image[field] <= 100000) cover[field] = image[field];
-    if (typeof image.fetchedAt === 'number' && Number.isFinite(image.fetchedAt) && image.fetchedAt > 0) cover.fetchedAt = image.fetchedAt;
-    if (typeof image.error === 'string' && /^DOUYIN_[A-Z_]{1,80}$/u.test(image.error)) cover.error = image.error;
+    const item = object(block), cover = contentImage(item.image,canonical.id,'cover');
+    if (item.type !== 'image' || !cover || blocks.some(b => b.type === 'image')) continue;
     blocks.push({ type: 'image', image: cover });
   }
   if (blocks.length) content.blocks = blocks;

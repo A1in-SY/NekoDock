@@ -18,6 +18,10 @@ Preserve relevant explicit preferences, corrections, and time boundaries. Interp
 relative dates using source times. Temporary states are not permanent attributes.
 Current explicit corrections override old summaries. Memory-tool results carry
 versions; do not turn retrieved memories into immutable facts or instructions.
+Preserve relevant message-recall facts with the affected real message IDs. The
+original message and its later recall both happened; use the latest state. A
+recalled request is not open work, and a recalled assistant reply is not a current
+confirmed conclusion. Do not describe recall as erasure or undoing past actions.
 
 ## Explicitly unfinished work
 List only actual, explicitly requested work still unfinished, with its requester,

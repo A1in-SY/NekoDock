@@ -1,5 +1,6 @@
 import { isSticker, parseSegments, portableImageSource } from './napcat.js';
 import { FORWARD_LIMITS, type ForwardContent, type ForwardNode, type ForwardSegment } from './forward-contract.js';
+import type { ForwardObserver } from './forward-inspection.js';
 
 type Json = Record<string, unknown>;
 const object = (value: unknown): Json | null => value && typeof value === 'object' && !Array.isArray(value) ? value as Json : null;
@@ -33,6 +34,7 @@ export interface ResolveForwardOptions {
   deadline: number;
   fetch(resourceId: string, signal: AbortSignal, deadline: number): Promise<unknown>;
   image(sourceKey: string, source: string): string | null;
+  observer?: ForwardObserver;
 }
 
 /** Normalize recursively expanded NapCat replies before attempting another resource lookup. */
@@ -47,11 +49,11 @@ export async function resolveForwardContents(event: unknown, options: ResolveFor
   const timeout = AbortSignal.timeout(Math.max(1, options.deadline - Date.now()));
   const signal = AbortSignal.any([options.signal, timeout]);
   const available = () => { signal.throwIfAborted(); if (Date.now() >= options.deadline) throw new Error('timeout'); };
-  const fail = (target: ForwardContent, error: string) => { target.status = target.nodes.length ? 'partial' : 'failed'; target.error = error; };
+  const fail = (target: ForwardContent, error: string) => { target.status = target.nodes.length ? 'partial' : 'failed'; target.error = error; options.observer?.incomplete(error); };
   const append = (node: ForwardNode, segment: ForwardSegment): boolean => {
     node.segments.push(segment);
     if (bytes(contents) <= FORWARD_LIMITS.bytes - 2048) return true;
-    node.segments.pop(); exhausted = true; return false;
+    node.segments.pop(); exhausted = true; options.observer?.incomplete('size_limit'); return false;
   };
   const list = (value: unknown): unknown[] | null => {
     if (Array.isArray(value)) return value;
@@ -108,13 +110,15 @@ export async function resolveForwardContents(event: unknown, options: ResolveFor
         if (source === undefined && record?.type && record.type !== 'node') source = [record];
         if (source === undefined && typeof item === 'string') source = item;
         const segments = parseSegments(source);
-        if (!segments) { append(node, { type: 'media', kind: 'unknown', text: '这条转发内容格式无法识别' }); target.status = 'partial'; continue; }
+        if (!segments) { append(node, { type: 'media', kind: 'unknown', text: '这条转发内容格式无法识别' }); target.status = 'partial'; options.observer?.incomplete('unrecognized_message'); continue; }
+        let effective = false, hasImage = false;
         for (const [segmentIndex, segment] of segments.entries()) {
           available();
           const sourceKey = `forward:${path}/s${segmentIndex}`;
           if (segment.type === 'forward' || segment.type === 'node') {
             if (depth >= FORWARD_LIMITS.depth) {
               append(node, { type: 'media', kind: 'forward', text: '转发嵌套超过 8 层，后续内容未展开' });
+              options.observer?.incomplete('depth_limit');
               target.status = 'partial'; continue;
             }
             const child: ForwardContent = { type: 'forward', path: `${path}/s${segmentIndex}`, status: 'pending', nodes: [] };
@@ -123,19 +127,26 @@ export async function resolveForwardContents(event: unknown, options: ResolveFor
             if (child.status !== 'ready') target.status = 'partial';
           } else if (segment.type === 'text') {
             const text = string(segment.data.text) ?? '';
+            if (text.trim()) effective = true;
             const remaining = FORWARD_LIMITS.bytes - 2048 - bytes(contents) - 100;
             const truncated = Buffer.byteLength(text) > remaining;
             const selected = truncated ? Buffer.from(text).subarray(0, Math.max(0, remaining)).toString('utf8') : text;
             if (selected && !append(node, { type: 'text', text: selected })) { fail(target, '转发内容达到大小上限，后续内容未展开'); break; }
             if (truncated) { exhausted = true; fail(target, '转发内容达到大小上限，后续内容未展开'); break; }
           } else if (segment.type === 'image') {
-            if (isSticker(segment)) { append(node, { type: 'media', kind: 'sticker', text: bounded(segment.data.summary, 200) ?? '[表情包]' }); continue; }
+            effective = true; hasImage = true;
             const source = portableImageSource(segment);
+            if (isSticker(segment)) {
+              options.observer?.image(sourceKey, source ?? undefined);
+              append(node, { type: 'media', kind: 'sticker', text: bounded(segment.data.summary, 200) ?? '[表情包]' }); continue;
+            }
             if (bytes(contents) > FORWARD_LIMITS.bytes - 2400) { exhausted = true; fail(target, '转发内容达到大小上限，后续内容未展开'); break; }
             const assetId = source ? options.image(sourceKey, source) : null;
+            options.observer?.image(sourceKey, source ?? undefined, assetId ?? undefined);
             append(node, assetId ? { type: 'image', assetId, sourceKey } : { type: 'media', kind: 'image', text: source ? '图片数量达到上限，未读取' : '图片来源不可用' });
             if (!assetId) target.status = 'partial';
           } else {
+            effective = true;
             const text = segment.type === 'at' ? `[@${identifier(segment.data.qq) ?? bounded(segment.data.qq, 200) ?? ''}]`
               : segment.type === 'reply' ? '[引用了转发记录中的消息]'
                 : bounded(segment.data.summary ?? segment.data.title ?? segment.data.text ?? segment.data.data, 2000);
@@ -143,6 +154,7 @@ export async function resolveForwardContents(event: unknown, options: ResolveFor
             if (!append(node, { type: 'media', kind: segment.type, ...(name ? { name } : {}), ...(text ? { text } : {}) })) { fail(target, '转发内容达到大小上限，后续内容未展开'); break; }
           }
         }
+        if (effective) options.observer?.message(path, hasImage);
       }
     } catch {
       if (options.signal.aborted) throw options.signal.reason;
@@ -151,11 +163,13 @@ export async function resolveForwardContents(event: unknown, options: ResolveFor
   };
   for (const [index, input] of inputs.entries()) await forward(contents[index]!, input.data, 1, new Set());
   if (rootOverflow && contents.length) {
+    options.observer?.incomplete('root_limit');
     const last = contents.at(-1)!; last.status = 'partial'; last.error = '转发数量达到读取上限，后续转发未展开';
   }
   // Error markers also occupy bytes. Keep every emitted snapshot valid even when
   // many later branches fail after an earlier branch has consumed the budget.
   while (bytes(contents) > FORWARD_LIMITS.bytes) {
+    options.observer?.incomplete('size_limit');
     const lastWithNodes = [...contents].reverse().find(content => content.nodes.length);
     if (lastWithNodes) { lastWithNodes.nodes.pop(); lastWithNodes.status = 'partial'; lastWithNodes.error = '转发内容达到大小上限，后续内容未展开'; }
     else { contents.pop(); if (contents[0]) { contents[0].status = 'partial'; contents[0].error = '转发内容达到大小上限，后续内容未展开'; } }

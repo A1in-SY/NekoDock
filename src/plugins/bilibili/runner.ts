@@ -7,6 +7,8 @@ import { BilibiliError, bilibiliError as errorCode } from './errors.js';
 import { resolveDynamic } from './dynamic.js';
 import { resolveLive } from './live.js';
 import { preparePresentation } from './presentation.js';
+import { prepareVideoAuthor } from './video-author.js';
+import { id, imageUrl } from './api.js';
 export { BilibiliError } from './errors.js';
 import type { PluginContent, PluginExecution, PluginRunnerJob, PluginRunnerDefinition } from '../../plugin-system/contracts.js';
 import { validateBilibiliConfig } from './config.js';
@@ -108,7 +110,7 @@ export async function executeBilibiliJob(input:PluginRunnerJob,root:string,signa
     const url=await resolveBilibiliUrl(safe.url,fetcher,combined);
     const resource=normalizeBilibiliResource(url)!;
     if(job.command==='share'&&job.operation==='resolve'&&(
-      resource.kind==='video'&&!job.config.enhance&&!job.config.autoVideo||
+      resource.kind==='video'&&!job.config.enhance&&!job.config.autoVideo&&job.config.videoDisplay==='off'||
       resource.kind==='post'&&!job.config.dynamicEnhance&&job.config.dynamicDisplay==='off'||
       resource.kind==='live'&&!job.config.liveEnhance&&job.config.liveDisplay==='off')) {
       const content:PluginContent={type:resource.kind as 'video'|'post'|'live',platform:'bilibili',resourceId:resource.id,url:resource.url,
@@ -116,7 +118,9 @@ export async function executeBilibiliJob(input:PluginRunnerJob,root:string,signa
       await network.close();return {content,cleanup};
     }
     if(job.operation==='prepare') {
-      const prepared=await preparePresentation({...job,resource},directory,fetcher,execute,env,combined);await network.close();return {...prepared,cleanup};
+      const content=resource.kind==='video'&&job.presentation?.mode==='card'&&job.content
+        ?await prepareVideoAuthor(job.content,resource,fetcher,combined,job.config.cookie):job.content;
+      const prepared=await preparePresentation({...job,resource,content},directory,fetcher,execute,env,combined);await network.close();return {...prepared,cleanup};
     }
     if(resource.kind!=='video') {
       if(job.operation!=='resolve'||resource.kind==='short')throw new BilibiliError('BILIBILI_OPERATION_UNSUPPORTED');
@@ -125,13 +129,17 @@ export async function executeBilibiliJob(input:PluginRunnerJob,root:string,signa
     }
     if(job.operation==='resolve') {
       const raw=await execute('yt-dlp',[...args,'--skip-download',...(job.config.subtitles?['--write-subs','--sub-langs','zh.*,ai-zh.*,en.*','--sub-format','srt']:[]),'--dump-single-json','--',url],{cwd:directory,env,signal:combined,timeoutMs:job.config.timeoutSeconds*1000});
-      const info=object(JSON.parse(raw));const normalized=normalizeBilibiliResource(typeof info.webpage_url==='string'?info.webpage_url:url)??resource;
+      const info=object(JSON.parse(raw));const extracted=normalizeBilibiliResource(typeof info.webpage_url==='string'?info.webpage_url:url)??resource;
+      const videoUrl=new URL(extracted.url);videoUrl.searchParams.set('p',String(resource.part??1));
+      const normalized=normalizeBilibiliResource(videoUrl.toString())!;
       const content:PluginContent={type:'video',platform:'bilibili',resourceId:normalized.id,url:normalized.url,title:typeof info.title==='string'?info.title:job.resource.title??'哔哩哔哩视频',part:resource.part,retrieval:{status:'ready'}};
       if(typeof info.uploader==='string')content.author=info.uploader;
+      const authorId=id(info.uploader_id);if(authorId)content.authorId=authorId;
       if(typeof info.description==='string')content.description=info.description.slice(0,12000);
       if(typeof info.duration==='number'&&Number.isFinite(info.duration))content.durationSeconds=info.duration;
       if(typeof info.timestamp==='number')content.publishedAt=info.timestamp;
-      if(typeof info.thumbnail==='string'&&/^https:\/\//u.test(info.thumbnail))content.coverUrl=info.thumbnail;
+      const cover=imageUrl(info.thumbnail);
+      if(cover){content.coverUrl=cover;content.blocks=[{type:'image',image:{id:`${content.resourceId}:cover`,url:cover,role:'cover',status:'pending'}}];}
       if(job.config.subtitles) {
         const subtitles=object(info.subtitles);const languages=Object.keys(subtitles).filter(key=>key!=='danmaku');const language=languages.find(key=>/^zh|^ai-zh/u.test(key))??languages[0];
         const variants=language&&Array.isArray(subtitles[language])?subtitles[language] as Array<Record<string,unknown>>:[];

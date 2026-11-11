@@ -10,10 +10,10 @@ export interface PluginDispatch {
 export interface PluginCommand { name: string; description: string; pluginId: PluginId; contextPolicy: 'control' | 'chat'; executor: 'worker' | 'console'; }
 export interface PluginManifest {
   id: PluginId; name: string; version: string; apiVersion: 1; required: boolean;
-  capabilities?: Array<'commands' | 'content-enrichment' | 'video-download'>;
+  capabilities?: Array<'commands' | 'content-enrichment' | 'video-download' | 'forward-inspection'>;
   resourceTypes: Array<'video' | 'article' | 'post' | 'live' | 'game'>; commands: PluginCommand[]; description?: string;
-  configSchema?: { type:'object'; properties:Record<string,{type:'boolean'|'integer'|'string';title:string;description?:string;minimum?:number;maximum?:number;default?:unknown;secret?:boolean;enum?:string[];enumLabels?:string[];group?:string}> };
-  fields?: Array<{key:string;label:string;type:'boolean'|'number'|'string'|'secret'|'select';description?:string;min?:number;max?:number;default?:unknown;options?:Array<{value:string;label:string}>;group?:string;visibleWhen?:{key:string;value:unknown}}>;
+  configSchema?: { type:'object'; properties:Record<string,{type:'boolean'|'integer'|'string';title:string;description?:string;minimum?:number;maximum?:number;default?:unknown;secret?:boolean;enum?:string[];enumLabels?:string[];group?:string;parent?:string}> };
+  fields?: Array<{key:string;label:string;type:'boolean'|'number'|'string'|'secret'|'select';description?:string;min?:number;max?:number;default?:unknown;options?:Array<{value:string;label:string}>;group?:string;parent?:string;visibleWhen?:{key:string;value:unknown}}>;
 }
 export type PublicPluginDefinition = PluginManifest;
 export interface PluginResource { kind: string; id: string; url: string; title?: string; part?: number; }
@@ -57,8 +57,18 @@ export interface PluginJobView {
   id: string; pluginId: PluginId; sourceMessageId: string; conversationId?: string;
   operation: string; state: string; createdAt: number; attempts: number; automatic: boolean; command: string; commandName?: string;
   resource?: { id: string; url: string; title?: string; author?: string; part?: number };
+  commandExecution?: PluginCommandExecution & { input: string };
+  inspection?: ForwardInspectionView;
   finishedAt?: number; durationMs?: number; error?: string;
-  deliveries: Array<{ kind: 'reply' | 'video' | 'image'; status: 'pending' | 'sending' | 'acknowledged' | 'failed' | 'unconfirmed'; messageId?: string; code?: string }>;
+  deliveries: Array<{ kind: 'reply' | 'video' | 'image' | 'notification'; status: 'pending' | 'sending' | 'acknowledged' | 'failed' | 'unconfirmed'; messageId?: string; code?: string }>;
+}
+export interface ForwardInspectionView {
+  messageCount: number; imageMessageCount: number; imageCount: number; ratioPercent: number;
+  sampledCount: number; checkedCount: number; structuralComplete: boolean;
+  outcome: 'pending' | 'detected' | 'not_detected' | 'unknown' | 'skipped';
+  scores?: Array<{sourceKey: string; score: number}>; reason?: string;
+  failures?: Array<{sourceKey: string; code: string; httpStatus?: number}>;
+  requestCount?: number; cacheHits?: number; preparedCacheHits?: number;
 }
 export interface PluginInstanceView {
   id: PluginId; pluginId: PluginId; enabled: boolean; revision: number;
@@ -89,6 +99,15 @@ export interface PluginRunnerDefinition { execute(job: PluginRunnerJob, workspac
 export class PluginExecutionError extends Error { constructor(readonly code: string, readonly retryable = false) { super(code); } }
 export interface PluginJobPolicy { timeoutSeconds: number; waitSeconds: number; maxAssetBytes: number; cacheMaxBytes: number; cacheHours: number; }
 export interface ControlPluginDefinition { kind: 'control'; manifest: PluginManifest; command(event: unknown): PluginDispatch | undefined; }
+export interface PluginCommandExecution {
+  text: string; summary: string; details: Array<{ label: string; value: string }>;
+}
+export interface CommandPluginDefinition {
+  kind: 'command'; manifest: PluginManifest; defaults: PluginSettings;
+  validateConfig(input: unknown, current?: PluginSettings): PluginSettings;
+  command(event: unknown): PluginDispatch | undefined;
+  execute(dispatch: PluginDispatch, config: PluginSettings): PluginCommandExecution;
+}
 export interface ContentPluginDefinition {
   kind: 'content'; manifest: PluginManifest; defaults: PluginSettings;
   validateConfig(input: unknown, current?: PluginSettings): PluginSettings;
@@ -105,4 +124,9 @@ export interface ContentPluginDefinition {
   missingResourceText: string;
   afterResolve(command: string, resource: PluginResource, config: PluginSettings, content: PluginContent): { provideContext: boolean; replyText?: string; download?: PluginResource; prepare?: PluginPresentation };
 }
-export type PluginDefinition = ControlPluginDefinition | ContentPluginDefinition;
+export interface ObserverPluginDefinition {
+  kind: 'observer'; manifest: PluginManifest; defaults: PluginSettings;
+  validateConfig(input: unknown, current?: PluginSettings): PluginSettings;
+  validateEnabled?(settings: PluginSettings): void;
+}
+export type PluginDefinition = ControlPluginDefinition | CommandPluginDefinition | ContentPluginDefinition | ObserverPluginDefinition;

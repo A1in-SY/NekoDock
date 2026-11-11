@@ -46,7 +46,8 @@ export function defaultSettings(): BotSettings {
     contextWindow: 200_000, compactLimit: 160_000, compactKeepRecentTokens: 20_000, compactSummaryMaxTokens: 4000, maxOutputTokens: 8192,
     memoryEnabled: true, memoryDailyEnabled: true, memoryDailyTime: '04:00', memoryTimezone: 'Asia/Shanghai', memoryAfterCompaction: true, memoryRecallTokens: 3000,
     memoryModel: '', memoryBaseUrl: '', memoryEmbeddingProvider: 'none', memoryEmbeddingBaseUrl: '', memoryEmbeddingModel: '', supportsImages: true, supportsReasoning: true,
-    allowCommands: false, allowFileWrites: true, taskCreatorOnly: true, persona: '', replyProbability: 5,
+    allowCommands: false, allowFileWrites: true, taskCreatorOnly: true, persona: '', replyMode: 'random', replyProbability: 5,
+    replyJudgeBaseUrl: 'https://api.typesafe.ai/v1', replyJudgeModel: 'jev-latest', replyJudgeThreshold: 0.7, replyJudgeTimeout: 3, replyJudgeInstructions: '',
     proxyEnabled: false, proxyUrl: '', proxyNoProxy: DEFAULT_NO_PROXY, proxyForTools: true,
     searchProvider: 'none', searchBaseUrl: 'https://api.tavily.com', searchDepth: 'basic', searchResults: 8, searchTimeout: 30,
     voiceEnabled: false, voiceProbability: 20, ttsProvider: 'none',
@@ -97,11 +98,15 @@ export function validateSettings(input: unknown, existing?: BotSettings): BotSet
     if (typeof value === 'string' && value.length > (key === 'persona' ? 200_000 : 16_000)) throw new Error(`${key} 内容过长`);
     (config as unknown as Record<string, unknown>)[key] = value;
   }
-  for (const key of ['wsUrl', 'model', 'baseUrl', 'searchBaseUrl', 'ttsBaseUrl', 'ttsModel', 'ttsVoice', 'edgeVoice'] as const) config[key] = config[key].trim();
+  for (const key of ['wsUrl', 'model', 'baseUrl', 'searchBaseUrl', 'ttsBaseUrl', 'ttsModel', 'ttsVoice', 'edgeVoice', 'replyJudgeBaseUrl', 'replyJudgeModel'] as const) config[key] = config[key].trim();
   oneOf(config.modelApi, ['openai-responses', 'openai-completions'], 'modelApi');
   oneOf(config.reasoning, ['', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'], 'reasoning');
   oneOf(config.searchProvider, ['none', 'tavily'], 'searchProvider');
   oneOf(config.ttsProvider, ['none', 'edge-tts', 'mimo'], 'ttsProvider');
+  oneOf(config.replyMode, ['random', 'jev'], 'replyMode');
+  if (config.replyJudgeThreshold < 0 || config.replyJudgeThreshold > 1) throw new Error('replyJudgeThreshold 必须为 0 至 1');
+  positiveUnit(config.replyJudgeTimeout, 'replyJudgeTimeout', 1000);
+  if (config.replyJudgeTimeout > 60) throw new Error('replyJudgeTimeout 不能超过 60 秒');
   probability(config.replyProbability, 'replyProbability');
   probability(config.voiceProbability, 'voiceProbability');
   for (const key of ['modelTimeout', 'actionTimeout', 'retrySeconds', 'reconnectSeconds', 'imageTimeout', 'imageMaxMiB'] as const) positiveUnit(config[key], key, key.endsWith('MiB') ? MiB : 1000);
@@ -131,6 +136,7 @@ export function validateSettings(input: unknown, existing?: BotSettings): BotSet
   // Inactive provider fields are retained without requiring their credentials.
   const parsed = loadConfig(settingsToEnv(config, { type: 'group', id: '1' }));
   config.wsUrl = parsed.wsUrl;
+  if (parsed.replyDecision.mode === 'jev') config.replyJudgeBaseUrl = parsed.replyDecision.baseUrl;
   if (parsed.agentBaseUrl) config.baseUrl = parsed.agentBaseUrl;
   if (parsed.webSearch.provider === 'tavily') config.searchBaseUrl = parsed.webSearch.baseUrl;
   if (parsed.tts.provider === 'mimo') config.ttsBaseUrl = parsed.tts.baseUrl;
@@ -153,6 +159,9 @@ export function settingsToEnv(config: BotSettings, target: { type: 'group' | 'pr
     NETWORK_PROXY_ENABLED: String(config.proxyEnabled), NETWORK_PROXY_URL: config.proxyUrl,
     NETWORK_PROXY_USERNAME: config.proxyUsername ?? '', NETWORK_PROXY_PASSWORD: config.proxyPassword ?? '',
     NETWORK_PROXY_NO_PROXY: config.proxyNoProxy, NETWORK_PROXY_FOR_TOOLS: String(config.proxyForTools),
+    REPLY_MODE: config.replyMode, REPLY_JUDGE_BASE_URL: config.replyJudgeBaseUrl, REPLY_JUDGE_MODEL: config.replyJudgeModel,
+    REPLY_JUDGE_API_KEY: config.replyJudgeApiKey ?? '', REPLY_JUDGE_THRESHOLD: String(config.replyJudgeThreshold),
+    REPLY_JUDGE_TIMEOUT_MS: String(config.replyJudgeTimeout * 1000), REPLY_JUDGE_INSTRUCTIONS: config.replyJudgeInstructions,
     RANDOM_REPLY_PROBABILITY: String(config.replyProbability / 100), VOICE_REPLY_ENABLED: String(config.voiceEnabled),
     VOICE_REPLY_PROBABILITY: String(config.voiceProbability / 100), WEB_SEARCH_PROVIDER: config.searchProvider, TTS_PROVIDER: config.ttsProvider,
     BATCH_SIZE: String(config.batchSize), REPLY_MAX_CHARS: String(config.replyMaxChars),
@@ -197,6 +206,9 @@ export function settingsFromEnv(env: Record<string, string | undefined>, persona
     memoryModel: parsed.memory.model, memoryBaseUrl: parsed.memory.baseUrl, memoryApiKey: parsed.memory.apiKey, memoryEmbeddingProvider: parsed.memory.embeddingProvider, memoryEmbeddingBaseUrl: parsed.memory.embeddingBaseUrl, memoryEmbeddingModel: parsed.memory.embeddingModel, memoryEmbeddingApiKey: parsed.memory.embeddingApiKey,
     supportsImages: parsed.agentSupportsImages, supportsReasoning: parsed.agentSupportsReasoning,
     allowCommands: parsed.allowCommands, allowFileWrites: parsed.allowFileWrites, taskCreatorOnly: parsed.taskCreatorOnly, replyProbability: parsed.randomReplyProbability * 100,
+    replyMode: parsed.replyDecision.mode, replyJudgeBaseUrl: parsed.replyDecision.baseUrl, replyJudgeModel: parsed.replyDecision.model,
+    replyJudgeApiKey: parsed.replyDecision.apiKey, replyJudgeThreshold: parsed.replyDecision.threshold,
+    replyJudgeTimeout: parsed.replyDecision.timeoutMs / 1000, replyJudgeInstructions: parsed.replyDecision.instructions,
     voiceEnabled: parsed.voiceReplyEnabled, voiceProbability: Number(env.VOICE_REPLY_PROBABILITY ?? 0.2) * 100,
     batchSize: parsed.batchSize, replyMaxChars: parsed.replyMaxChars, modelTimeout: parsed.agentTimeoutMs / 1000,
     actionTimeout: parsed.actionTimeoutMs / 1000, retrySeconds: parsed.retryMs / 1000, reconnectSeconds: parsed.reconnectMs / 1000,

@@ -3,11 +3,13 @@ import { setTimeout as delay } from 'node:timers/promises';
 import type { ManagedIdentity } from './managed-worker.js';
 import { workerRequest } from './managed-worker.js';
 import { logEvent } from './logging.js';
-import type { Logger, MessageSegment, MessageSender, SendReceipt } from './types.js';
+import type { Logger, MessageSegment, MessageSender, SendReceipt, OutgoingDeliveryMetadata, RecallResult } from './types.js';
+import type { ChatRecallEvent } from './chat-context-contract.js';
 import { NAPCAT_SSE_MAX_BYTES } from './transport-protocol.js';
 import { directFetch } from './network.js';
 import type { IncomingImageDescriptor } from './incoming-image-contract.js';
 import type { PluginDispatch } from './plugin-contract.js';
+import { pluginManifests } from './plugin-system/generated/catalog.js';
 import { isForwardSnapshot, type ForwardSnapshot } from './forward-contract.js';
 
 interface TransportOptions {
@@ -17,6 +19,7 @@ interface TransportOptions {
   reconnectMs: number;
   onEvent(event: unknown, attachments?: IncomingImageDescriptor[], dispatch?: PluginDispatch, forwards?: ForwardSnapshot): void;
   onContentUpdate?(snapshot: ForwardSnapshot, attachments?: IncomingImageDescriptor[]): void;
+  onRecall?(event:ChatRecallEvent):void;
 }
 
 /** Parses complete SSE records while bounding one unfinished event. */
@@ -71,13 +74,29 @@ export class ConsoleTransport implements MessageSender {
     await this.stream;
   }
 
-  sendText(text: string, signal: AbortSignal, replyTo?: string): Promise<SendReceipt> {
-    return this.send({kind:'text',text,...(replyTo !== undefined ? {replyTo} : {})}, signal);
+  sendText(text: string, signal: AbortSignal, replyTo?: string,metadata?:OutgoingDeliveryMetadata): Promise<SendReceipt> {
+    return this.send({kind:'text',text,...(replyTo !== undefined ? {replyTo} : {}),...(metadata?{metadata}:{})}, signal);
   }
-  sendImage(file: string, signal: AbortSignal): Promise<SendReceipt> { return this.send({kind:'image',file}, signal); }
+  sendImage(file: string, signal: AbortSignal,metadata?:OutgoingDeliveryMetadata): Promise<SendReceipt> { return this.send({kind:'image',file,...(metadata?{metadata}:{})}, signal); }
   sendVideo(file: string, signal: AbortSignal): Promise<SendReceipt> { return this.send({kind:'video',file}, signal); }
-  sendVoice(file: string, signal: AbortSignal): Promise<SendReceipt> { return this.send({kind:'voice',file}, signal); }
-  sendMessage(segments: MessageSegment[], signal: AbortSignal): Promise<SendReceipt> { return this.send({kind:'message',segments}, signal); }
+  sendVoice(file: string, signal: AbortSignal,metadata?:OutgoingDeliveryMetadata): Promise<SendReceipt> { return this.send({kind:'voice',file,...(metadata?{metadata}:{})}, signal); }
+  sendMessage(segments: MessageSegment[], signal: AbortSignal,replyTo?:string,metadata?:OutgoingDeliveryMetadata): Promise<SendReceipt> { return this.send({kind:'message',segments,...(replyTo?{replyTo}:{}),...(metadata?{metadata}:{})}, signal); }
+
+  async validateReplyTargets(ids:string[],signal:AbortSignal):Promise<void> {
+    const result=await workerRequest(this.options.identity,'napcat/validate-quotes',{messageIds:ids},signal) as {ok:boolean;code?:string;messageId?:string};
+    if(result.ok!==true)throw Object.assign(new Error('Quoted message is unavailable.'),{code:result.code??'QUOTE_TARGET_UNKNOWN',messageId:result.messageId});
+  }
+  async recallMessage(messageRef:string,operationId:string,signal:AbortSignal):Promise<RecallResult> {
+    const deadline=Date.now()+this.options.actionTimeoutMs;
+    try {
+      const response=await directFetch(this.endpoint('recall'),{method:'POST',headers:{authorization:`Bearer ${this.options.identity.token}`,'content-type':'application/json'},
+        body:JSON.stringify({messageRef,operationId,deadline}),redirect:'error',signal:AbortSignal.any([signal,AbortSignal.timeout(Math.max(1,deadline-Date.now()))])});
+      if(!response.ok)throw new Error('Recall gateway unavailable.');
+      const result=await response.json() as RecallResult;
+      if(result.messageRef!==messageRef||!['recalled','already_recalled','partial','failed','unconfirmed'].includes(result.status)||!Array.isArray(result.parts))throw new Error('Invalid recall response.');
+      return result;
+    }catch{return {messageRef,status:'unconfirmed',parts:[],code:'NAPCAT_RECALL_UNCONFIRMED'};}
+  }
 
   private endpoint(path: string): string {
     const {identity}=this.options;
@@ -93,7 +112,7 @@ export class ConsoleTransport implements MessageSender {
       let idleTimer: NodeJS.Timeout | undefined;
       const touch=()=>{clearTimeout(idleTimer);idleTimer=setTimeout(()=>attempt.abort(),45000);};
       try {
-        const response=await directFetch(this.endpoint('events'),{headers:{authorization:`Bearer ${identity.token}`,accept:'text/event-stream'},
+        const response=await directFetch(this.endpoint('events'),{headers:{authorization:`Bearer ${identity.token}`,accept:'text/event-stream',...(this.options.onRecall?{'x-nekodock-capabilities':'recall-v1'}:{})},
           signal:AbortSignal.any([signal,attempt.signal]),redirect:'error'});
         clearTimeout(headerTimeout);
         if (!response.ok || !response.body || !response.headers.get('content-type')?.startsWith('text/event-stream')) throw new Error('Transport stream unavailable.');
@@ -112,6 +131,12 @@ export class ConsoleTransport implements MessageSender {
             if (value.dispatch !== undefined && !validDispatch(value.dispatch, value.event)) throw new Error('Invalid plugin dispatch.');
             if(value.forwards!==undefined&&(!isForwardSnapshot(value.forwards)||value.forwards.messageId!==String((value.event as Record<string,unknown>).message_id)))throw new Error('Invalid transport forward content.');
             this.options.onEvent(value.event, value.attachments as IncomingImageDescriptor[] | undefined, value.dispatch as PluginDispatch | undefined,value.forwards as ForwardSnapshot|undefined);
+            if(signal.aborted)throw new Error('Runtime closed before acknowledgement.');
+            await workerRequest(identity,'napcat/ack',{seq:value.seq},signal);
+          } else if(type==='recall') {
+            const event=value.recall as ChatRecallEvent|undefined;
+            if(!Number.isSafeInteger(value.seq)||(value.seq as number)<1||!event||typeof event.eventId!=='string'||typeof event.messageId!=='string'||!Number.isFinite(event.time)||!this.options.onRecall)throw new Error('Invalid transport recall event.');
+            this.options.onRecall(event);
             if(signal.aborted)throw new Error('Runtime closed before acknowledgement.');
             await workerRequest(identity,'napcat/ack',{seq:value.seq},signal);
           } else if(type==='content-update') {
@@ -177,6 +202,6 @@ function validDispatch(value: unknown, event: object): value is PluginDispatch {
     && dispatch.sourceMessageId.length <= 200 && typeof dispatch.command === 'string' && dispatch.command.length <= 80
     && typeof dispatch.args === 'string' && dispatch.args.length <= 16384
     && (dispatch.jobId === undefined || typeof dispatch.jobId === 'string' && dispatch.jobId.length <= 200)
-    && (dispatch.pluginId === 'core' && dispatch.executor === 'worker' && dispatch.contextPolicy === 'control'
-      || dispatch.pluginId === 'bilibili' && dispatch.executor === 'console' && dispatch.contextPolicy === 'chat');
+    && pluginManifests.some(plugin => plugin.id === dispatch.pluginId && plugin.commands.some(command =>
+      command.executor === dispatch.executor && command.contextPolicy === dispatch.contextPolicy));
 }

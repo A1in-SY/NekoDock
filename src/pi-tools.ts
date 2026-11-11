@@ -6,7 +6,8 @@ import { Type } from 'typebox';
 import { createBashToolDefinition, createEditToolDefinition, createReadToolDefinition, createWriteToolDefinition,
   detectSupportedImageMimeTypeFromFile, type ToolDefinition } from '@earendil-works/pi-coding-agent';
 import { createWebSearchProvider } from './web-search.js';
-import { replyMessagesSchema, validateReplyRequest } from './reply-contract.js';
+import { ReplyToolError, replyMessagesSchema, validateRecallRequest, validateReplyRequest } from './reply-contract.js';
+import type { ReplyToolReceipt } from './types.js';
 import type { PiConfig } from './pi-protocol.js';
 import type { TaskToolRequest } from './scheduled-contract.js';
 import { proxyEnvironment, type NetworkProxyConfig } from './network.js';
@@ -32,10 +33,12 @@ export async function workspacePath(workspace: string, input: string, missing = 
 }
 
 /** Restrict file tools; terminal access deliberately has the Bot container's user permissions. */
-export function createPiTools(config: PiConfig, send: (request: unknown, signal?: AbortSignal, toolCallId?: string) => Promise<void>, taskTools?: {
+export function createPiTools(config: PiConfig, send: (request: unknown, signal?: AbortSignal, toolCallId?: string) => Promise<void | ReplyToolReceipt>, taskTools?: {
   manage?: (request:TaskToolRequest,operationId:string)=>Promise<unknown>;
   saveState?: (data:Record<string,unknown>,expectedVersion:number)=>Promise<unknown>;
-}, network?:{searchFetch?:typeof globalThis.fetch}): ToolDefinition<any, any>[] {
+}, network?:{searchFetch?:typeof globalThis.fetch}, replies?: {
+  recall: (request: {messageRef:string}, signal?: AbortSignal, toolCallId?: string) => Promise<unknown>;
+}): ToolDefinition<any, any>[] {
   const checked = (path: string, missing = false) => workspacePath(config.workspace, path, missing);
   const read = async (path: string) => {
     const handle = await open(await checked(path), constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -88,9 +91,14 @@ export function createPiTools(config: PiConfig, send: (request: unknown, signal?
     execute: async (_id, params, signal) => textResult(await provider.fetch(params as { urls: string[] }, signal ?? new AbortController().signal)),
   });
   tools.push({ name: 'send_message', label: 'send_message', promptSnippet: 'Send chat replies.',
-    description: 'Deliver one or more chat messages using this actual tool. accepted=true means this content is already queued, not a reason to send it again. Each intended reply must be submitted once. Tool results continue the same request; they do not reset its phase. For substantive human-requested research or scripting, send one brief opening before the work, continue, then send the useful result. For chat, quick lookups, simple fixed reminders and scheduled execution, send only the useful answer or confirmation; no task-start message. After the useful final reply is accepted, finish immediately without another send or duplicate final text. Keep the persona voice and sparse meaningful updates.',
+    description: 'Deliver one or more chat messages using this actual tool. Each text or text-and-mention message may set replyTo to a real, existing QQ messageId supplied in this conversation; never quote a recalled message. Image messages cannot set replyTo. Quoted replies are delivered as text. accepted=true means this content is already queued, not a reason to send it again. Returned messageRefs identify your logical messages for recall_message, not QQ message IDs for quoting. Each intended reply must be submitted once. Tool results continue the same request; they do not reset its phase. For substantive human-requested research or scripting, send one brief opening before the work, continue, then send the useful result. For chat, quick lookups, simple fixed reminders and scheduled execution, send only the useful answer or confirmation; no task-start message. After the useful final reply is accepted, finish immediately without another send or duplicate final text. Keep the persona voice and sparse meaningful updates.',
     executionMode: 'sequential', parameters: Type.Unsafe({ type: 'object', properties: { messages: replyMessagesSchema(config.targetType) }, required: ['messages'], additionalProperties: false }),
-    execute: async (id, params, signal) => { await send(validateReplyRequest(params, config.targetType), signal, id); return textResult({ accepted: true }); },
+    execute: async (id, params, signal) => replyOperationResult(async()=>await send(validateReplyRequest(params, config.targetType), signal, id) ?? { accepted: true }),
+  });
+  if (replies) tools.push({name:'recall_message',label:'recall_message',promptSnippet:'Recall one of your own chat replies.',
+    description:'Cancel or recall one logical chat message using the exact messageRef returned by send_message. Only your own model replies in this conversation are eligible. Use this for a clear error, duplicate, or an explicit request to take back your reply; avoid repeated cosmetic corrections. A message may span multiple QQ messages, so inspect partial or unconfirmed results. Claim recall only when the result confirms it. To correct a reply, recall it and then send the corrected content. A recall preserves the historical fact that the message was sent; it does not undo other actions.',
+    executionMode:'sequential',parameters:Type.Object({messageRef:Type.String({minLength:1,maxLength:400})},{additionalProperties:false}),
+    execute:async(id,params,signal)=>replyOperationResult(()=>replies.recall(validateRecallRequest(params),signal,id)),
   });
   if(taskTools?.manage) {
     const operations={create:'create_scheduled_task',list:'list_scheduled_tasks',update:'update_scheduled_task',delete:'delete_scheduled_task'} as const;
@@ -119,6 +127,14 @@ export function createPiTools(config: PiConfig, send: (request: unknown, signal?
 }
 
 function textResult(value: unknown) { return { content: [{ type: 'text' as const, text: JSON.stringify(value) }], details: undefined }; }
+async function replyOperationResult(operation:()=>Promise<unknown>) {
+  try {return textResult(await operation());}
+  catch(error) {
+    if(!(error instanceof ReplyToolError))throw error;
+    return textResult({accepted:false,error:{code:error.code,message:error.message,
+      ...(error.messageIndex===undefined?{}:{messageIndex:error.messageIndex})}});
+  }
+}
 export function shellEnvironment(source: NodeJS.ProcessEnv = process.env, proxy?: NetworkProxyConfig): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const name of ['PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'TZ', 'TMPDIR', 'TEMP', 'TMP', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'PLAYWRIGHT_BROWSERS_PATH', 'PYTHONPATH', 'VIRTUAL_ENV']) {

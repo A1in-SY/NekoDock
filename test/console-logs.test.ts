@@ -174,6 +174,16 @@ test('slow log clients are disconnected before adding another snapshot to an ove
 });
 
 
+test('reply decision metadata remains visible in instance logs without classifier bodies or credentials', () => {
+ const result=sanitizeLogSnapshot({sourceId:'bot:example:container',truncated:false,lines:[{
+  time:appTime,stream:'stdout',message:`${appTime} INFO reply.decision.result message_ref="abc123" candidate_count=2 score=0.86 threshold=0.7 decision="reply" model="synthetic" actual_model="synthetic-v1" duration_ms=50 input_tokens=80 output_tokens=0 api_key="synthetic-secret" state="private conversation" instructions="private guidance"`,
+ }]},['synthetic-secret']);
+ assert.equal(result.lines.length,1);
+ assert.match(result.lines[0]!.message,/candidate_count=2 score=0.86 threshold=0.7 decision="reply"/);
+ assert.match(result.lines[0]!.message,/actual_model="synthetic-v1"/);
+ assert.doesNotMatch(JSON.stringify(result),/synthetic-secret|private conversation|private guidance|api_key|instructions/);
+});
+
 test('Pi lifecycle diagnostics retain selected metadata and never expose provider error prose', () => {
  const messages=[
   'agent.run.started operation="run" api="openai-responses" model="provider/model" run_id="run-one" resumed=true',

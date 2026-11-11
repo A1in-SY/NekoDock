@@ -3,7 +3,7 @@
   "id": "bilibili",
   "name": "哔哩哔哩增强",
   "description": "解析视频、动态和直播分享，补充内容资料，并按实例配置展示。",
-  "version": "1.1.0",
+  "version": "1.2.3",
   "apiVersion": 1,
   "entries": {
     "console": "./index.js",
@@ -26,19 +26,34 @@
         "type": "boolean",
         "title": "视频上下文增强",
         "default": true,
-        "group": "视频"
+        "group": "视频行为"
       },
-      "subtitles": {
-        "type": "boolean",
-        "title": "尝试获取字幕",
-        "default": true,
-        "group": "视频"
+      "videoDisplay": {
+        "type": "string",
+        "title": "视频自动展示",
+        "description": "将视频资料排版为图片发送，与上下文增强和自动发送视频分别控制。",
+        "enum": [
+          "off",
+          "card"
+        ],
+        "enumLabels": [
+          "关闭",
+          "排版图片"
+        ],
+        "default": "off",
+        "group": "视频行为"
       },
       "autoVideo": {
         "type": "boolean",
         "title": "自动发送视频",
         "default": false,
-        "group": "视频"
+        "group": "视频行为"
+      },
+      "subtitles": {
+        "type": "boolean",
+        "title": "尝试获取字幕",
+        "default": true,
+        "group": "视频资料"
       },
       "maxDurationSeconds": {
         "type": "integer",
@@ -46,15 +61,8 @@
         "minimum": 1,
         "maximum": 3600,
         "default": 300,
-        "group": "视频"
-      },
-      "maxMiB": {
-        "type": "integer",
-        "title": "视频大小上限（MiB）",
-        "minimum": 1,
-        "maximum": 256,
-        "default": 50,
-        "group": "视频"
+        "group": "视频下载限制",
+        "description": "自动发送视频与 /bili download 共用的时长限制。"
       },
       "maxHeight": {
         "type": "integer",
@@ -62,13 +70,14 @@
         "minimum": 144,
         "maximum": 1080,
         "default": 720,
-        "group": "视频"
+        "group": "视频下载限制",
+        "description": "自动发送视频与 /bili download 共用的清晰度限制。"
       },
       "dynamicEnhance": {
         "type": "boolean",
         "title": "动态上下文增强",
         "default": true,
-        "group": "动态"
+        "group": "动态行为"
       },
       "dynamicDisplay": {
         "type": "string",
@@ -84,13 +93,13 @@
           "排版图片"
         ],
         "default": "off",
-        "group": "动态"
+        "group": "动态行为"
       },
       "liveEnhance": {
         "type": "boolean",
         "title": "直播上下文增强",
         "default": true,
-        "group": "直播"
+        "group": "直播行为"
       },
       "liveDisplay": {
         "type": "string",
@@ -106,23 +115,15 @@
           "排版图片"
         ],
         "default": "off",
-        "group": "直播"
+        "group": "直播行为"
       },
-      "timeoutSeconds": {
+      "maxMiB": {
         "type": "integer",
-        "title": "下载总超时（秒）",
-        "minimum": 5,
-        "maximum": 600,
-        "default": 120,
-        "group": "通用"
-      },
-      "waitSeconds": {
-        "type": "integer",
-        "title": "本轮等待解析（秒）",
-        "minimum": 0,
-        "maximum": 5,
-        "default": 2,
-        "group": "通用"
+        "title": "单个媒体大小上限（MiB）",
+        "minimum": 1,
+        "maximum": 256,
+        "default": 50,
+        "group": "媒体与缓存"
       },
       "cacheHours": {
         "type": "integer",
@@ -130,7 +131,7 @@
         "minimum": 1,
         "maximum": 720,
         "default": 24,
-        "group": "通用"
+        "group": "媒体与缓存"
       },
       "cacheMaxMiB": {
         "type": "integer",
@@ -138,14 +139,30 @@
         "minimum": 50,
         "maximum": 16384,
         "default": 1024,
-        "group": "通用"
+        "group": "媒体与缓存"
+      },
+      "timeoutSeconds": {
+        "type": "integer",
+        "title": "单次处理超时（秒）",
+        "minimum": 5,
+        "maximum": 600,
+        "default": 120,
+        "group": "处理"
+      },
+      "waitSeconds": {
+        "type": "integer",
+        "title": "本轮等待解析（秒）",
+        "minimum": 0,
+        "maximum": 5,
+        "default": 2,
+        "group": "处理"
       },
       "cookie": {
         "type": "string",
         "title": "Cookie（可选）",
         "description": "仅填写本实例使用的 Cookie；留空保留，清除时显式提交空字符串。",
         "secret": true,
-        "group": "通用"
+        "group": "访问"
       }
     }
   },

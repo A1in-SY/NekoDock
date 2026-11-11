@@ -7,7 +7,7 @@ import { prepareIncomingImages } from './images.js';
 import { incomingMessageText } from './napcat.js';
 import { fingerprint, logEvent } from './logging.js';
 import { safeToolPayload } from './conversation-recorder.js';
-import { validateReplyRequest } from './reply-contract.js';
+import { ReplyToolError, validateRecallRequest, validateReplyRequest } from './reply-contract.js';
 import type { AgentResult, AgentRunner, Logger, PendingBatch, ReplyTools, RunObserver } from './types.js';
 import type { PiChildMessage, PiConfig, PiStart, PiParentMessage } from './pi-protocol.js';
 import type { ScheduledExecutionTools, ScheduledInput, TaskTools, TaskChatMessage } from './scheduled-contract.js';
@@ -16,7 +16,7 @@ import type { MemoryBatch, MemoryBatchTools, MemoryReadTools } from './memory-co
 import { memoryOrganizerInput, memoryOrganizerResult } from './pi-memory.js';
 import { recoverContextReceipts, type PiContextStart, type ContextImage } from './pi-context.js';
 import { workspacePath } from './pi-tools.js';
-import type { ContextCommit, ChatContextMessage } from './chat-context-contract.js';
+import type { ContextCommit, ChatContextMessage, ChatRecallEvent } from './chat-context-contract.js';
 import { prepareModelImage } from './model-image.js';
 
 export interface PiRunnerOptions extends PiConfig {
@@ -94,7 +94,13 @@ export async function validatePiSession(home: string, session: string): Promise<
 
 export class PiRunner implements AgentRunner {
   readonly supportsContextCommits = true;
+  private readonly recallListeners=new Set<(event:ChatRecallEvent)=>void>();
   constructor(readonly options: PiRunnerOptions) {}
+
+  /** Persistent delivery belongs to the Worker; this only updates an already active run. */
+  notifyRecall(event:ChatRecallEvent):void {
+    for(const listener of this.recallListeners)listener(event);
+  }
 
   async recoverContext(session: string | null, onCommit: (receipt: ContextCommit) => void, stagedBatchIds: string[] = []): Promise<void> {
     if (session !== null) {
@@ -243,6 +249,10 @@ export class PiRunner implements AgentRunner {
           if(error&&!ended){failure??=new Error('PI_CHANNEL_CLOSED');kill();}
         });}catch {if(!ended){failure??=new Error('PI_CHANNEL_CLOSED');kill();}}
       };
+      const recallListener=(event:ChatRecallEvent)=>post({type:'recall-event',event});
+      const operationError=(error:ReplyToolError)=>({code:/^[A-Z][A-Z0-9_]{0,99}$/u.test(error.code)?error.code:'REPLY_INVALID_REQUEST',
+        message:(safeToolPayload(error.message,[...presentationSecrets,config.apiKey??'']) as string).slice(0,300),
+        ...(error.messageIndex===undefined?{}:{messageIndex:error.messageIndex})});
       const stop = (error: Error) => {
         failure ??= error;
         if (ended) return;
@@ -266,10 +276,26 @@ export class PiRunner implements AgentRunner {
           } else if (message.type === 'send') {
             let allowed = false;
             if (!failure && !signal.aborted && replies && (operation === 'run'||operation==='scheduled')) {
-              try { await replies.send(validateReplyRequest(message.request, config.targetType), message.toolCallId ? {toolCallId:message.toolCallId} : undefined); accepted++; allowed = true; }
-              catch { stop(new Error('PI_REPLY_ACCEPT_FAILED')); }
+              try {
+                const receipt=await replies.send(validateReplyRequest(message.request, config.targetType), message.toolCallId ? {toolCallId:message.toolCallId} : undefined);
+                accepted++; allowed = true;post({type:'send-result',id:message.id,accepted:true,receipt});return;
+              } catch(error) {
+                if(error instanceof ReplyToolError){post({type:'send-result',id:message.id,accepted:false,error:operationError(error)});return;}
+                stop(new Error('PI_REPLY_ACCEPT_FAILED'));
+              }
             }
             post({ type: 'send-result', id: message.id, accepted: allowed });
+          } else if(message.type==='recall') {
+            if(failure||signal.aborted||!replies?.recall||operation!=='run') {
+              post({type:'recall-result',id:message.id,ok:false,error:{code:'RECALL_UNAVAILABLE',message:'Recall is unavailable for this execution.'}});return;
+            }
+            try {
+              const result=await replies.recall(validateRecallRequest(message.request),{toolCallId:message.toolCallId,operationId:`${runId}:${message.toolCallId??message.id}`});
+              accepted++;post({type:'recall-result',id:message.id,ok:true,result});
+            }catch(error){
+              if(error instanceof ReplyToolError)post({type:'recall-result',id:message.id,ok:false,error:operationError(error)});
+              else {post({type:'recall-result',id:message.id,ok:false});stop(new Error('PI_RECALL_FAILED'));}
+            }
           } else if(message.type==='task-manage'||message.type==='task-state') {
             try {
               if(failure||signal.aborted)throw new Error('Task operation cancelled.');
@@ -335,6 +361,7 @@ export class PiRunner implements AgentRunner {
       child.on('error', error => stop(error));
       child.once('close', (code, childSignal) => {
         ended = true;
+        this.recallListeners.delete(recallListener);
         kill(); // Reap terminal children that kept the Agent process group alive.
         clearTimeout(timeout); clearTimeout(killTimer); signal.removeEventListener('abort', abort);
         void queue.then(() => {
@@ -349,7 +376,9 @@ export class PiRunner implements AgentRunner {
         });
       });
       post({ type: 'start', operation, config, session, prompt, system, images,taskManagement:!!tasks,taskState:!!state,
+        recallEnabled:operation==='run'&&!!replies?.recall,
         memoryRead: !!reads, ...(recalled === undefined ? {} : { recalledMemory: recalled }), ...(context ? {context} : {}) } satisfies PiStart);
+      if(operation==='run')this.recallListeners.add(recallListener);
     });
   }
 }

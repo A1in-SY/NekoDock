@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { BridgeStore } from '../src/store.js';
 import { WorkerIncomingForwards } from '../src/incoming-forwards.js';
+import { ForwardInspectionCollector } from '../src/forward-inspection.js';
+import { resolveForwardContents } from '../src/forward-resolver.js';
 import type { ForwardSnapshot } from '../src/forward-contract.js';
 import type { IncomingMessage } from '../src/types.js';
 
@@ -21,6 +23,33 @@ const fixture=()=>{
   const store=new BridgeStore(':memory:',{type:'group',id:'1001'});store.insert(message());
   return store;
 };
+
+test('forwarded content above the former byte and node limits stays complete through inspection and Worker projection',async()=>{
+  const store=fixture();
+  try {
+    const count=250,body='Synthetic forwarded content. '.repeat(22);
+    const collector=new ForwardInspectionCollector(4);
+    const contents=await resolveForwardContents({message:[{type:'forward',data:{content:Array.from({length:count},(_,index)=>({
+      message:[{type:'text',data:{text:`${index}: ${body}`}},{type:'image',data:{url:`https://example.invalid/${index}.png`}}],
+    }))}}]}, {signal:signal(),deadline:Date.now()+2000,fetch:async()=>{throw new Error('Unexpected resource lookup');},
+      image:key=>`asset:${key}`,observer:collector});
+    assert.ok(Buffer.byteLength(JSON.stringify(contents))>128*1024);
+    assert.equal(contents[0]!.status,'ready');
+    assert.equal(contents[0]!.nodes.length,count);
+    const summary=collector.summary();
+    assert.equal(summary.structuralComplete,true);
+    assert.equal(summary.messageCount,count);
+    assert.equal(summary.imageMessageCount,count);
+    assert.equal(summary.imageCount,count);
+    assert.equal(summary.samples.length,4);
+    assert.equal(store.recordForwardContent(snapshot({revision:2,contents})),true);
+    assert.deepEqual(store.forwardSnapshot('outer')!.contents,contents);
+    assert.deepEqual(store.chatMessageForQQ('outer')!.contents,contents);
+    const update=store.recorder.pending().findLast(event=>event.type==='message.content.updated')!;
+    assert.deepEqual(update.payload.contents,contents);
+    assert.equal(update.payload.truncated,undefined);
+  }finally{store.close();}
+});
 
 test('forward snapshots revise one outer chat fact and preserve independent plugin content',()=>{
   const store=fixture();

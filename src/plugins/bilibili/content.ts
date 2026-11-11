@@ -48,6 +48,12 @@ export function validatePluginContent(value:unknown,resource:BilibiliResource,de
     content.blocks=blocks(v.blocks);
     if(v.original&&depth===0)content.original=validatePluginContent(v.original,resource,1);
   }
+  if(v.type==='video') {
+    const covers=blocks(v.blocks).filter(block=>block.type==='image'&&block.image.role==='cover').slice(0,1);
+    if(covers.length)content.blocks=covers;
+    const cover=imageUrl(v.coverUrl);
+    if(cover)content.coverUrl=cover;else delete content.coverUrl;
+  }
   if(v.type==='live'&&v.live!==undefined) {
     const live=object(v.live);if(typeof live.roomId!=='string'||!/^\d{1,20}$/u.test(live.roomId)||canonical.id!==`live:${live.roomId}`||!['live','offline','replay'].includes(live.status))throw new Error('插件直播资料无效');
     content.live={roomId:live.roomId,status:live.status};

@@ -37,6 +37,18 @@ export interface ChatContextMessage {
   toolCallId?: string;
   logicalMessageIndex?: number;
   partIndex?: number;
+  /** Current chat state; content revisions and original message text remain independent. */
+  recalled?: boolean;
+  recalledAt?: number;
+}
+
+export interface ChatRecallEvent {
+  eventId: string;
+  messageId: string;
+  /** Unix seconds, matching the original chat message. */
+  time: number;
+  operatorId?: string;
+  authorId?: string;
 }
 
 export interface ContextVersion {
@@ -61,6 +73,8 @@ export interface ContextSubmission {
   /** Model replies already exist as tool calls; only their real delivery associations are new. */
   receipts?: ChatContextMessage[];
   versions: ContextVersion[];
+  /** Real state changes are appended after the original chat facts. */
+  recalls?: ChatRecallEvent[];
 }
 
 export interface ContextCommit {
@@ -72,6 +86,7 @@ export interface ContextCommit {
   /** A revision can target an earlier entry rather than the new input entry. */
   entries?: Array<ContextVersion & { entryId: string }>;
   hash?: string;
+  recallEventIds?: string[];
 }
 
 export interface PluginChatReply {

@@ -3,6 +3,7 @@ import type { PluginContent, PluginResource } from '../../plugin-system/contract
 export interface BilibiliConfig extends Record<string, unknown> {
   enhance: boolean;
   subtitles: boolean;
+  videoDisplay: 'off' | 'card';
   autoVideo: boolean;
   dynamicEnhance: boolean;
   dynamicDisplay: 'off' | 'original' | 'card';

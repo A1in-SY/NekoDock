@@ -64,9 +64,9 @@ async function fixture(t: TestContext, overrides: { paused?: boolean; maxConcurr
     const [response] = await once(request, 'response');
     response.pause(); return response as import('node:http').IncomingMessage;
   };
-  const open = async (botId: string) => {
+  const open = async (botId: string,supportsRecall=true) => {
     const controller = new AbortController(); streams.push(controller);
-    const response = await fetch(`http://127.0.0.1:${httpAddress.port}/events/${botId}`, { signal: controller.signal });
+    const response = await fetch(`http://127.0.0.1:${httpAddress.port}/events/${botId}`, { signal: controller.signal,...(supportsRecall?{headers:{'x-nekodock-capabilities':'recall-v1'}}:{}) });
     assert.equal(response.status, 200); const reader = response.body!.getReader();
     const events: { type: string; data: Record<string, unknown> }[] = []; let buffer = '';
     const reading = (async () => {
@@ -205,6 +205,8 @@ test('stable delivery IDs return the original outcome and cannot address another
 
 test('quoted text reaches the bound group and its reference participates in delivery identity', async t => {
   const f = await fixture(t);
+  f.emit(message('1001','trigger-42'));
+  await waitFor(()=>!!f.db.messageState.get(f.first.id,'trigger-42')?.registered);
   const request: NapcatSendRequest = { deliveryId: 'quoted-id', kind: 'text', text: 'Please wait', replyTo: 'trigger-42', deadline: Date.now() + 1500 };
   const first = f.gateway.send(f.first.id, request);
   const duplicate = f.gateway.send(f.first.id, request);
@@ -239,6 +241,98 @@ test('invalid quote references are rejected before claiming or sending a deliver
   });
   assert.equal(f.db.getNapcatDelivery(f.first.id, 'quote-video'), null);
   assert.equal(f.requests.length, 0);
+});
+
+test('recall notices are durable, scoped, deduplicated and replayed without ordinary message processing',async t=>{
+  const f=await fixture(t),stream=await f.open(f.first.id);
+  const recall={post_type:'notice',notice_type:'group_recall',self_id:'999',group_id:'1001',user_id:'123',operator_id:'123',message_id:'late-original',time:1792727201};
+  f.emit(recall);f.emit(recall);f.emit({...recall,group_id:'1002',self_id:'wrong-account'});
+  await waitFor(()=>stream.events.some(event=>event.type==='recall'));
+  const notice=stream.events.find(event=>event.type==='recall')!;
+  assert.equal((notice.data.recall as {messageId:string}).messageId,'late-original');
+  assert.equal(f.db.pendingNapcatEventCount(f.first.id),1);assert.equal(f.db.pendingNapcatEventCount(f.second.id),0);
+  f.gateway.acknowledge(f.first.id,notice.data.seq as number);
+  f.emit(message('1001','late-original'));await waitFor(()=>!!f.db.messageState.get(f.first.id,'late-original')?.registered);
+  assert.deepEqual(f.gateway.validateQuotes(f.first.id,{messageIds:['late-original']}),{ok:false,code:'QUOTE_TARGET_RECALLED',messageId:'late-original'});
+  assert.equal(f.requests.length,0);
+});
+
+test('an old Worker can drain before a new Worker replays the pending recall event',async t=>{
+  const f=await fixture(t),old=await f.open(f.first.id,false);
+  f.emit({post_type:'notice',notice_type:'group_recall',self_id:'999',group_id:'1001',user_id:'123',operator_id:'123',message_id:'upgrade-recall',time:1792727201});
+  await waitFor(()=>f.db.pendingNapcatEventCount(f.first.id)===1);await new Promise(resolve=>setTimeout(resolve,40));
+  assert.equal(old.events.some(event=>event.type==='recall'),false);assert.equal(f.gateway.pendingInbound(f.first.id),0);
+  const seq=f.db.pendingNapcatEvents(f.first.id)[0]!.seq;
+  await old.close();const upgraded=await f.open(f.first.id,true);
+  await waitFor(()=>upgraded.events.some(event=>event.type==='recall'));
+  assert.equal(upgraded.events.find(event=>event.type==='recall')!.data.seq,seq);
+  f.gateway.acknowledge(f.first.id,seq);assert.equal(f.db.pendingNapcatEventCount(f.first.id),0);
+});
+
+test('a quoted message recalled while queued is blocked at the actual send boundary',async t=>{
+  const f=await fixture(t);f.emit(message('1001','quote-target'));await waitFor(()=>!!f.db.messageState.get(f.first.id,'quote-target')?.registered);
+  const blocking=f.send(f.first.id,'blocking');await waitFor(()=>f.requests.length===1);
+  const quoted=f.gateway.send(f.first.id,{deliveryId:'late-quote',kind:'text',text:'reply',replyTo:'quote-target',deadline:Date.now()+1500});
+  f.emit({post_type:'notice',notice_type:'group_recall',self_id:'999',group_id:'1001',user_id:'123',operator_id:'123',message_id:'quote-target',time:1792727201});
+  await waitFor(()=>f.db.messageState.get(f.first.id,'quote-target')?.recalled===1);f.answer(f.requests[0]!);await blocking;
+  assert.deepEqual(await quoted,{ok:false,code:'QUOTE_TARGET_RECALLED',deliveryStatus:'failed'});assert.equal(f.requests.length,1);
+});
+
+test('confirmed model references recall actual QQ IDs once and merge the resulting notice',async t=>{
+  const f=await fixture(t);const metadata={messageRef:'reply-example:0',conversationId:'chat-example',origin:'model' as const,logicalMessageIndex:0,partIndex:0};
+  const sending=f.gateway.send(f.first.id,{deliveryId:'model-send',kind:'text',text:'correction needed',metadata,deadline:Date.now()+1500});
+  await waitFor(()=>f.requests.length===1);f.answer(f.requests[0]!,{data:{message_id:'sent-qq-id'}});await sending;
+  const body={messageRef:metadata.messageRef,operationId:'recall-operation',deadline:Date.now()+1500};
+  const recalling=f.gateway.recall(f.first.id,body),duplicate=f.gateway.recall(f.first.id,body);
+  await waitFor(()=>f.requests.length===2);assert.equal(f.requests[1]!.action,'delete_msg');assert.deepEqual(f.requests[1]!.params,{message_id:'sent-qq-id'});
+  f.answer(f.requests[1]!,{data:{}});
+  const result=await recalling;assert.equal(result.status,'recalled');assert.deepEqual(await duplicate,result);assert.deepEqual(await f.gateway.recall(f.first.id,body),result);
+  assert.equal(f.db.messageState.get(f.first.id,'sent-qq-id')?.recalled,1);
+  f.emit({post_type:'notice',notice_type:'group_recall',self_id:'999',group_id:'1001',user_id:'999',operator_id:'999',message_id:'sent-qq-id',time:1792727201});
+  await new Promise(resolve=>setTimeout(resolve,15));assert.equal(f.db.pendingNapcatEvents(f.first.id).filter(event=>event.recall).length,1);
+  assert.equal((await f.gateway.recall(f.second.id,{...body,operationId:'foreign'})).status,'failed');assert.equal(f.requests.length,2);
+});
+
+test('private user recall is routed to the registered private target and never to a group',async t=>{
+  const f=await fixture(t);f.emit(message('1001','private-original',{message_type:'private'}));
+  await waitFor(()=>!!f.db.messageState.get(f.privateBot.id,'private-original')?.registered);
+  f.emit({post_type:'notice',notice_type:'friend_recall',self_id:'999',user_id:'123',message_id:'private-original',time:1792727201});
+  await waitFor(()=>f.db.messageState.get(f.privateBot.id,'private-original')?.recalled===1);
+  assert.equal(f.db.messageState.get(f.first.id,'private-original'),null);
+});
+
+test('group mentions can carry a validated quote and unknown or foreign IDs cannot reach NapCat',async t=>{
+  const f=await fixture(t);f.emit(message('1001','quote-with-at'));await waitFor(()=>!!f.db.messageState.get(f.first.id,'quote-with-at')?.registered);
+  const request={deliveryId:'quote-at',kind:'message',segments:[{type:'at',userId:'123'},{type:'text',text:'reply'}],replyTo:'quote-with-at',deadline:Date.now()+1500};
+  const sending=f.gateway.send(f.first.id,request);await waitFor(()=>f.requests.length===1);
+  assert.deepEqual((f.requests[0]!.params as {message:unknown[]}).message,[{type:'reply',data:{id:'quote-with-at'}},{type:'at',data:{qq:'123'}},{type:'text',data:{text:'reply'}}]);
+  f.answer(f.requests[0]!);await sending;
+  assert.equal((await f.gateway.send(f.second.id,{...request,deliveryId:'foreign-quote'})).ok,false);
+  assert.equal((await f.gateway.send(f.first.id,{...request,deliveryId:'unknown-quote',replyTo:'not-observed'})).ok,false);
+  assert.equal(f.requests.length,1);
+});
+
+test('an explicit recall refusal leaves the message live while a timeout remains unconfirmed',async t=>{
+  const f=await fixture(t);const metadata={messageRef:'reply-rejected:0',conversationId:'chat-example',origin:'model' as const,logicalMessageIndex:0,partIndex:0};
+  const sent=f.gateway.send(f.first.id,{deliveryId:'recall-refusal-source',kind:'text',text:'example',metadata,deadline:Date.now()+1500});
+  await waitFor(()=>f.requests.length===1);f.answer(f.requests[0]!,{data:{message_id:'refusal-source'}});await sent;
+  const recalled=f.gateway.recall(f.first.id,{messageRef:metadata.messageRef,operationId:'refused-operation',deadline:Date.now()+1500});
+  await waitFor(()=>f.requests.length===2);f.answer(f.requests[1]!,{status:'failed',retcode:1200,data:null,message:'synthetic-rejection'});
+  assert.equal((await recalled).status,'failed');assert.equal(f.db.messageState.get(f.first.id,'refusal-source')?.recalled,0);
+  const timed=f.gateway.recall(f.first.id,{messageRef:metadata.messageRef,operationId:'timeout-operation',deadline:Date.now()+40});
+  const result=await timed;assert.equal(result.status,'unconfirmed');assert.equal(f.db.messageState.get(f.first.id,'refusal-source')?.recalled,0);
+});
+
+test('NapCat internal recall receipt timeout is unconfirmed and a later trusted notice confirms the state',async t=>{
+  const f=await fixture(t);f.db.messageState.register(f.first.id,'internal-timeout','999','model',{messageRef:'reply-timeout:0',conversationId:'chat-example',origin:'model',logicalMessageIndex:0,partIndex:0});
+  const pending=f.gateway.recall(f.first.id,{messageRef:'reply-timeout:0',operationId:'internal-timeout-operation',deadline:Date.now()+1500});
+  await waitFor(()=>f.requests.length===1);f.answer(f.requests[0]!,{status:'failed',retcode:1200,data:null,message:'Timeout: NTEvent serviceAndMethod:NodeIKernelMsgService/recallMsg ListenerName:NodeIKernelMsgListener/onMsgInfoListUpdate EventRet: {}'});
+  const result=await pending;assert.equal(result.status,'unconfirmed');assert.equal(result.parts[0]!.code,'NAPCAT_RECALL_RECEIPT_TIMEOUT');assert.equal(f.db.messageState.get(f.first.id,'internal-timeout')?.recalled,0);
+  f.emit({post_type:'notice',notice_type:'group_recall',self_id:'999',group_id:'1001',user_id:'999',operator_id:'999',message_id:'internal-timeout',time:1792727201});
+  await waitFor(()=>f.db.messageState.get(f.first.id,'internal-timeout')?.recalled===1);
+  assert.equal((await f.gateway.recall(f.first.id,{messageRef:'reply-timeout:0',operationId:'internal-timeout-operation',deadline:Date.now()+1500})).status,'unconfirmed');
+  assert.equal((await f.gateway.recall(f.first.id,{messageRef:'reply-timeout:0',operationId:'confirmed-new-operation',deadline:Date.now()+1500})).status,'already_recalled');
+  assert.equal(f.requests.length,1);
 });
 
 test('a missing send receipt remains unconfirmed and leaves the shared connection usable', async t => {
@@ -360,6 +454,18 @@ test('connection edits wait for current acknowledgements before replacing the up
   await new Promise(resolve => setTimeout(resolve, 20)); assert.equal(reconciled, false); assert.equal(f.sockets.length, 1);
   f.answer(f.requests[0]!); assert.equal((await pending).ok, true); await reconciling;
   await waitFor(() => f.sockets.length === 2 && f.gateway.getConnectionStatus(f.connection.id).online);
+});
+
+test('connection edits also drain an in-flight recall before replacing the shared socket',async t=>{
+  const f=await fixture(t),metadata={messageRef:'reply-before-edit:0',conversationId:'chat-example',origin:'model' as const,logicalMessageIndex:0,partIndex:0};
+  const sending=f.gateway.send(f.first.id,{deliveryId:'before-recall-edit',kind:'text',text:'example',metadata,deadline:Date.now()+1500});
+  await waitFor(()=>f.requests.length===1);f.answer(f.requests[0]!,{data:{message_id:'recall-before-edit'}});await sending;
+  const recalling=f.gateway.recall(f.first.id,{messageRef:metadata.messageRef,operationId:'edit-recall-operation',deadline:Date.now()+1500});
+  await waitFor(()=>f.requests.length===2);f.db.updateNapcatConnection(f.connection.id,{token:'updated-synthetic-token'});
+  let complete=false;const reconciling=f.gateway.reconcile().then(()=>{complete=true;});
+  await new Promise(resolve=>setTimeout(resolve,20));assert.equal(complete,false);assert.equal(f.sockets.length,1);
+  f.answer(f.requests[1]!,{data:{}});assert.equal((await recalling).status,'recalled');await reconciling;
+  await waitFor(()=>f.sockets.length===2&&f.gateway.getConnectionStatus(f.connection.id).online);
 });
 
 test('connection edits preserve video ACKs beyond the ordinary action timeout and settle queued sends', async t => {

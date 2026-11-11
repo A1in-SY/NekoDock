@@ -19,6 +19,7 @@ import { ConversationStreams } from './conversation-streams.js';
 import { NapcatGateway } from './napcat-gateway.js';
 import { NetworkProbes } from './network-probes.js';
 import { ConsoleImagePrefetch } from './incoming-images.js';
+import { ForwardInspectionCoordinator } from './inspection-coordinator.js';
 import {isNapcatSendResult,NAPCAT_MEDIA_MAX_BYTES,type NapcatSendResult} from '../transport-protocol.js';
 import type {PluginRunnerResult} from '../plugin-contract.js';
 import { contentPlugin } from '../plugin-system/registry.js';
@@ -26,6 +27,7 @@ import { contentPlugin } from '../plugin-system/registry.js';
 export interface ConsoleOptions {
  dataDir:string; docker:DockerClient; staticDir?:string; timers?:boolean; logPollMs?:number; conversationHeartbeatMs?:number;
  incomingImageFetch?:typeof globalThis.fetch;
+ inspectionFetch?:typeof globalThis.fetch;
  pluginRunnerToken?:string;
 }
 const object=(value:unknown):Record<string,unknown>=>{
@@ -48,6 +50,8 @@ export async function createConsole(options:ConsoleOptions){
  const networkProbes=new NetworkProbes();
  const incomingImages=new ConsoleImagePrefetch({store:db.images,root:resolve(options.dataDir,'incoming-images'),bot:id=>db.getBot(id),logger,fetch:options.incomingImageFetch});
  incomingImages.start(options.timers!==false);
+ const inspections=new ForwardInspectionCoordinator({db,images:incomingImages,gateway,logger,fetch:options.inspectionFetch});
+ inspections.start(options.timers!==false);
  const pluginAssetsRoot=resolve(options.dataDir,'plugin-assets');
  const pluginRunnerToken=options.pluginRunnerToken??process.env.CONSOLE_PLUGIN_RUNNER_TOKEN??db.pluginRunnerToken();
  if(process.env.CONSOLE_PLUGIN_RUNNER_TOKEN_FILE){const file=resolve(process.env.CONSOLE_PLUGIN_RUNNER_TOKEN_FILE);mkdirSync(dirname(file),{recursive:true,mode:0o755});writeFileSync(file+'.tmp',pluginRunnerToken+'\n',{mode:0o444});renameSync(file+'.tmp',file);}
@@ -345,6 +349,8 @@ export async function createConsole(options:ConsoleOptions){
   if(!Number.isSafeInteger(seq))throw new Error('请求投递确认序号无效');gateway.acknowledge(req.params.id,seq as number);return {ok:true};
  });
  app.post<{Params:{id:string}}>('/internal/workers/:id/napcat/send',{bodyLimit:32*1024*1024},async(req)=>{await worker(req);return gateway.send(req.params.id,req.body);});
+ app.post<{Params:{id:string}}>('/internal/workers/:id/napcat/validate-quotes',async(req)=>{await worker(req);return gateway.validateQuotes(req.params.id,req.body);});
+ app.post<{Params:{id:string}}>('/internal/workers/:id/napcat/recall',async(req)=>{await worker(req);return gateway.recall(req.params.id,req.body);});
  app.post<{Params:{id:string}}>('/internal/workers/:id/heartbeat',async(req)=>{
   await worker(req);const acknowledgedSeq=db.ingestHeartbeat(req.params.id,req.body as WorkerHeartbeat);changes();
   if((req.body as WorkerHeartbeat).events.length)conversations.notify(req.params.id);
@@ -376,7 +382,7 @@ export async function createConsole(options:ConsoleOptions){
   every(15000,()=>void sample());every(3600000,()=>{try{metrics.compact();}catch{logEvent(logger,'warn','console.metrics_compact_failed');}});
   every(60000,()=>{void db.pluginAssets.cleanup(pluginAssetsRoot).catch(()=>logEvent(logger,'warn','plugin.assets.cleanup_failed'));});
  }
- app.addHook('preClose',async()=>{for(const timer of timers)clearInterval(timer);logs.close();conversations.close();for(const stream of streams)stream.response.end();await gateway.close();await incomingImages.close();});
+ app.addHook('preClose',async()=>{for(const timer of timers)clearInterval(timer);logs.close();conversations.close();for(const stream of streams)stream.response.end();await inspections.close();await gateway.close();await incomingImages.close();});
  app.addHook('onClose',async()=>{for(const timer of timers)clearInterval(timer);for(const stream of streams)stream.response.end();db.close();metrics.close();});
- return {app,db,metrics,auth,lifecycle,gateway,sample,incomingImages};
+ return {app,db,metrics,auth,lifecycle,gateway,sample,incomingImages,inspections};
 }

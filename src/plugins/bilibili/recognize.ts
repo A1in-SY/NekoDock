@@ -28,7 +28,7 @@ export function bilibiliResources(event:unknown):BilibiliResource[] {
     }
   }
   const title=Array.isArray(e.message)?e.message.map(item=>{const s=object(item),d=object(s?.data);if(s?.type!=='json')return '';let card=object(d?.data);try{if(typeof d?.data==='string')card=object(JSON.parse(d.data));}catch{};return scalar(object(object(card?.meta)?.detail_1)?.desc).slice(0,500);}).find(Boolean):undefined;
-  const matches=text.join('\n').match(/https?:\/\/(?:(?:(?:www\.|m\.)?bilibili\.com\/(?:video\/(?:BV[0-9A-Za-z]{10}|av\d+)|opus\/\d+)|t\.bilibili\.com\/\d+|(?:live|live\.m)\.bilibili\.com\/(?:h5\/)?\d+|m\.live\.bilibili\.com\/(?:h5\/)?\d+)(?:[^\s<>"'\]，。]*)?|b23\.tv\/[0-9A-Za-z]+(?:\?[^\s<>"'\]，。]*)?)|\bBV[0-9A-Za-z]{10}\b/gu)??[];
+  const matches=text.join('\n').match(/https?:\/\/(?:(?:(?:www\.|m\.)?bilibili\.com\/(?:(?:zh-Hans\/)?video\/(?:BV[0-9A-Za-z]{10}|av\d+)|opus\/\d+)|t\.bilibili\.com\/\d+|(?:live|live\.m)\.bilibili\.com\/(?:h5\/)?\d+|m\.live\.bilibili\.com\/(?:h5\/)?\d+)(?:[^\s<>"'\]，。]*)?|b23\.tv\/[0-9A-Za-z]+(?:\?[^\s<>"'\]，。]*)?)|\bBV[0-9A-Za-z]{10}\b/gu)??[];
   const out=new Map<string,BilibiliResource>();
   for(const found of matches.slice(0,8)) {
     const resource=normalizeBilibiliResource(found,title);if(resource)out.set(resource.id,resource);
@@ -47,7 +47,7 @@ export function normalizeBilibiliResource(input:string,title?:string):BilibiliRe
     const room=/^\/(?:h5\/)?(\d{1,20})\/?$/u.exec(u.pathname)?.[1];
     if(room&&['live.bilibili.com','live.m.bilibili.com','m.live.bilibili.com'].includes(host))return {kind:'live',id:`live:${room}`,url:`https://live.bilibili.com/${room}`,...(title?{title:title.slice(0,500)}: {})};
     if(!['www.bilibili.com','bilibili.com','m.bilibili.com'].includes(host))return null;
-    const id=/^\/video\/(BV[0-9A-Za-z]{10}|av\d+)\/?$/u.exec(u.pathname)?.[1];if(!id)return null;
+    const id=/^\/(?:zh-Hans\/)?video\/(BV[0-9A-Za-z]{10}|av\d+)\/?$/u.exec(u.pathname)?.[1];if(!id)return null;
     return {kind:'video',id:`${id}:p${part}`,url:`https://www.bilibili.com/video/${id}${part>1?`?p=${part}`:''}`,part,...(title?{title:title.slice(0,500)}: {})};
   }catch{return null;}
 }

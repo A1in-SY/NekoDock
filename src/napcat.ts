@@ -23,6 +23,7 @@ function sendFailure(error: Error, code: string, deliveryStatus: 'failed' | 'unc
 const sendFailureCodes: Record<string, string> = {
   api_rejected: 'NAPCAT_API_REJECTED', response_timeout: 'NAPCAT_RESPONSE_TIMEOUT',
   send_receipt_timeout: 'NAPCAT_SEND_RECEIPT_TIMEOUT',
+  recall_receipt_timeout: 'NAPCAT_RECALL_RECEIPT_TIMEOUT',
   aborted: 'NAPCAT_SEND_CANCELLED', disconnected: 'NAPCAT_CONNECTION_LOST',
   stopped: 'NAPCAT_CLIENT_STOPPED', send_failed: 'NAPCAT_SEND_FAILED',
 };
@@ -32,6 +33,12 @@ function sendReceiptTimedOut(action: string, packet: JsonObject): boolean {
   // A send can reach QQ before NapCat times out waiting for its local receipt event.
   const timeout = /\bTimeout:\s*NTEvent\s+serviceAndMethod:\s*NodeIKernelMsgService\/sendMsg\s+ListenerName:\s*NodeIKernelMsgListener\/onMsgInfoListUpdate(?:\s|$)/u;
   return [packet.message, packet.wording].some(detail => typeof detail === 'string' && timeout.test(detail));
+}
+
+function recallReceiptTimedOut(action:string,packet:JsonObject):boolean {
+  if(action!=='delete_msg')return false;
+  const timeout=/\bTimeout:\s*NTEvent\s+serviceAndMethod:\s*NodeIKernelMsgService\/recallMsg\s+ListenerName:\s*NodeIKernelMsgListener\/onMsgInfoListUpdate(?:\s|$)/u;
+  return [packet.message,packet.wording].some(detail=>typeof detail==='string'&&timeout.test(detail));
 }
 
 function object(value: unknown): JsonObject | null {
@@ -125,6 +132,10 @@ export function imageSources(rawJson: string): string[] {
 function hasContent(segment: Segment): boolean {
   if (segment.type === 'text') return string(segment.data.text).trim().length > 0;
   return segment.type !== 'at' && segment.type !== 'reply' && !isSticker(segment);
+}
+
+export function hasReplyContent(rawJson:string):boolean {
+  try {return (parseSegments(object(JSON.parse(rawJson))?.message)??[]).some(hasContent);}catch{return false;}
 }
 
 function bridgeCommand(segments: Segment[], selfId: string | null): BridgeCommand | undefined {
@@ -282,12 +293,12 @@ export class NapCatClient implements MessageSender {
     return this.sendSegments([{ type: 'record', data: { file } }], signal);
   }
 
-  async sendMessage(segments: MessageSegment[], signal: AbortSignal): Promise<SendReceipt> {
+  async sendMessage(segments: MessageSegment[], signal: AbortSignal,replyTo?:string): Promise<SendReceipt> {
     if (this.options.target.type !== 'group') throw new Error('Segment messages require a group target');
     if (!isSegmentMessage({ type: 'message', segments })) throw new Error('Invalid outgoing message segments');
-    return this.sendSegments(segments.map(segment => segment.type === 'at'
+    return this.sendSegments([...(replyTo?[{type:'reply',data:{id:replyTo}}]:[]),...segments.map(segment => segment.type === 'at'
       ? { type: 'at', data: { qq: segment.userId } }
-      : { type: 'text', data: { text: segment.text } }), signal);
+      : { type: 'text', data: { text: segment.text } })], signal);
   }
 
   /** Shared gateways choose the destination from their authenticated instance binding. */
@@ -301,14 +312,19 @@ export class NapCatClient implements MessageSender {
       segments = [{ type: 'record', data: { file: message.file } }];
     } else {
       if (target.type !== 'group' || !isSegmentMessage({ type: 'message', segments: message.segments })) throw new Error('Invalid outgoing message segments');
-      segments = message.segments.map(segment => segment.type === 'at'
-        ? { type: 'at', data: { qq: segment.userId } } : { type: 'text', data: { text: segment.text } });
+      segments = [...(message.replyTo?[{type:'reply',data:{id:message.replyTo}}]:[]),...message.segments.map(segment => segment.type === 'at'
+        ? { type: 'at', data: { qq: segment.userId } } : { type: 'text', data: { text: segment.text } })];
     }
     return this.sendSegments(segments, signal, target, deadline);
   }
 
   async inspect(action: 'get_status' | 'get_login_info', signal: AbortSignal): Promise<unknown> {
     return this.request(action, {}, signal, Date.now() + this.options.actionTimeoutMs, 0);
+  }
+
+  async recall(messageId:string,signal:AbortSignal,deadline=Date.now()+this.options.actionTimeoutMs):Promise<void> {
+    if(!messageId||messageId.length>200)throw new Error('Invalid recall message ID');
+    await this.request('delete_msg',{message_id:messageId},signal,deadline,0);
   }
 
   async getForwardMessage(resourceId: string, signal: AbortSignal, deadline: number): Promise<unknown> {
@@ -365,7 +381,7 @@ export class NapCatClient implements MessageSender {
         signal.removeEventListener('abort', onAbort);
         const failure = error ? sendFailure(error, sendFailureCodes[reason ?? ''] ?? 'NAPCAT_SEND_UNCONFIRMED',
           reason === 'api_rejected' ? 'failed' : 'unconfirmed', retcode) : undefined;
-        logEvent(logger, error ? 'warn' : 'info', reason === 'response_timeout' || reason === 'send_receipt_timeout' ? 'napcat.api.timeout' : error ? 'napcat.api.failed' : 'napcat.api.succeeded', {
+        logEvent(logger, error ? 'warn' : 'info', reason === 'response_timeout' || reason === 'send_receipt_timeout' || reason==='recall_receipt_timeout' ? 'napcat.api.timeout' : error ? 'napcat.api.failed' : 'napcat.api.succeeded', {
           echo, action, stage: 'send', reason, retcode, segment_count: segmentCount,
           error_code: failure?.code, delivery_status: failure?.deliveryStatus,
           pending_count: this.pending.size, duration_ms: Date.now() - started,
@@ -451,10 +467,11 @@ export class NapCatClient implements MessageSender {
         if (pending?.socket === socket) {
           const succeeded = packet.status === 'ok' && packet.retcode === 0;
           const receiptTimeout = !succeeded && sendReceiptTimedOut(pending.action, packet);
-          pending.finish(succeeded ? undefined : receiptTimeout
+          const recallTimeout=!succeeded&&recallReceiptTimedOut(pending.action,packet);
+          pending.finish(succeeded ? undefined : receiptTimeout||recallTimeout
             ? new Error('NapCat send receipt timed out; send outcome unknown')
             : new Error(`NapCat API request failed (retcode ${typeof packet.retcode === 'number' ? packet.retcode : 'unknown'})`),
-          succeeded ? undefined : receiptTimeout ? 'send_receipt_timeout' : 'api_rejected',
+          succeeded ? undefined : receiptTimeout ? 'send_receipt_timeout' : recallTimeout?'recall_receipt_timeout':'api_rejected',
           typeof packet.retcode === 'number' && Number.isFinite(packet.retcode) ? packet.retcode : undefined,
           packet.data);
           return;

@@ -46,6 +46,7 @@ export class WorkerIncomingImages {
   private lastRemoteSyncAt = 0;
   private cleanupAt = 0;
   private persistence: Promise<void> = Promise.resolve();
+  private readonly contentLocks = new Map<string, Promise<void>>();
   private parentAbort?: () => void;
 
   constructor(readonly options: WorkerIncomingImageOptions, private readonly parentSignal?: AbortSignal) {
@@ -331,7 +332,7 @@ export class WorkerIncomingImages {
     const signal = this.controller.signal;
     if (initial.status !== 'pending') { await this.acknowledge(initial, signal); return; }
     const started = Date.now();
-    logEvent(this.options.logger, 'info', 'image.cache.started', { attachment_ref: fingerprint(initial.id), message_ref: fingerprint(initial.message_id) });
+    const logStarted = () => logEvent(this.options.logger, 'info', 'image.cache.started', { attachment_ref: fingerprint(initial.id), message_ref: fingerprint(initial.message_id) });
     try {
       let bytes: Buffer;
       let expected: IncomingImageDescriptor | undefined;
@@ -340,6 +341,7 @@ export class WorkerIncomingImages {
         return;
       }
       if(initial.plugin_asset_id&&this.options.pluginContent) {
+        logStarted();
         this.db.prepare('UPDATE incoming_image_cache SET plugin_attempts=plugin_attempts+1 WHERE id=?').run(initial.id);
         bytes=await this.options.pluginContent(initial.plugin_asset_id,AbortSignal.any([signal,AbortSignal.timeout(this.options.timeoutMs)]));
       } else if (initial.remote_id && this.options.remote) {
@@ -353,31 +355,31 @@ export class WorkerIncomingImages {
           return;
         }
         if (expected.status !== 'ready') { await this.acknowledge(this.row(initial.id)!, remoteSignal); return; }
-        if (!expected.sha256 || !/^[a-f0-9]{64}$/.test(expected.sha256) || !Number.isSafeInteger(expected.size)
+        if (!expected.sha256 || !/^[a-f0-9]{64}$/.test(expected.sha256) || !['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(expected.mimeType ?? '') || !Number.isSafeInteger(expected.size)
           || expected.size! <= 0 || expected.size! > this.options.maxBytes) throw new Error('图片内容校验失败');
-        bytes = await this.options.remote.content(initial.remote_id, remoteSignal);
+        const descriptor = expected;
+        await this.withContent(descriptor.sha256!, async () => {
+          remoteSignal.throwIfAborted();
+          if (await this.reuseCached(initial, descriptor, remoteSignal)) {
+            logEvent(this.options.logger, 'info', 'image.cache.hit', { attachment_ref: fingerprint(initial.id), bytes: descriptor.size, duration_ms: Date.now() - started });
+            return;
+          }
+          logStarted();
+          const downloaded = await this.options.remote!.content(initial.remote_id!, remoteSignal);
+          await this.save(initial, downloaded, descriptor, remoteSignal);
+          logEvent(this.options.logger, 'info', 'image.cache.ready', { attachment_ref: fingerprint(initial.id), bytes: downloaded.length, duration_ms: Date.now() - started });
+        });
+        this.updated(initial.message_id);
+        await this.acknowledge(this.row(initial.id)!, signal);
+        return;
       } else if (initial.source) {
+        logStarted();
         bytes = await readIncomingImage(initial.source, this.imageOptions(), signal);
       } else {
         this.db.prepare('UPDATE incoming_image_cache SET next_attempt_at=? WHERE id=?').run(Date.now() + 1000, initial.id);
         return;
       }
-      signal.throwIfAborted();
-      if (bytes.length > this.options.maxBytes) throw new Error('图片超过大小限制');
-      const extension = imageExtension(bytes);
-      const sha256 = hash(bytes);
-      if (expected && (sha256 !== expected.sha256 || bytes.length !== expected.size || mime(extension) !== expected.mimeType)) throw new Error('图片内容校验失败');
-      await this.serial(async () => {
-        signal.throwIfAborted();
-        const existing = this.db.prepare("SELECT path FROM incoming_image_cache WHERE sha256=? AND status='ready' LIMIT 1").get(sha256) as { path: string } | undefined;
-        const duplicate = existing && existsSync(existing.path);
-        const used = await this.cleanupUnlocked(Date.now(), duplicate ? 0 : bytes.length);
-        if (used + (duplicate ? 0 : bytes.length) > this.options.cacheMaxBytes) throw new Error('图片缓存空间不足');
-        const path = await cacheImage(bytes, this.imageOptions(), signal);
-        this.db.prepare(`UPDATE incoming_image_cache SET status='ready',path=?,sha256=?,mime_type=?,size=?,error=NULL,
-          last_access_at=?,ack_pending=CASE WHEN remote_id IS NULL THEN 0 ELSE 1 END,next_attempt_at=0 WHERE id=?`)
-          .run(path, sha256, mime(extension), bytes.length, Date.now(), initial.id);
-      });
+      await this.save(initial, bytes, expected, signal);
       this.updated(initial.message_id);
       logEvent(this.options.logger, 'info', 'image.cache.ready', { attachment_ref: fingerprint(initial.id), bytes: bytes.length, duration_ms: Date.now() - started });
       await this.acknowledge(this.row(initial.id)!, signal);
@@ -397,6 +399,53 @@ export class WorkerIncomingImages {
       this.updated(initial.message_id);
       logEvent(this.options.logger, 'warn', 'image.cache.failed', { attachment_ref: fingerprint(initial.id), reason: safeError(error), duration_ms: Date.now() - started });
     }
+  }
+
+  private async withContent(key: string, action: () => Promise<void>): Promise<void> {
+    const previous = this.contentLocks.get(key) ?? Promise.resolve();
+    const work = previous.catch(() => {}).then(action);
+    this.contentLocks.set(key, work);
+    try { await work; }
+    finally { if (this.contentLocks.get(key) === work) this.contentLocks.delete(key); }
+  }
+
+  private async reuseCached(initial: ImageRow, expected: IncomingImageDescriptor, signal: AbortSignal): Promise<boolean> {
+    return this.serial(async () => {
+      const candidates = this.db.prepare("SELECT * FROM incoming_image_cache WHERE sha256=? AND status='ready' AND size=? AND mime_type=? ORDER BY last_access_at DESC")
+        .all(expected.sha256!, expected.size!, expected.mimeType!) as unknown as ImageRow[];
+      for (const candidate of candidates) {
+        signal.throwIfAborted();
+        try {
+          const bytes = await this.readCached(candidate, signal);
+          if (mime(imageExtension(bytes)) !== expected.mimeType) continue;
+          this.setReady(initial.id, candidate.path!, expected.sha256!, expected.mimeType!, expected.size!);
+          return true;
+        } catch { signal.throwIfAborted(); }
+      }
+      return false;
+    });
+  }
+
+  private setReady(id: string, path: string, sha256: string, mimeType: string, size: number): void {
+    this.db.prepare(`UPDATE incoming_image_cache SET status='ready',path=?,sha256=?,mime_type=?,size=?,error=NULL,
+      last_access_at=?,ack_pending=CASE WHEN remote_id IS NULL THEN 0 ELSE 1 END,next_attempt_at=0 WHERE id=?`)
+      .run(path, sha256, mimeType, size, Date.now(), id);
+  }
+
+  private async save(initial: ImageRow, bytes: Buffer, expected: IncomingImageDescriptor | undefined, signal: AbortSignal): Promise<void> {
+    signal.throwIfAborted();
+    if (bytes.length > this.options.maxBytes) throw new Error('图片超过大小限制');
+    const extension = imageExtension(bytes), sha256 = hash(bytes);
+    if (expected && (sha256 !== expected.sha256 || bytes.length !== expected.size || mime(extension) !== expected.mimeType)) throw new Error('图片内容校验失败');
+    await this.serial(async () => {
+      signal.throwIfAborted();
+      const existing = this.db.prepare("SELECT path FROM incoming_image_cache WHERE sha256=? AND status='ready' LIMIT 1").get(sha256) as { path: string } | undefined;
+      const duplicate = existing && existsSync(existing.path);
+      const used = await this.cleanupUnlocked(Date.now(), duplicate ? 0 : bytes.length);
+      if (used + (duplicate ? 0 : bytes.length) > this.options.cacheMaxBytes) throw new Error('图片缓存空间不足');
+      const path = await cacheImage(bytes, this.imageOptions(), signal);
+      this.setReady(initial.id, path, sha256, mime(extension), bytes.length);
+    });
   }
 
   private async acknowledge(row: ImageRow, signal: AbortSignal): Promise<void> {

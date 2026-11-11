@@ -49,3 +49,17 @@ test('默认日志脱敏覆盖 MiMo 语音供应商的 API Key', () => {
     else process.env.MIMO_TTS_API_KEY = previous;
   }
 });
+
+test('default logging redacts the independent reply classifier key', () => {
+  const previous = process.env.REPLY_JUDGE_API_KEY;
+  const lines: string[] = [];
+  try {
+    process.env.REPLY_JUDGE_API_KEY = 'synthetic-classifier-secret';
+    createLogger({ write: (_level, line) => lines.push(line) }).warn('key=synthetic-classifier-secret');
+    assert.match(lines[0]!, /key=\[redacted\]/);
+    assert.doesNotMatch(lines[0]!, /synthetic-classifier-secret/);
+  } finally {
+    if (previous === undefined) delete process.env.REPLY_JUDGE_API_KEY;
+    else process.env.REPLY_JUDGE_API_KEY = previous;
+  }
+});

@@ -133,7 +133,7 @@ test('depth truncation remains a valid eight-layer content tree', async () => {
 });
 
 test('the cumulative node limit applies across nested branches', async () => {
-  const contents = await resolve(event(forward('root', Array.from({length: 250}, (_, index) => message(text(`line-${index}`))))));
+  const contents = await resolve(event(forward('root', Array.from({length: FORWARD_LIMITS.nodes + 50}, (_, index) => message(text(`line-${index}`))))));
   assert.equal(contents[0]!.nodes.length, FORWARD_LIMITS.nodes);
   assert.equal(contents[0]!.status, 'partial');
   valid(contents);
@@ -145,9 +145,9 @@ test('large multi-root input stays within the complete JSON byte limit including
   valid(contents);
 });
 
-test('more than two hundred root forwards report explicit truncation', async () => {
-  const contents = await resolve(event(...Array.from({length: 201}, (_, index) => forward(`root-${index}`, []))));
-  assert.equal(contents.length, 200);
+test('root forwards beyond the configured limit report explicit truncation', async () => {
+  const contents = await resolve(event(...Array.from({length: FORWARD_LIMITS.nodes + 1}, (_, index) => forward(`root-${index}`, []))));
+  assert.equal(contents.length, FORWARD_LIMITS.nodes);
   assert.equal(contents.at(-1)!.status, 'partial');
   assert.match(contents.at(-1)!.error!, /后续转发未展开/);
   valid(contents);

@@ -3,7 +3,7 @@ import { closeSync, createReadStream, fsyncSync, openSync } from 'node:fs';
 import { dirname } from 'node:path';
 import {createInterface} from 'node:readline';
 import type { SessionManager } from '@earendil-works/pi-coding-agent';
-import type { ChatContextMessage, ContextCommit, ContextSubmission, ContextVersion } from './chat-context-contract.js';
+import type { ChatContextMessage, ChatRecallEvent, ContextCommit, ContextSubmission, ContextVersion } from './chat-context-contract.js';
 import type {AgentMessage} from '@earendil-works/pi-agent-core';
 
 export interface ContextImage { type: 'image'; data: string; mimeType: string }
@@ -18,10 +18,46 @@ interface ContextMarker {
   conversationId: string;
   versions: ContextVersion[];
   entries: Array<ContextVersion & { entryId: string }>;
+  recallEventIds?: string[];
 }
 type Json = Record<string, unknown>;
 const object = (value: unknown): Json | null => value && typeof value === 'object' && !Array.isArray(value) ? value as Json : null;
 const key = (message: ContextVersion) => `${message.chatMessageId}:${message.revision}`;
+export const CHAT_RECALL_CUSTOM_TYPE = 'chat.message_recalled';
+
+export function validChatRecallEvent(value: unknown): value is ChatRecallEvent {
+  const item=object(value);
+  return !!item && typeof item.eventId==='string' && item.eventId.length>0 && item.eventId.length<=400
+    && typeof item.messageId==='string' && item.messageId.length>0 && item.messageId.length<=200
+    && typeof item.time==='number' && Number.isFinite(item.time) && item.time>=0
+    && (item.operatorId===undefined || typeof item.operatorId==='string' && item.operatorId.length<=200)
+    && (item.authorId===undefined || typeof item.authorId==='string' && item.authorId.length<=200);
+}
+
+function recalledEvent(entry: Json): ChatRecallEvent | undefined {
+  if(entry.type!=='custom_message'||entry.customType!==CHAT_RECALL_CUSTOM_TYPE)return;
+  const details=object(entry.details);
+  return validChatRecallEvent(details?.event)?details.event:undefined;
+}
+
+/** Record an actual status transition after its source input, without editing that input. */
+export function appendRecallEvents(manager: SessionManager, events: readonly ChatRecallEvent[]): string[] {
+  if(!events.length)return [];
+  const present=new Set(manager.getBranch().flatMap(entry=>{
+    const event=recalledEvent(entry as unknown as Json);return event?[event.eventId]:[];
+  }));
+  const appended:string[]=[];
+  for(const event of events) {
+    if(!validChatRecallEvent(event))throw new Error('Invalid chat recall event.');
+    if(present.has(event.eventId))continue;
+    manager.appendCustomMessageEntry(CHAT_RECALL_CUSTOM_TYPE,JSON.stringify({
+      source:'chat_state',type:'message_recalled',...event,recalled:true,
+      notice:'This is an observed chat status change, not a new human message or reply request. The original message remains in history; its request or statement is no longer active. Do not quote it.',
+    }),false,{event});
+    present.add(event.eventId);appended.push(event.eventId);
+  }
+  return appended;
+}
 
 export function contextMessage(message: ChatContextMessage, historical = false): Json {
   return {
@@ -29,6 +65,8 @@ export function contextMessage(message: ChatContextMessage, historical = false):
     messageId: message.messageId, senderId: message.senderId, senderName: message.senderName,
     time: message.time, text: message.text, replyTo: message.replyTo,
     role: message.role, origin: message.origin,
+    recalled:message.recalled??false,
+    ...(message.recalledAt===undefined?{}:{recalledAt:message.recalledAt}),
     ...(message.sequence !== undefined ? { sequence: message.sequence } : {}),
     ...(message.assets?.length ? { assets: message.assets, images: message.assets.filter(asset => asset.type === 'image'&&asset.modelInput!==false).map(asset => ({
       attachmentId: asset.id, status: asset.status ?? 'ready', ...(asset.path ? { path: asset.path } : {}), ...(asset.error ? { error: asset.error } : {}),
@@ -247,7 +285,8 @@ export function prepareContextInput(manager: SessionManager, plan: PiContextStar
     ? Number(a.sequence)-Number(b.sequence)
     : Number(a.time)-Number(b.time));
   const marker: ContextMarker = { batchId: submission.batchId, conversationId: submission.conversationId,
-    versions: submission.versions, entries: [...revised.values()] };
+    versions: submission.versions, entries: [...revised.values()],
+    ...(submission.recalls?.length?{recallEventIds:[...new Set(submission.recalls.map(event=>event.eventId))]}:{}) };
   // Keep reply targets last so stable chat content remains a reusable provider prefix.
   const prompt = JSON.stringify({ messages, contextBatch: marker, replyTargetMessageIds: replyTargets });
   return { prompt, images: inputImages(messages, plan.imageData), marker };
@@ -261,7 +300,9 @@ function validMarker(value: unknown): value is ContextMarker {
     && item.versions.every(value => { const version = object(value); return version && typeof version.chatMessageId === 'string'
       && version.chatMessageId.length <= 400 && Number.isSafeInteger(version.revision) && Number(version.revision) > 0; })
     && Array.isArray(item.entries) && item.entries.every(value => { const entry = object(value); return entry
-      && typeof entry.chatMessageId === 'string' && Number.isSafeInteger(entry.revision) && typeof entry.entryId === 'string'; });
+      && typeof entry.chatMessageId === 'string' && Number.isSafeInteger(entry.revision) && typeof entry.entryId === 'string'; })
+    && (item.recallEventIds===undefined || Array.isArray(item.recallEventIds) && item.recallEventIds.length<=10_000
+      && item.recallEventIds.every(id=>typeof id==='string'&&id.length>0&&id.length<=400));
 }
 
 function receipt(entry: Json, session: string): ContextCommit | null {
@@ -274,7 +315,8 @@ function receipt(entry: Json, session: string): ContextCommit | null {
   const revised = new Map(marker.entries.map(item => [key(item), item]));
   return { batchId: marker.batchId, conversationId: marker.conversationId, session, entryId,
     versions: marker.versions, hash: createHash('sha256').update(text).digest('hex'),
-    entries: marker.versions.map(version => revised.get(key(version)) ?? { ...version, entryId }) };
+    entries: marker.versions.map(version => revised.get(key(version)) ?? { ...version, entryId }),
+    ...(marker.recallEventIds?.length?{recallEventIds:marker.recallEventIds}:{}) };
 }
 
 /** The acknowledgement follows file and directory sync, independently of generation. */
@@ -285,7 +327,12 @@ export function committedContext(manager: SessionManager, batchId: string): Cont
   });
   if (!entry) return null;
   syncSession(session);
-  return receipt(entry as unknown as Json, session);
+  const result=receipt(entry as unknown as Json, session)!;
+  const present=new Set(manager.getBranch().flatMap(entry=>{
+    const event=recalledEvent(entry as unknown as Json);return event?[event.eventId]:[];
+  }));
+  if(result.recallEventIds)result.recallEventIds=result.recallEventIds.filter(id=>present.has(id));
+  return result;
 }
 
 function syncSession(session: string): void {
@@ -299,7 +346,7 @@ function syncSession(session: string): void {
 export async function recoverContextReceipts(session: string): Promise<ContextCommit[]> {
   const input = createReadStream(session,{encoding:'utf8'});
   const lines = createInterface({input,crlfDelay:Infinity});
-  const entries = new Map<string,{parentId:string|null;commit:ContextCommit|null}>();
+  const entries = new Map<string,{parentId:string|null;commit:ContextCommit|null;recall?:ChatRecallEvent}>();
   let leaf: string | null = null;let headerSeen=false;
   try {
     for await (const line of lines) {
@@ -311,19 +358,21 @@ export async function recoverContextReceipts(session: string): Promise<ContextCo
           if(entry.type!=='session'||typeof entry.id!=='string'||!entry.id)return [];
         }
         if (entry && typeof entry.id === 'string') {
-          entries.set(entry.id,{parentId:typeof entry.parentId === 'string'?entry.parentId:null,commit:receipt(entry,session)});
+          entries.set(entry.id,{parentId:typeof entry.parentId === 'string'?entry.parentId:null,commit:receipt(entry,session),recall:recalledEvent(entry)});
           leaf = entry.id;
         }
       } catch { /* An interrupted final append has no commit. */ }
     }
   } finally {lines.close();input.destroy();}
-  const commits: ContextCommit[] = []; const seen = new Set<string>();
+  const commits: ContextCommit[] = []; const seen = new Set<string>();const recalled=new Set<string>();
   while (leaf) {
     if(seen.has(leaf))return [];
     seen.add(leaf);const entry = entries.get(leaf);if(!entry)return [];
+    if(entry.recall)recalled.add(entry.recall.eventId);
     if(entry.commit)commits.push(entry.commit);leaf=entry.parentId;
   }
   const receipts = commits.reverse();
+  for(const commit of receipts)if(commit.recallEventIds)commit.recallEventIds=commit.recallEventIds.filter(id=>recalled.has(id));
   if (receipts.length) syncSession(session);
   return receipts;
 }

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import type { ChatAsset, ChatContextMessage, ContextCommit, ContextSubmission, PluginChatReply } from './chat-context-contract.js';
+import type { ChatAsset, ChatContextMessage, ChatRecallEvent, ContextCommit, ContextSubmission, PluginChatReply } from './chat-context-contract.js';
 import type { CachedIncomingImage } from './incoming-image-contract.js';
 import type { StoredMessage } from './types.js';
 import { incomingMessageText } from './napcat.js';
@@ -13,6 +13,7 @@ interface Row {
   time: number; text: string; reply_to: string | null; assets_json: string; contents_json: string;
   source_message_id: string | null; plugin_id: string | null; projection: 'message' | 'reference';
   tool_call_id: string|null;logical_index:number|null;part_index:number|null;
+  recalled: number; recalled_at: number|null;
 }
 const value = (row: Row): ChatContextMessage => ({
   chatMessageId: row.id, conversationId: row.conversation_id, revision: Number(row.revision),sequence:Number(row.seq),
@@ -25,6 +26,7 @@ const value = (row: Row): ChatContextMessage => ({
   ...(row.tool_call_id?{toolCallId:row.tool_call_id}:{}),
   ...(row.logical_index!==null?{logicalMessageIndex:Number(row.logical_index)}:{}),
   ...(row.part_index!==null?{partIndex:Number(row.part_index)}:{}),
+  ...(row.recalled?{recalled:true,recalledAt:Number(row.recalled_at)}:{}),
 });
 
 /** Uses the bridge connection so chat facts and business acknowledgements commit together. */
@@ -52,10 +54,17 @@ export class ChatStore {
       PRIMARY KEY(message_id,plugin_id,resource_id)
     ); CREATE TABLE IF NOT EXISTS chat_forwards (
       message_id TEXT PRIMARY KEY,revision INTEGER NOT NULL,contents_json TEXT NOT NULL,deadline REAL NOT NULL,view_json TEXT
+    ); CREATE TABLE IF NOT EXISTS chat_recall_events (
+      event_id TEXT PRIMARY KEY,message_id TEXT NOT NULL UNIQUE,time REAL NOT NULL,operator_id TEXT,author_id TEXT,conversation_id TEXT
+    ); CREATE TABLE IF NOT EXISTS chat_recall_context (
+      event_id TEXT NOT NULL,session TEXT NOT NULL,entry_id TEXT NOT NULL,PRIMARY KEY(event_id,session)
     );`);
     const columns=db.prepare('PRAGMA table_info(chat_context_batches)').all();
     for(const column of ['staged_hash','committed_hash','receipt_json'])if(!columns.some(item=>item.name===column))db.exec(`ALTER TABLE chat_context_batches ADD COLUMN ${column} TEXT`);
     if(!db.prepare('PRAGMA table_info(chat_forwards)').all().some(column=>column.name==='view_json'))db.exec('ALTER TABLE chat_forwards ADD COLUMN view_json TEXT');
+    const messageColumns=db.prepare('PRAGMA table_info(chat_messages)').all();
+    if(!messageColumns.some(column=>column.name==='recalled'))db.exec('ALTER TABLE chat_messages ADD COLUMN recalled INTEGER NOT NULL DEFAULT 0');
+    if(!messageColumns.some(column=>column.name==='recalled_at'))db.exec('ALTER TABLE chat_messages ADD COLUMN recalled_at REAL');
   }
 
   get(id: string): ChatContextMessage | null {
@@ -67,10 +76,23 @@ export class ChatStore {
     return row ? value(row) : null;
   }
   put(message: Omit<ChatContextMessage, 'revision'>, projection: 'message' | 'reference' = 'message'): boolean {
-    return !!this.db.prepare(`INSERT OR IGNORE INTO chat_messages(id,conversation_id,qq_message_id,sender_id,sender_name,role,origin,time,text,reply_to,assets_json,contents_json,source_message_id,plugin_id,projection,tool_call_id,logical_index,part_index)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(message.chatMessageId,message.conversationId,message.messageId,message.senderId,message.senderName,
+    const recall=message.messageId?this.db.prepare('SELECT time FROM chat_recall_events WHERE message_id=?').get(message.messageId):undefined;
+    const inserted=!!this.db.prepare(`INSERT OR IGNORE INTO chat_messages(id,conversation_id,qq_message_id,sender_id,sender_name,role,origin,time,text,reply_to,assets_json,contents_json,source_message_id,plugin_id,projection,tool_call_id,logical_index,part_index,recalled,recalled_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(message.chatMessageId,message.conversationId,message.messageId,message.senderId,message.senderName,
       message.role,message.origin,message.time,message.text,message.replyTo,JSON.stringify(message.assets ?? []),JSON.stringify(message.contents ?? []),
-      message.sourceMessageId ?? null,message.pluginId ?? null,projection,message.toolCallId??null,message.logicalMessageIndex??null,message.partIndex??null).changes;
+      message.sourceMessageId ?? null,message.pluginId ?? null,projection,message.toolCallId??null,message.logicalMessageIndex??null,message.partIndex??null,recall?1:0,recall?.time??null).changes;
+    if(message.messageId)this.db.prepare('UPDATE chat_recall_events SET conversation_id=? WHERE message_id=? AND conversation_id IS NULL').run(message.conversationId,message.messageId);
+    return inserted;
+  }
+  recall(event: ChatRecallEvent): boolean {
+    if(!event.eventId||event.eventId.length>300||!event.messageId||event.messageId.length>200||!Number.isFinite(event.time)||event.time<0
+      ||[event.operatorId,event.authorId].some(id=>id!==undefined&&(typeof id!=='string'||!id||id.length>200)))throw new Error('Invalid message recall event.');
+    const original=this.forQQ(event.messageId);
+    const inserted=this.db.prepare('INSERT OR IGNORE INTO chat_recall_events(event_id,message_id,time,operator_id,author_id,conversation_id) VALUES(?,?,?,?,?,?)')
+      .run(event.eventId,event.messageId,event.time,event.operatorId??null,event.authorId??null,original?.conversationId??null);
+    if(!inserted.changes)return false;
+    this.db.prepare('UPDATE chat_messages SET recalled=1,recalled_at=? WHERE qq_message_id=?').run(event.time,event.messageId);
+    return true;
   }
   incoming(message: StoredMessage, conversationId: string): void {
     this.put({chatMessageId:`in:${message.messageId}`,conversationId,messageId:message.messageId,senderId:message.senderId,
@@ -181,7 +203,10 @@ export class ChatStore {
     return this.enrich(messageId,pluginId,contents,Number(previous?.revision??0)+1);
   }
   movePending(messageIds: string[], conversationId: string): void {
-    for(const id of messageIds)this.db.prepare('UPDATE chat_messages SET conversation_id=? WHERE id=?').run(conversationId,`in:${id}`);
+    for(const id of messageIds){
+      this.db.prepare('UPDATE chat_messages SET conversation_id=? WHERE id=?').run(conversationId,`in:${id}`);
+      this.db.prepare('UPDATE chat_recall_events SET conversation_id=? WHERE message_id=?').run(conversationId,id);
+    }
   }
   baseline(id: string, session: string): void {
     const message=this.get(id);if(!message)return;
@@ -211,7 +236,16 @@ export class ChatStore {
     const receipts=(this.db.prepare(`SELECT c.* FROM chat_messages c LEFT JOIN chat_context_versions v ON v.message_id=c.id AND v.session=?
       WHERE c.conversation_id=? AND c.origin='model' AND c.tool_call_id IS NOT NULL AND (v.revision IS NULL OR v.revision<c.revision) ORDER BY c.seq LIMIT 100`).all(session??'',conversationId) as unknown as Row[]).map(value);
     const versions=[...projected,...revisions.map(item=>item.message),...receipts].map(message=>({chatMessageId:message.chatMessageId,revision:message.revision}));
-    const submission:ContextSubmission={batchId:randomUUID(),conversationId,messages:projected,revisions,references,receipts,versions};
+    const suppliedIds=[...new Set([...versions.map(version=>version.chatMessageId),...references.map(message=>message.chatMessageId)])];
+    const recallRows=this.db.prepare(`SELECT r.* FROM chat_recall_events r JOIN chat_messages c ON c.qq_message_id=r.message_id
+      LEFT JOIN chat_recall_context v ON v.event_id=r.event_id AND v.session=?
+      WHERE r.conversation_id=? AND v.event_id IS NULL
+      AND (c.origin<>'human' OR c.qq_message_id IN (SELECT message_id FROM messages WHERE seq<=?))
+      AND (c.id IN (SELECT value FROM json_each(?)) OR EXISTS(SELECT 1 FROM chat_context_versions supplied WHERE supplied.message_id=c.id AND supplied.session=?))
+      ORDER BY r.time,r.event_id LIMIT 100`).all(session??'',conversationId,Math.max(0,...messages.map(message=>message.seq)),JSON.stringify(suppliedIds),session??'');
+    const recalls:ChatRecallEvent[]=recallRows.map(row=>({eventId:String(row.event_id),messageId:String(row.message_id),time:Number(row.time),
+      ...(row.operator_id?{operatorId:String(row.operator_id)}:{}),...(row.author_id?{authorId:String(row.author_id)}:{})}));
+    const submission:ContextSubmission={batchId:randomUUID(),conversationId,messages:projected,revisions,references,receipts,versions,...(recalls.length?{recalls}:{})};
     const encoded=JSON.stringify(submission);
     this.db.prepare('INSERT INTO chat_context_batches(id,conversation_id,submission_json,created_at,staged_hash) VALUES(?,?,?,?,?)')
       .run(submission.batchId,conversationId,encoded,Date.now(),createHash('sha256').update(encoded).digest('hex'));
@@ -225,6 +259,11 @@ export class ChatStore {
     const row=this.db.prepare('SELECT * FROM chat_context_batches WHERE id=?').get(receipt.batchId);
     if(!row || row.conversation_id !== receipt.conversationId)return false;
     const submission=JSON.parse(String(row.submission_json)) as ContextSubmission;
+    const recallIds=new Set(submission.recalls?.map(event=>event.eventId)??[]);
+    for(const eventId of receipt.recallEventIds??[]) {
+      if(!recallIds.has(eventId))throw new Error('Context commit does not match its staged recall events.');
+      this.db.prepare('INSERT OR IGNORE INTO chat_recall_context(event_id,session,entry_id) VALUES(?,?,?)').run(eventId,receipt.session,receipt.entryId);
+    }
     const selected=new Map(submission.versions.map(version=>[version.chatMessageId,version.revision]));
     for(const version of receipt.versions) {
       if(selected.get(version.chatMessageId)!==version.revision)throw new Error('Context commit does not match its staged message versions.');

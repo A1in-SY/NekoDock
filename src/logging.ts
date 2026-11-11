@@ -15,7 +15,7 @@ export function createLogger(options: {
   secrets?: readonly string[];
 } = {}): Logger {
   const secrets = [...new Set(options.secrets ?? [
-    process.env.NAPCAT_TOKEN, process.env.AGENT_API_KEY, process.env.CODEX_API_KEY, process.env.TAVILY_API_KEY, process.env.MIMO_TTS_API_KEY,
+    process.env.NAPCAT_TOKEN, process.env.AGENT_API_KEY, process.env.CODEX_API_KEY, process.env.TAVILY_API_KEY, process.env.MIMO_TTS_API_KEY, process.env.REPLY_JUDGE_API_KEY,
   ])].filter((value): value is string => typeof value === 'string' && value.length > 0)
     .sort((a, b) => b.length - a.length);
   const write = options.write ?? ((level: Level, line: string) => {

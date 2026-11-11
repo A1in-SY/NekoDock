@@ -1,5 +1,5 @@
 import type { TaskChatMessage, TaskTools } from './scheduled-contract.js';
-import type { ContextCommit, ContextSubmission } from './chat-context-contract.js';
+import type { ChatRecallEvent, ContextCommit, ContextSubmission } from './chat-context-contract.js';
 export type TargetType = 'group' | 'private';
 export interface Target { type: TargetType; id: string }
 
@@ -28,8 +28,8 @@ export interface IncomingMessage {
 export interface StoredMessage extends IncomingMessage { seq: number }
 
 export type MessageSegment = { type: 'text'; text: string } | { type: 'at'; userId: string };
-export interface SegmentMessage { type: 'message'; segments: MessageSegment[] }
-export type OutputMessage = { type: 'text'; text: string } | { type: 'image'; path: string } | SegmentMessage;
+export interface SegmentMessage { type: 'message'; segments: MessageSegment[]; replyTo?: string }
+export type OutputMessage = { type: 'text'; text: string; replyTo?: string } | { type: 'image'; path: string } | SegmentMessage;
 export interface VoiceReply { type: 'voice'; text: string; file?: string }
 export type ReplyPart = string | { type: 'image'; file: string } | SegmentMessage | VoiceReply;
 
@@ -45,9 +45,23 @@ export interface PendingBatch {
 }
 
 export interface ReplyToolRequest { messages: OutputMessage[] }
-export interface ReplyToolReceipt { accepted: true }
+export interface ReplyToolReceipt { accepted: true; messages?: Array<{ messageRef: string; status: 'queued' }> }
+export interface OutgoingDeliveryMetadata {
+  messageRef: string; conversationId: string; origin: 'model'; logicalMessageIndex: number; partIndex: number;
+}
+export interface RecallPartResult {
+  messageId: string; partIndex: number; status: 'recalled' | 'already_recalled' | 'failed' | 'unconfirmed'; code?: string;
+}
+export interface RecallResult {
+  messageRef: string; status: 'recalled' | 'already_recalled' | 'partial' | 'failed' | 'unconfirmed';
+  parts: RecallPartResult[]; events?: ChatRecallEvent[]; code?: string;
+}
+export interface RecallToolReceipt extends Omit<RecallResult, 'status'> {
+  status: RecallResult['status'] | 'cancelled'; cancelledParts?: number;
+}
 export interface ReplyTools {
   send(request: ReplyToolRequest, metadata?: { toolCallId?: string }): Promise<ReplyToolReceipt>;
+  recall?(request: { messageRef: string }, metadata?: { toolCallId?: string; operationId?: string }): Promise<RecallToolReceipt>;
 }
 export interface ReplyRequestRecord extends ReplyToolRequest {
   requestId: string;
@@ -75,9 +89,11 @@ export interface AgentRunner {
 }
 
 export interface MessageSender {
-  sendText(text: string, signal: AbortSignal, replyTo?: string): Promise<void | SendReceipt>;
-  sendImage(file: string, signal: AbortSignal): Promise<void | SendReceipt>;
-  sendMessage(segments: MessageSegment[], signal: AbortSignal): Promise<void | SendReceipt>;
-  sendVoice?(file: string, signal: AbortSignal): Promise<void | SendReceipt>;
+  sendText(text: string, signal: AbortSignal, replyTo?: string, metadata?: OutgoingDeliveryMetadata): Promise<void | SendReceipt>;
+  sendImage(file: string, signal: AbortSignal, metadata?: OutgoingDeliveryMetadata): Promise<void | SendReceipt>;
+  sendMessage(segments: MessageSegment[], signal: AbortSignal, replyTo?: string, metadata?: OutgoingDeliveryMetadata): Promise<void | SendReceipt>;
+  sendVoice?(file: string, signal: AbortSignal, metadata?: OutgoingDeliveryMetadata): Promise<void | SendReceipt>;
   sendVideo?(file: string, signal: AbortSignal): Promise<void | SendReceipt>;
+  validateReplyTargets?(ids: string[], signal: AbortSignal): Promise<void>;
+  recallMessage?(messageRef: string, operationId: string, signal: AbortSignal): Promise<RecallResult>;
 }

@@ -22,11 +22,14 @@ export interface MemorySource {
   messageId: string | null;
   senderId: string;
   senderName: string;
-  role: 'user' | 'assistant';
+  role: 'user' | 'assistant' | 'system';
   time: number;
   text: string;
   textOffset?: number;
   truncated?: boolean;
+  kind?: 'message_recalled';
+  recalled?: boolean;
+  recalledAt?: number;
 }
 
 export interface MemoryItem {
@@ -41,7 +44,7 @@ export interface MemoryItem {
   validTo: number | null;
   status: 'active' | 'superseded' | 'disabled';
   revision: number;
-  sources: Array<{ sourceId: string; quote: string }>;
+  sources: Array<{ sourceId: string; quote: string; recalled?: boolean; recalledAt?: number }>;
   createdAt: number;
   updatedAt: number;
 }

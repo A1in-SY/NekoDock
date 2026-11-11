@@ -54,7 +54,7 @@ export class ConsoleIncomingForwards {
   }
   claim(job: ForwardJob): boolean { return this.db.prepare("UPDATE console_incoming_forwards SET state='running' WHERE bot_id=? AND message_id=? AND state='queued'").run(job.botId, job.messageId).changes === 1; }
   reset(job: ForwardJob): void { this.db.prepare("UPDATE console_incoming_forwards SET state='queued' WHERE bot_id=? AND message_id=? AND state='running'").run(job.botId, job.messageId); }
-  complete(job: ForwardJob, contents: ForwardContent[]): void {
+  complete(job: ForwardJob, contents: ForwardContent[], resolved?: () => void): void {
     this.deps.transaction(() => {
       const current = this.get(job.botId, job.messageId);
       if (!current) return;
@@ -62,6 +62,7 @@ export class ConsoleIncomingForwards {
       if (!isForwardSnapshot(snapshot)) throw new Error('Invalid resolved forward content.');
       if (!this.db.prepare("UPDATE console_incoming_forwards SET state='complete',event_cipher=NULL,snapshot_cipher=? WHERE bot_id=? AND message_id=? AND state='running'")
         .run(this.deps.encrypt(snapshot), job.botId, job.messageId).changes) return;
+      resolved?.();
       if (this.deps.updated(job.botId, snapshot)) this.db.prepare('UPDATE console_incoming_forwards SET published=1 WHERE bot_id=? AND message_id=?').run(job.botId, job.messageId);
     });
     this.notify();

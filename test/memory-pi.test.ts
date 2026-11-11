@@ -7,9 +7,9 @@ import { join } from 'node:path';
 import { SessionManager } from '@earendil-works/pi-coding-agent';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import { PiRunner, type PiRunnerOptions } from '../src/pi.js';
-import { boundMemoryToolResult, injectRecalledMemory } from '../src/pi-memory.js';
+import { boundMemoryToolResult, injectRecalledMemory, memoryOrganizerInput, memoryOrganizerResult } from '../src/pi-memory.js';
 import { CHECKPOINT_HEADINGS, validateChatCheckpoint } from '../src/pi-compaction.js';
-import type { MemoryBatch, MemoryProposal } from '../src/memory-contract.js';
+import type { MemoryBatch, MemoryItem, MemoryProposal } from '../src/memory-contract.js';
 import type { PendingBatch, RunObservation } from '../src/types.js';
 import { decodeModelCall, respond, type ModelCall } from './fixtures/pi-e2e.js';
 
@@ -22,6 +22,22 @@ const memoryBatch: MemoryBatch = { jobId: 'example-job', fromSeq: 0, throughSeq:
 const checkpoint = CHECKPOINT_HEADINGS.map(heading => `## ${heading}\nNone.`).join('\n\n');
 const textOf = (message: any) => typeof message.content === 'string' ? message.content
   : (message.content ?? []).filter((part: any) => ['text','input_text'].includes(part.type)).map((part: any) => part.text).join('');
+
+test('consolidation input and search retain recalled evidence state while hiding internal source IDs',()=>{
+  const memory:MemoryItem={id:'synthetic-memory',scope:'person',subjectUserId:'101',kind:'preference',topic:'drink/preference',content:'Prefers tea.',
+    occurredAt:null,validFrom:null,validTo:null,status:'active',revision:1,createdAt:1,updatedAt:1,
+    sources:[{sourceId:'in:synthetic-recalled-source',quote:'I prefer tea.',recalled:true,recalledAt:124000},
+      {sourceId:'in:synthetic-active-source',quote:'Another statement.',recalled:false}]};
+  const expected=[{quote:'I prefer tea.',recalled:true,recalledAt:124000},{quote:'Another statement.',recalled:false}];
+  const input=memoryOrganizerInput({...memoryBatch,memories:[memory]}) as {memories:Array<{evidence:unknown[]}>};
+  assert.deepEqual(input.memories[0]!.evidence,expected);
+  const array=memoryOrganizerResult('search',[memory]) as Array<{evidence:unknown[]}>;
+  assert.deepEqual(array[0]!.evidence,expected);
+  const object=memoryOrganizerResult('search',{items:[memory]}) as {items:Array<{evidence:unknown[]}>};
+  assert.deepEqual(object.items[0]!.evidence,expected);
+  for(const value of [input,array,object])assert.doesNotMatch(JSON.stringify(value),/sourceId|synthetic-recalled-source|synthetic-active-source/);
+  assert.equal(memory.sources[0]!.sourceId,'in:synthetic-recalled-source');
+});
 
 async function fixture(handler: (call: ModelCall, response: ServerResponse, count: number) => void | Promise<void>, overrides: Partial<PiRunnerOptions> = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'memory-pi-')); const home = join(dir, 'pi'); const workspace = join(dir, 'workspace');

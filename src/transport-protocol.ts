@@ -1,4 +1,4 @@
-import type { MessageSegment } from './types.js';
+import type { MessageSegment, OutgoingDeliveryMetadata } from './types.js';
 import { INCOMING_IMAGE_MAX_COUNT } from './incoming-image-contract.js';
 import { FORWARD_LIMITS } from './forward-contract.js';
 
@@ -12,10 +12,10 @@ export type NapcatOutgoingMessage =
   | { kind: 'image'; file: string }
   | { kind: 'video'; file: string }
   | { kind: 'voice'; file: string }
-  | { kind: 'message'; segments: MessageSegment[] };
+  | { kind: 'message'; segments: MessageSegment[]; replyTo?:string };
 
 /** A delivery ID identifies one attempt permanently, including an unknown outcome. */
-export type NapcatSendRequest = NapcatOutgoingMessage & { deliveryId: string; deadline: number };
+export type NapcatSendRequest = NapcatOutgoingMessage & { deliveryId: string; deadline: number; metadata?:OutgoingDeliveryMetadata };
 export type NapcatSendResult = { ok: true; messageId?: string }
   | { ok: false; code: string; deliveryStatus: 'failed' | 'unconfirmed' };
 export interface NapcatInboundDelivery { seq: number; event: unknown }

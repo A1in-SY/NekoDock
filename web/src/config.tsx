@@ -151,7 +151,7 @@ export function Configuration({
     opts: {
       min?: number;
       max?: number;
-      step?: number;
+      step?: number | 'any';
       readOnly?: boolean;
     } = {},
   ) => (
@@ -365,12 +365,25 @@ export function Configuration({
                 aria-readonly="true"
               />
             </div>
-            {bot.targetType === "group" &&
-              range(
+            {bot.targetType === "group" && <>
+              {select("普通群聊回复策略", "replyMode", [["random", "概率回复"], ["jev", "Jev 判断"]], "被 @ 时正常回复；此策略仅用于空闲时的普通群聊消息。", true)}
+              {draft.replyMode === "jev" ? <>
+                {field("Jev Base URL", "replyJudgeBaseUrl", "填写 API 根路径，例如 https://api.typesafe.ai/v1；程序追加 /systemone。", "url", true)}
+                {field("Jev Model", "replyJudgeModel", "与主聊天模型独立，填写该服务支持的准确模型 ID。")}
+                {secret("Jev API Key", "replyJudgeApiKey")}
+                {field("回复判断阈值", "replyJudgeThreshold", "模型分值达到阈值即触发；越高越安静。这不是随机回复概率。", "number", false, { min: 0, max: 1, step: "any" })}
+                {field("判断超时（秒）", "replyJudgeTimeout", "超时或请求失败时不主动回复；私聊和 @ 不受影响。", "number", false, { min: 0.001, max: 60, step: 0.001 })}
+                <div className="form-field full">
+                  <label htmlFor="f-replyJudgeInstructions">补充判断说明</label>
+                  <textarea id="f-replyJudgeInstructions" value={draft.replyJudgeInstructions} maxLength={16000} rows={4} onChange={event => patch("replyJudgeInstructions", event.target.value)} />
+                  <small className="field-hint">可填写机器人称呼、感兴趣的话题和参与聊天的偏好；独立于主会话人格，仅供 Jev 判断是否参与。</small>
+                </div>
+              </> : range(
                 "普通消息回复概率",
                 "replyProbability",
                 "被 @ 时正常回复；普通非表情包消息按此概率参与。",
               )}
+            </>}
           </div>
           <hr className="form-divider" />
           <h3 className="form-subtitle">NapCat 连接</h3>

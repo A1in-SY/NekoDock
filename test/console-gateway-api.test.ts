@@ -34,6 +34,9 @@ test('shared connection API protects credentials, revisions, references and work
   assert.equal(JSON.stringify(snapshot).includes('synthetic-upstream-token'),false);
   for(const suffix of ['config','napcat/events'])assert.equal((await app.inject({url:`/internal/workers/${copy.json().id}/${suffix}`,headers:internal})).statusCode,401);
   assert.equal((await app.inject({method:'POST',url:`/internal/workers/${copy.json().id}/napcat/send`,headers:internal,payload:{}})).statusCode,401);
+  for(const route of ['validate-quotes','recall'])assert.equal((await app.inject({method:'POST',url:`/internal/workers/${copy.json().id}/napcat/${route}`,headers:internal,payload:{}})).statusCode,401);
+  const unknown=await app.inject({method:'POST',url:`/internal/workers/${bot.id}/napcat/validate-quotes`,headers:internal,payload:{messageIds:['unobserved-history']}});
+  assert.equal(unknown.statusCode,200);assert.equal(unknown.json().code,'QUOTE_TARGET_UNKNOWN');
   assert.equal((await app.inject({method:'DELETE',url:`/api/napcat-connections/${connection.id}`,headers})).statusCode,400);
   const updated=await app.inject({method:'PUT',url:`/api/napcat-connections/${connection.id}`,headers,payload:{expectedRevision:1,name:'renamed'}});
   assert.equal(updated.statusCode,200,updated.body);assert.equal(updated.json().tokenConfigured,true);

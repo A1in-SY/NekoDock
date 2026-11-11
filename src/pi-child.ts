@@ -13,7 +13,10 @@ import { createNetworkClient } from './network.js';
 import { createMemoryTools, injectRecalledMemory } from './pi-memory.js';
 import { createChatCheckpoint } from './pi-compaction.js';
 import type { MemoryProposal, MemoryHistorySearch, MemorySearch } from './memory-contract.js';
-import { committedContext, prepareContextInput, modelContextMessages } from './pi-context.js';
+import { appendRecallEvents, committedContext, prepareContextInput, modelContextMessages, validChatRecallEvent } from './pi-context.js';
+import type { ChatRecallEvent } from './chat-context-contract.js';
+import type { ReplyToolReceipt } from './types.js';
+import { ReplyToolError } from './reply-contract.js';
 import { MODEL_IMAGE_OPTIONS } from './model-image.js';
 
 const send = (message: PiChildMessage) => {
@@ -22,8 +25,9 @@ const send = (message: PiChildMessage) => {
 let session: AgentSession | undefined;
 let started = false; let cancelled = false;
 const thinking=new ThinkingObserver(event=>send({type:'event',event}));
-const pending = new Map<string, { resolve(): void; reject(error: Error): void }>();
+const pending = new Map<string, { resolve(value:unknown): void; reject(error: Error): void }>();
 const pendingTasks=new Map<string,{resolve(value:unknown):void;reject(error:Error):void}>();
+const pendingRecalls=new Map<string,ChatRecallEvent>();
 process.on('message', (raw: PiParentMessage) => {
   if (raw.type === 'abort') {
     cancelled = true;
@@ -33,7 +37,14 @@ process.on('message', (raw: PiParentMessage) => {
     pendingTasks.clear();
   } else if (raw.type === 'send-result') {
     const request = pending.get(raw.id); pending.delete(raw.id);
-    if (raw.accepted) request?.resolve(); else request?.reject(new Error('Reply request unavailable. Do not resend automatically.'));
+    if (raw.accepted) request?.resolve(raw.receipt??{accepted:true});
+    else request?.reject(raw.error?new ReplyToolError(raw.error.code,raw.error.message,raw.error.messageIndex):new Error('Reply request unavailable. Do not resend automatically.'));
+  } else if(raw.type==='recall-result') {
+    const request=pending.get(raw.id);pending.delete(raw.id);
+    if(raw.ok)request?.resolve(raw.result);
+    else request?.reject(raw.error?new ReplyToolError(raw.error.code,raw.error.message,raw.error.messageIndex):new Error('Recall request unavailable.'));
+  } else if(raw.type==='recall-event') {
+    if(validChatRecallEvent(raw.event))pendingRecalls.set(raw.event.eventId,raw.event);
   } else if(raw.type==='task-result'||raw.type==='memory-result') {
     const request=pendingTasks.get(raw.id);pendingTasks.delete(raw.id);
     if(raw.ok)request?.resolve(raw.result);else request?.reject(new Error(raw.error??'Task operation unavailable.'));
@@ -94,17 +105,27 @@ async function execute(start: PiStart): Promise<void> {
   const manager = start.operation === 'memory' ? SessionManager.inMemory(config.workspace)
     : start.session ? SessionManager.open(start.session, sessions, config.workspace) : SessionManager.create(config.workspace, sessions);
   terminateUnfinishedTools(manager);
+  for(const event of start.context?.submission.recalls??[])pendingRecalls.set(event.eventId,event);
+  const appendPendingRecalls=()=>{
+    if(!pendingRecalls.size)return false;
+    const appended=appendRecallEvents(manager,[...pendingRecalls.values()]);pendingRecalls.clear();
+    if(appended.length)session?.refreshContext();
+    return appended.length>0;
+  };
   let contextReported = false;
   const reportContext = (required = false) => {
     if (!start.context || contextReported) return;
     const receipt = committedContext(manager, start.context.submission.batchId);
-    if (receipt) { contextReported = true; send({type:'context-committed',receipt}); }
+    const complete=receipt&&(start.context.submission.recalls??[]).every(event=>receipt.recallEventIds?.includes(event.eventId));
+    if (receipt&&complete) { contextReported = true; send({type:'context-committed',receipt}); }
     else if(required)throw new Error('Input context was not persisted before execution.');
   };
   if (start.context) {
     const existing = committedContext(manager, start.context.submission.batchId);
     if (existing) {
-      send({type:'session',path:existing.session}); send({type:'context-committed',receipt:existing});
+      appendPendingRecalls();
+      const complete=committedContext(manager,start.context.submission.batchId)!;
+      send({type:'session',path:complete.session}); send({type:'context-committed',receipt:complete});
       if (start.operation === 'append') return;
       throw Object.assign(new Error('Generation is not replayed after its input was committed.'), {code:'PI_CONTEXT_ALREADY_COMMITTED'});
     }
@@ -114,6 +135,7 @@ async function execute(start: PiStart): Promise<void> {
   }
   if (start.operation === 'append') {
     manager.appendMessage({ role: 'user', content: [{ type: 'text', text: start.prompt }, ...start.images], timestamp: Date.now() });
+    appendPendingRecalls();
     const path = manager.getSessionFile(); if (!path) throw new Error('Missing persisted session.');
     await access(path); send({ type: 'session', path }); reportContext(true); return;
   }
@@ -164,14 +186,24 @@ async function execute(start: PiStart): Promise<void> {
     : createPiTools(config, async (request, signal, toolCallId) => {
     if (cancelled || signal?.aborted) throw new Error('Reply request unavailable.');
     const id = randomUUID();
-    await new Promise<void>((resolveSend, reject) => {
-      pending.set(id, { resolve: resolveSend, reject });
+    return await new Promise<ReplyToolReceipt>((resolveSend, reject) => {
+      pending.set(id, { resolve: value=>resolveSend(value as ReplyToolReceipt), reject });
       send({ type: 'send', id, request, ...(toolCallId ? {toolCallId} : {}) });
       // Acceptance may already be committing in the parent. Wait for its result;
       // process cancellation is bounded by the parent's process-group timeout.
     });
   }, { ...(start.taskManagement?{manage:(request,operationId)=>taskRpc({type:'task-manage',request,operationId})}:{}),
-    ...(start.taskState?{saveState:(data,expectedVersion)=>taskRpc({type:'task-state',data,expectedVersion})}:{}) },{searchFetch:searchNetwork.fetch});
+    ...(start.taskState?{saveState:(data,expectedVersion)=>taskRpc({type:'task-state',data,expectedVersion})}:{}) },{searchFetch:searchNetwork.fetch},start.recallEnabled?{
+      recall:async(request,signal,toolCallId)=>{
+        if(cancelled||signal?.aborted)throw new Error('Recall request unavailable.');
+        const id=randomUUID();const result=await new Promise<unknown>((resolve,reject)=>{
+          pending.set(id,{resolve,reject});send({type:'recall',id,request,...(toolCallId?{toolCallId}:{})});
+        });
+        const events=(result as {events?:unknown}|null)?.events;
+        if(Array.isArray(events))for(const event of events)if(validChatRecallEvent(event))pendingRecalls.set(event.eventId,event);
+        return result;
+      },
+    }:undefined);
   if (start.operation === 'run' && start.memoryRead) tools.push(...createMemoryTools(memoryReads));
   let sessionReported = false; let settled = false; let failure: string | undefined; let memoryCalls = 0; let modelFailure = false;
   const settings = SettingsManager.inMemory({
@@ -193,10 +225,11 @@ async function execute(start: PiStart): Promise<void> {
         queueMicrotask(() => { void session?.abort(); });
         return { cancel: true };
       }
-    }, start.operation === 'run' && (start.context || start.recalledMemory !== undefined) ? event => {
+    }, start.operation === 'run' ? event => {
+      const appended=appendPendingRecalls();
       try { reportContext(true); }
       catch { failure ??= 'Input context persistence failed.'; cancelled = true; void session?.abort(); return {messages:[]}; }
-      const messages = (event as {messages:import('@earendil-works/pi-agent-core').AgentMessage[]}).messages;
+      const messages = appended&&session?session.messages:(event as {messages:import('@earendil-works/pi-agent-core').AgentMessage[]}).messages;
       const recalled = start.recalledMemory === undefined ? messages : injectRecalledMemory(messages,
         start.prompt, start.recalledMemory, config, start.system, tools.map(tool => ({name:tool.name,description:tool.description,parameters:tool.parameters}))).messages;
       return { messages: modelContextMessages(recalled) };
@@ -323,6 +356,7 @@ async function execute(start: PiStart): Promise<void> {
     // cancels overflow/length recovery before any summarization or retry.
     await session.prompt(start.prompt, { images: start.images, expandPromptTemplates: false, source: 'rpc' });
     await session.waitForIdle();
+    appendPendingRecalls();
     if (!settled) throw new Error('Agent did not settle.');
     if (failure || cancelled) throw Object.assign(new Error(failure || 'Agent cancelled.'), modelFailure && !cancelled ? {modelFailure:true} : {});
   }

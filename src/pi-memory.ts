@@ -24,7 +24,9 @@ function organizerSource(source: MemorySource) {
 }
 function organizerItem(item: MemoryItem) {
   const { sources, ...content } = item;
-  return { ...content, evidence: sources.map(source => ({ quote: source.quote })) };
+  return { ...content, evidence: sources.map(source => ({ quote: source.quote,
+    ...(source.recalled===undefined?{}:{recalled:source.recalled}),
+    ...(source.recalledAt===undefined?{}:{recalledAt:source.recalledAt}) })) };
 }
 export function memoryOrganizerInput(input: MemoryBatch): unknown {
   return { ...input, sources: input.sources.map(organizerSource), memories: input.memories.map(organizerItem) };

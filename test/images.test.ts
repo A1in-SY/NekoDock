@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test, type TestContext } from 'node:test';
-import { prepareImageReply, prepareIncomingImages } from '../src/images.js';
+import { cacheImage, prepareImageReply, prepareIncomingImages } from '../src/images.js';
 import type { StoredMessage } from '../src/types.js';
 
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+X2ioAAAAASUVORK5CYII=', 'base64');
@@ -60,6 +60,22 @@ test('incoming HTTP and base64 images share content-addressed readable cache fil
   assert.match(result.files[0]!, /\.qq-images\/[a-f\d]{64}\.png$/);
   assert.deepEqual(await readFile(result.files[0]!), png);
   assert.deepEqual(await readdir(join(options.workspace, '.qq-images')), [result.files[0]!.split('/').at(-1)]);
+});
+
+test('content-addressed cache reuse preserves the file timestamp and repairs corrupted or missing files', async t => {
+  const {options} = await fixture(t), signal = controller().signal;
+  const path = await cacheImage(png, options, signal);
+  const previous = new Date('2025-01-01T00:00:00Z');
+  await utimes(path, previous, previous);
+  const reused = await Promise.all([cacheImage(png, options, signal), cacheImage(png, options, signal)]);
+  assert.deepEqual(reused, [path, path]);
+  assert.equal((await stat(path)).mtimeMs, previous.getTime());
+  await writeFile(path, Buffer.alloc(png.length));
+  assert.equal(await cacheImage(png, options, signal), path);
+  assert.deepEqual(await readFile(path), png);
+  await rm(path);
+  assert.equal(await cacheImage(png, options, signal), path);
+  assert.deepEqual(await readFile(path), png);
 });
 
 test('incoming failures are isolated, sanitized and preserve successful images', async t => {

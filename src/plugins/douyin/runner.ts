@@ -8,6 +8,7 @@ import { DouyinClient, boundedBytes, createDouyinState, mediaResponse, videoCand
 import { validateDouyinConfig } from './config.js';
 import { douyinError, object, validateDouyinContent } from './content.js';
 import { normalizeDouyinResource } from './recognize.js';
+import { prepareDouyinCard } from './presentation.js';
 
 export { createDouyinState } from './api.js';
 export interface DouyinTools {
@@ -82,6 +83,13 @@ export async function executeDouyinJob(job: PluginRunnerJob, root: string, signa
   const client = new DouyinClient(fetcher,job.botId,job.networkProxy,tools.state,
     tools.fetch ? () => ({ fetch: fetcher, close: async () => {} }) : () => createNetworkClient(job.networkProxy,silent,'plugins'));
   try {
+    if (job.operation === 'prepare' && job.presentation?.mode === 'card') {
+      let info;
+      try { info = await client.info(resource,combined); }
+      catch { combined.throwIfAborted(); }
+      const prepared = await prepareDouyinCard({ ...job, resource, config },directory,info,fetcher,execute,env,combined);
+      await network.close(); return { ...prepared, cleanup };
+    }
     const info = await client.info(resource,combined);
     if (job.operation === 'resolve') { await network.close(); return { content: structuredClone(info.content), cleanup }; }
     if (job.operation === 'prepare') {

@@ -22,7 +22,7 @@ export interface ScheduledRun {
   status: TaskRunStatus; deliveryStatus: TaskDeliveryStatus; acceptedMessages: number; acknowledgedMessages: number;
   error?: string; manual: boolean; conversationId: string;
 }
-export interface TaskChatMessage { id: string; senderId: string; senderName: string; time: number; text: string; replyTo: string | null; role: 'user' | 'assistant'; assets?: import('./chat-context-contract.js').ChatAsset[]; contents?: unknown[]; }
+export interface TaskChatMessage { id: string; senderId: string; senderName: string; time: number; text: string; replyTo: string | null; role: 'user' | 'assistant'; assets?: import('./chat-context-contract.js').ChatAsset[]; contents?: unknown[]; recalled?:boolean; recalledAt?:number; }
 export interface TaskChatCoverage { from: number; to: number; availableCount: number; includedCount: number; truncated: boolean; coverage: 'complete' | 'latest_messages_in_range' }
 export interface ScheduledInput {
   kind: 'scheduled_task'; task: { id: string; name: string; instructions: string };
