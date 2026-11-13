@@ -228,10 +228,10 @@ function createRuntime(config:Config, signal:AbortSignal, identity?:ManagedIdent
       store.recorder.append(type,safe,eventId,{...(run?{runId:run.id,conversationId:run.conversationId}:{}),time});
     },logger,notify:()=>processor?.notify(),
   }):undefined;
-  const taskTools:TaskTools|undefined=identity?{manage:async(request,operationId)=>{
+  const taskTools:TaskTools|undefined=identity?{manage:async(request,operationId,signal)=>{
     const actorId=store.senderForMessage(request.sourceMessageId);
     if(!actorId)throw new Error('任务请求来源无效');
-    const result=await workerRequest(identity,'tasks/manage',{operationId,request,actorId},controller.signal);
+    const result=await workerRequest(identity,'tasks/manage',{operationId,request,actorId},signal?AbortSignal.any([controller.signal,signal]):controller.signal);
     processor.notify();return result;
   }}:undefined;
   plugins = identity ? new PluginCoordinator({ identity, store, logger, notify: () => processor?.notify(),
@@ -292,6 +292,7 @@ function createRuntime(config:Config, signal:AbortSignal, identity?:ManagedIdent
     get upstreamConnected(){return napcat instanceof ConsoleTransport?napcat.upstreamConnected:napcat.connected;},
     get qqOnline(){return napcat instanceof ConsoleTransport?napcat.qqOnline:napcat.connected;},
     requestDrain:()=>{processor.requestDrain();void memory.close();},done,
+    cancelRun:runId=>processor.cancelRun(runId),
     probeNetwork:probeSignal=>probeNetwork(diagnostics,config.agentBaseUrl,AbortSignal.any([controller.signal,probeSignal])),
     stop:(beforeStoreClose)=>stopped??=(async()=>{
       clearInterval(scheduleTimer);clearInterval(embeddingTimer);controller.abort();await napcat.stop();

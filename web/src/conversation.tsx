@@ -6,6 +6,8 @@ import type {
   PublicBot,
 } from "../../src/console/contracts";
 import { api, errorText } from "./api";
+import { cancellationRequestId, replyCancellationState } from './run-control-state';
+import type { RunCancellation } from '../../src/run-control-contract';
 import { conversationActivity, conversationDisplay, mergeConversationUpdate, mergeLatestConversation, mergeOlderConversation } from "./conversation-state";
 import { compact, date, ErrorBox, fmt, Icon } from "./ui";
 import { deliveryLabels, runLabels } from "./tasks-state";
@@ -28,11 +30,37 @@ export function Conversation({ bot }: { bot: PublicBot }) {
   const [error, setError] = useState("");
   const [streamError, setStreamError] = useState("");
   const [reload, setReload] = useState(0);
+  const [cancelRequest,setCancelRequest]=useState<{runId:string;time:number}|null>(null);
+  const [cancelError,setCancelError]=useState('');
+  const [cancelSending,setCancelSending]=useState(false);
+  const [now,setNow]=useState(Date.now());
+  const cancelFlight=useRef(false);
+  const cancelKey=useRef<{runId:string;requestId:string}|null>(null);
   const request = useRef(0);
   const current = useRef<ConversationView | null>(null);
   const olderRequest = useRef<AbortController | null>(null);
   const scroll = useRef<HTMLDivElement>(null);
   const atBottom = useRef(true);
+  const cancellation=replyCancellationState(bot,cancelRequest,now);
+  useEffect(()=>{
+    if(!cancellation.waiting)return;
+    const timer=setInterval(()=>setNow(Date.now()),1000);
+    return ()=>clearInterval(timer);
+  },[cancellation.waiting]);
+  useEffect(()=>{setCancelRequest(null);setCancelError('');cancelKey.current=null;},[bot.id]);
+  const cancelReply=async()=>{
+    const runId=cancellation.runId;
+    if(!runId||cancellation.disabled||cancelFlight.current)return;
+    cancelFlight.current=true;setCancelSending(true);setCancelError('');
+    if(cancelKey.current?.runId!==runId)cancelKey.current={runId,requestId:cancellationRequestId()};
+    try {
+      const result=await api<RunCancellation>(`/api/bots/${encodeURIComponent(bot.id)}/runs/${encodeURIComponent(runId)}/cancel`,{
+        method:'POST',body:JSON.stringify({requestId:cancelKey.current.requestId}),signal:AbortSignal.timeout(5000),
+      });
+      if(result.status==='requested'||result.status==='received')setCancelRequest({runId,time:result.createdAt});
+    }catch(error){setCancelError(errorText(error));}
+    finally{cancelFlight.current=false;setCancelSending(false);setNow(Date.now());}
+  };
   useEffect(() => {
     const generation = ++request.current;
     const controller = new AbortController();
@@ -176,6 +204,9 @@ export function Conversation({ bot }: { bot: PublicBot }) {
           </span>
         </span>
         <div className="conversation-actions">
+          <button className="btn" disabled={cancelSending||cancellation.disabled} title={cancellation.title} onClick={()=>void cancelReply()}>
+            <Icon name="square" />{cancelSending||cancellation.waiting?'正在停止…':'停止当前回复'}
+          </button>
           <details className="token-popover usage-popover">
             <summary className="usage-trigger" aria-label="Token 用量">
               <Icon name="database" />
@@ -265,6 +296,8 @@ export function Conversation({ bot }: { bot: PublicBot }) {
           </details>
         </div>
       </header>
+      {cancellation.message&&<p className="reply-cancel-status" role="status">{cancellation.message}</p>}
+      {cancelError&&<ErrorBox error={cancelError} />}
       {(error || streamError) && <ErrorBox error={error || streamError} retry={() => setReload((value) => value + 1)} />}
       <div
         className="conversation-scroll"
@@ -343,7 +376,7 @@ function EventItem({ event, botId }: { event: ConsoleEvent; botId: string }) {
           <Icon name="chevron" className="chevron" />
           <Icon name="spark" />
           <span>{p.status === "in_progress" ? "思考中" : "思考过程"}</span>
-          {p.status === "failed" && <time>已结束</time>}
+          {(p.status === "failed"||p.status==='cancelled') && <time>{p.status==='cancelled'?'已停止':'已结束'}</time>}
         </summary>
         <pre>{text(p.text)}{p.truncated === true ? "\n\n（内容已截断）" : ""}</pre>
       </details>
@@ -376,6 +409,7 @@ function EventItem({ event, botId }: { event: ConsoleEvent; botId: string }) {
         ? <PluginMediaAttachment key={value.id} asset={value} botId={botId} />
         : <span key={index}>{text(value.title)}</span>; })}
     </RecalledBody></div></article>;
+  if(event.type==='run.cancelled')return <div className="conversation-tool" role="status"><summary><Icon name="square" /><span>已由管理员停止本轮回复</span><time>{date(event.time)}</time></summary></div>;
   if (event.type === "run.failed" || event.type === "compact.failed") {
     const detail = text(p.error) || (event.type === "compact.failed"
       ? p.aborted ? "上下文压缩已中止，可在实例日志查看详细信息。" : "上下文压缩未完成，可在实例日志查看详细信息。"
@@ -396,7 +430,7 @@ function EventItem({ event, botId }: { event: ConsoleEvent; botId: string }) {
       <summary>
         <Icon name="chevron" className="chevron" />
         <Icon
-          name={running ? "clock" : p.status === "failed" ? "info" : "check"}
+          name={running ? "clock" : p.status === "failed" ? "info" : p.status==='cancelled'?'square':"check"}
         />
         <span className="mono">{tool}</span>
         <span className="tool-description">{description}</span>
@@ -404,7 +438,7 @@ function EventItem({ event, botId }: { event: ConsoleEvent; botId: string }) {
           {running
             ? "执行中"
             : duration == null
-              ? text(p.status) === "failed"
+              ? text(p.status)==='cancelled'?'已停止':text(p.status) === "failed"
                 ? "失败"
                 : "完成"
               : duration < 1000

@@ -72,7 +72,7 @@ export function conversationDisplay(view: ConversationView | null): ConsoleEvent
     index: number;
     parts: Map<string, ConsoleEvent>;
   }>();
-  const terminals = new Map<string, "completed" | "failed">();
+  const terminals = new Map<string, "completed" | "failed" | "cancelled">();
   for (const item of view?.items ?? []) {
     if (item.type === "message.content.updated") {
       if (typeof item.payload.messageId === "string" && Array.isArray(item.payload.contents))
@@ -108,8 +108,8 @@ export function conversationDisplay(view: ConversationView | null): ConsoleEvent
       }
       continue;
     }
-    if (item.type === "run.completed" || item.type === "run.failed")
-      terminals.set(item.runId ?? "", item.type === "run.failed" ? "failed" : "completed");
+    if (item.type === "run.completed" || item.type === "run.failed" || item.type==='run.cancelled')
+      terminals.set(item.runId ?? "", item.type === 'run.cancelled'?'cancelled':item.type === "run.failed" ? "failed" : "completed");
     if (item.type === "thinking.updated") {
       const key = item.runId ?? "thinking:" + (item.itemId ?? item.seq);
       let group = thinking.get(key);
@@ -121,7 +121,7 @@ export function conversationDisplay(view: ConversationView | null): ConsoleEvent
       group.parts.set(item.itemId ?? "thinking", item);
     } else if (
       item.type === "message.received" || item.type === "incoming" ||
-      item.type === "reply.accepted" || item.type === "plugin.message.sent" || item.type === "run.failed" ||
+      item.type === "reply.accepted" || item.type === "plugin.message.sent" || item.type === "run.failed" || item.type==='run.cancelled' ||
       item.type === "compact.failed"
     ) {
       if (item.type === "reply.accepted" && typeof item.payload.requestId === "string")
@@ -153,6 +153,10 @@ export function conversationDisplay(view: ConversationView | null): ConsoleEvent
         result.push(item);
       }
     }
+  }
+  for(const [index,item] of result.entries()) {
+    if(item.type==='tool.started'&&terminals.get(item.runId??'')==='cancelled')
+      result[index]={...item,type:'tool.completed',payload:{...item.payload,status:'cancelled'}};
   }
   for (const group of thinking.values()) {
     const first = result[group.index]!;
@@ -209,7 +213,7 @@ export function conversationActivity(view: ConversationView | null, processing: 
       }
     }
     if (item.type === "run.started") { run = { id: item.runId, time: item.time }; compact = null; settled = false; }
-    if ((item.type === "run.completed" || item.type === "run.failed") && (!run?.id || !item.runId || item.runId === run.id)) { run = null; compact = null; settled = true; }
+    if ((item.type === "run.completed" || item.type === "run.failed" || item.type==='run.cancelled') && (!run?.id || !item.runId || item.runId === run.id)) { run = null; compact = null; settled = true; }
     if (item.type === "compact.started") { compact = { id: item.runId, time: item.time }; settled = false; }
     if ((item.type === "compact.completed" || item.type === "compact.failed") && (!compact?.id || !item.runId || item.runId === compact.id)) { compact = null; settled = true; }
   }

@@ -13,6 +13,7 @@ import { FORWARD_LIMITS } from '../forward-contract.js';
 import { resolveForwardContents } from '../forward-resolver.js';
 import type { ForwardJob } from './incoming-forwards.js';
 import { ForwardInspectionCollector } from '../forward-inspection.js';
+import { runIdentity } from '../run-control-contract.js';
 
 export interface NapcatGatewayOptions {
   db: ConsoleDatabase; logger: Logger;
@@ -386,6 +387,10 @@ export class NapcatGateway {
       if (isNapcatSendResult(claimed.record.result)) return claimed.record.result;
       return failed('NAPCAT_SEND_UNCONFIRMED', 'unconfirmed');
     }
+    if(metadata?.runId&&this.db.runControls.isCancelled(botId,metadata.runId)) {
+      const result=failed('RUN_CANCELLED');
+      this.db.finishNapcatDelivery(botId,deliveryId,'failed',result);return result;
+    }
     const bytes = Buffer.byteLength(serialized);
     if (this.sending.size >= 128 || bytes + [...this.deliveryBytes.values()].reduce((total, size) => total + size, 0) > 64 * 1024 * 1024) {
       const result = failed('NAPCAT_SEND_QUEUE_FULL');
@@ -409,6 +414,7 @@ export class NapcatGateway {
     let acquired = false;
     try {
       await this.acquire(botId, deadline); acquired = true;
+      if(metadata?.runId&&this.db.runControls.isCancelled(botId,metadata.runId))return failed('RUN_CANCELLED');
       if(guard&&!guard())return failed('PLUGIN_NOTIFICATION_CANCELLED');
       const bot = this.db.getBot(botId);
       if (!bot || this.db.getRuntime(botId).state === 'stopped') return failed('NAPCAT_INSTANCE_STOPPED');
@@ -548,7 +554,8 @@ function validateSend(input: unknown, imageMaxBytes: number, voiceMaxBytes: numb
   const fields = kind === 'text' ? ['text', 'replyTo'] : kind === 'video' || kind === 'image' || kind === 'voice' ? ['file'] : kind === 'message' ? ['segments','replyTo'] : null;
   if (!fields || Object.keys(value).some(key => !['deliveryId', 'deadline', 'kind','metadata', ...fields].includes(key))) return null;
   if(value.metadata!==undefined){const meta=object(value.metadata);
-    if(!meta||Object.keys(meta).some(key=>!['messageRef','conversationId','origin','logicalMessageIndex','partIndex'].includes(key))||meta.origin!=='model'
+    if(!meta||Object.keys(meta).some(key=>!['messageRef','conversationId','origin','logicalMessageIndex','partIndex','runId'].includes(key))||meta.origin!=='model'
+      ||meta.runId!==undefined&&!runIdentity(meta.runId)
       ||!id(meta.messageRef)||!id(meta.conversationId)||!Number.isSafeInteger(meta.logicalMessageIndex)||(meta.logicalMessageIndex as number)<0
       ||!Number.isSafeInteger(meta.partIndex)||(meta.partIndex as number)<0)return null;
   }

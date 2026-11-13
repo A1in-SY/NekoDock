@@ -45,9 +45,18 @@ export interface PendingBatch {
 }
 
 export interface ReplyToolRequest { messages: OutputMessage[] }
-export interface ReplyToolReceipt { accepted: true; messages?: Array<{ messageRef: string; status: 'queued' }> }
+export type ReplyDeliveryStatus = 'sent' | 'pending' | 'failed' | 'unconfirmed' | 'partial' | 'cancelled';
+export interface ReplyDeliveryCounts {
+  total: number; sent: number; pending: number; failed: number; unconfirmed: number; cancelled: number;
+}
+export interface ReplyMessageReceipt {
+  messageRef: string; status: ReplyDeliveryStatus; parts: ReplyDeliveryCounts;
+  errors?: Array<{ partIndex: number; code: string; retcode?: number }>;
+}
+export interface ReplyToolReceipt { accepted: true; messages?: ReplyMessageReceipt[]; notice?: string }
 export interface OutgoingDeliveryMetadata {
   messageRef: string; conversationId: string; origin: 'model'; logicalMessageIndex: number; partIndex: number;
+  runId?: string;
 }
 export interface RecallPartResult {
   messageId: string; partIndex: number; status: 'recalled' | 'already_recalled' | 'failed' | 'unconfirmed'; code?: string;

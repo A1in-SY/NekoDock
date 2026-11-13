@@ -10,6 +10,10 @@ test('Pi 长任务中途回复、多次工具调用、final 不重复发送，�
     const id = call.batch.at(-1)?.messageId;
     if (call.results.length) {
       assertAccepted(call);
+      const toolResult = call.results.at(-1)!;
+      const receipt = JSON.parse(String(toolResult.output ?? toolResult.content));
+      const expected = id === 'failure-image' ? ['failed','sent'] : [id === 'failure-napcat' ? 'failed' : id === 'failure-ack' ? 'unconfirmed' : 'sent'];
+      assert.deepEqual(receipt.messages.map((message: {status:string}) => message.status), expected);
       if (id === 'failure-model') { response.writeHead(503, { 'content-type': 'application/json' }); response.end(JSON.stringify({ error: { message: 'fixture provider failed', type: 'server_error' } })); return; }
       if (id === 'task' && call.results.length === 1) {
         await result.promise; sendReply(call, response, [{ type: 'message', segments: [{ type: 'at', userId: '501' }, { type: 'text', text: ' 第一个方案更合适，比较结果已经确认。' }] }]); return;
@@ -55,7 +59,7 @@ test('Pi 长任务中途回复、多次工具调用、final 不重复发送，�
   for (const failure of ['model', 'image', 'napcat', 'ack']) {
     const before = f.outgoing.length; const failureId = `failure-${failure}`;
     f.send(failureId);
-    await f.waitFor(() => f.calls.some(call => call.batch.at(-1)?.messageId === failureId && call.results.length > 0), '真实 Pi 应收到 accepted=true，而不是投递状态');
+    await f.waitFor(() => f.calls.some(call => call.batch.at(-1)?.messageId === failureId && call.results.length > 0), '真实 Pi 应收到 accepted=true 和准确的逐条投递状态');
     cursor++; await f.waitFor(() => f.complete(cursor), '失败批次应结束并推进游标');
     const expected = failure === 'model' ? 2 : 1;
     assert.equal(f.outgoing.length, before + expected, '模型失败额外发送一次提示；发送及媒体准备失败保持原有行为');

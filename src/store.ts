@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { isMp3Snapshot } from './audio.js';
 import { isSegmentMessage } from './messages.js';
-import type { BridgeCommand, CommandResult, IncomingMessage, OutputMessage, PendingBatch, PendingCommand, RecallToolReceipt, ReplyPart, ReplyRequestRecord, StoredMessage, Target } from './types.js';
+import type { BridgeCommand, CommandResult, IncomingMessage, OutputMessage, PendingBatch, PendingCommand, RecallToolReceipt, ReplyMessageReceipt, ReplyPart, ReplyRequestRecord, ReplyToolReceipt, StoredMessage, Target } from './types.js';
 import type { TaskChatMessage } from './scheduled-contract.js';
 import type { CachedIncomingImage } from './incoming-image-contract.js';
 import { ChatStore } from './chat-store.js';
@@ -12,6 +12,7 @@ import type { ChatAsset, ChatContextMessage, ChatRecallEvent, ContextCommit, Con
 import type { ForwardSnapshot } from './forward-contract.js';
 import type { ReplyDecisionCandidate, ReplyDecisionOutcome } from './reply-decision.js';
 import { ReplyLedger } from './reply-ledger.js';
+import { replyMessageReceipt, replyToolReceipt } from './reply-receipt.js';
 
 type StateRow = {
   target_type: string;
@@ -542,8 +543,11 @@ export class BridgeStore {
       const pending = this.requireBatch(throughSeq);
       for (let index = pending.nextReplyIndex; index < (pending.replies?.length ?? 0); index++) {
         const attempted = this.db.prepare('SELECT status FROM reply_attempts WHERE through_seq=? AND part_index=?').get(throughSeq, index);
-        this.recorder.append('delivery.failed', {
+        const part=this.replyLedger.part(throughSeq,index);
+        this.recorder.append(reason==='cancelled'&&!attempted?'delivery.cancelled':'delivery.failed', {
           deliveryId: `${throughSeq}:${index}`, partIndex: index, status: attempted ? 'unconfirmed' : 'skipped', reason,
+          ...(part?{requestId:part.requestId,messageRef:part.messageRef,logicalMessageIndex:part.logicalMessageIndex}:{}),
+          ...(reason==='cancelled'&&!attempted?{errorCode:'RUN_CANCELLED'}:{}),
         }, `delivery-result:${throughSeq}:${index}`);
       }
       this.recorder.append('batch.abandoned', { throughSeq, reason }, `batch:${throughSeq}:abandoned`, runId ? { runId } : {});
@@ -592,6 +596,25 @@ export class BridgeStore {
     return rows.map(toReplyRequest);
   }
 
+  replyReceipt(requestId: string): ReplyToolReceipt {
+    const refs = this.replyLedger.references(requestId);
+    if (!refs.length) throw new Error('Reply receipt request is not registered.');
+    return replyToolReceipt(refs.map(messageRef => {
+      const parts = this.replyLedger.parts(messageRef);
+      const errors: NonNullable<ReplyMessageReceipt['errors']> = [];
+      for (const part of parts) {
+        if (part.state !== 'failed' && part.state !== 'unconfirmed' && part.state !== 'cancelled') continue;
+        const row = this.db.prepare('SELECT payload_json FROM console_events WHERE event_key=?')
+          .get(`delivery-result:${part.throughSeq}:${part.partIndex}`) as { payload_json: string } | undefined;
+        const result = row ? JSON.parse(row.payload_json) as { errorCode?: unknown; retcode?: unknown } : undefined;
+        const code = result?.errorCode ?? part.cancelCode;
+        if (typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,99}$/.test(code)) errors.push({ partIndex: part.partIndex, code,
+          ...(typeof result?.retcode === 'number' && Number.isSafeInteger(result.retcode) ? { retcode: result.retcode } : {}) });
+      }
+      return replyMessageReceipt(messageRef, parts.map(part => part.state), errors);
+    }));
+  }
+
   appendReplyRequest(throughSeq: number, requestId: string, messages: OutputMessage[], parts: ReplyPart[], messageIndices?:number[], toolCallId?:string): ReplyRequestRecord {
     if (typeof requestId !== 'string' || !requestId.trim()) throw new Error('Reply request ID must not be empty.');
     if (!Array.isArray(messages) || messages.length === 0 || messages.some(message => !isOutputMessage(message))) {
@@ -637,17 +660,27 @@ export class BridgeStore {
   }
 
   skipCancelledReply(throughSeq: number, index: number): void {
-    this.transaction(()=>{
-      const batch=this.requireBatch(throughSeq),part=this.replyLedger.part(throughSeq,index);
-      if(!batch.replies||batch.nextReplyIndex!==index||!part||part.state!=='cancelled')throw new Error('Reply cancellation does not match the pending item.');
-      this.db.prepare('UPDATE pending_batch SET next_reply_index=? WHERE id=1').run(index+1);
-      const recalled=part.cancelCode==='QUOTE_TARGET_RECALLED';
-      this.recorder.append(recalled?'delivery.failed':'delivery.cancelled',{deliveryId:`${throughSeq}:${index}`,requestId:part.requestId,
-        messageRef:part.messageRef,logicalMessageIndex:part.logicalMessageIndex,partIndex:index,status:'skipped',errorCode:part.cancelCode??'REPLY_CANCELLED'},`delivery-result:${throughSeq}:${index}`);
-    });
+    this.transaction(()=>this.advanceCancelledReply(throughSeq,index));
+  }
+  private advanceCancelledReply(throughSeq:number,index:number):void {
+    const batch=this.requireBatch(throughSeq),part=this.replyLedger.part(throughSeq,index);
+    if(!batch.replies||batch.nextReplyIndex!==index||!part||part.state!=='cancelled')throw new Error('Reply cancellation does not match the pending item.');
+    this.db.prepare('UPDATE pending_batch SET next_reply_index=? WHERE id=1').run(index+1);
+    const recalled=part.cancelCode==='QUOTE_TARGET_RECALLED';
+    this.recorder.append(recalled?'delivery.failed':'delivery.cancelled',{deliveryId:`${throughSeq}:${index}`,requestId:part.requestId,
+      messageRef:part.messageRef,logicalMessageIndex:part.logicalMessageIndex,partIndex:index,status:'skipped',errorCode:part.cancelCode??'REPLY_CANCELLED'},`delivery-result:${throughSeq}:${index}`);
   }
 
   cancelReply(messageRef: string, code?:string): void { this.transaction(()=>this.replyLedger.cancel(messageRef,code)); }
+  /** Preparation was cancelled before any transport call, so its outcome is known. */
+  cancelPreparedReply(throughSeq:number,index:number):void {
+    this.transaction(()=>{
+      const part=this.replyLedger.part(throughSeq,index);
+      if(part)this.replyLedger.cancel(part.messageRef,'RUN_CANCELLED');
+      this.replyLedger.status(throughSeq,index,'cancelled');
+      this.advanceCancelledReply(throughSeq,index);
+    });
+  }
   beginReplyRecall(messageRef: string, operationId: string): RecallToolReceipt | 'started' | null {
     return this.transaction(()=>{
       this.replyLedger.parts(messageRef,this.recorder.conversationId);

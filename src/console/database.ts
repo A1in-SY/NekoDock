@@ -15,6 +15,7 @@ import { ConsolePlugins } from './plugins.js';
 import { ConsolePluginAssets } from './plugin-assets.js';
 import { ConsoleMessageState } from './message-state.js';
 import type { ChatRecallEvent } from '../chat-context-contract.js';
+import { RunControls } from './run-controls.js';
 
 export interface RuntimeRecord {
   state: RuntimeState; connected: boolean; processing: boolean; drained: boolean; lastHeartbeat: number | null; error?: string;
@@ -43,6 +44,7 @@ export class ConsoleDatabase {
   readonly plugins: ConsolePlugins;
   readonly pluginAssets: ConsolePluginAssets;
   readonly messageState: ConsoleMessageState;
+  readonly runControls: RunControls;
 
   constructor(path: string, keyPath: string) {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
@@ -142,6 +144,7 @@ export class ConsoleDatabase {
       if (!botColumns.some(column => column.name === 'connection_id')) this.db.exec('ALTER TABLE bots ADD COLUMN connection_id TEXT REFERENCES napcat_connections(id)');
       this.migrateNapcatConnections();
       this.messageState=new ConsoleMessageState(this.db,{requireBot:id=>this.requireBot(id),connection:id=>this.getNapcatConnection(id)});
+      this.runControls=new RunControls(this.db,{requireBot:id=>this.requireBot(id),change:(id,type)=>this.change(id,type)});
       this.memory = new ConsoleMemory(this.db, {requireBot:id=>this.requireBot(id),encrypt:value=>this.encrypt(value),decrypt:value=>this.decrypt(value),transaction:fn=>this.transaction(fn),change:(id,type)=>this.change(id,type)});
       this.tasks = new ScheduledTasks(this.db, {
         requireBot: id => this.requireBot(id), encrypt: value => this.encrypt(value), decrypt: value => this.decrypt(value),
@@ -470,7 +473,7 @@ export class ConsoleDatabase {
     for (const field of SECRET_FIELDS) delete publicConfig[field];
     for (const field of ['wsUrl', 'reconnectSeconds', 'actionTimeout'] as const) delete (publicConfig as Partial<BotSettings>)[field];
     const { drained: _drained, ...runtime } = this.getRuntime(id);
-    return { ...metadata, config: publicConfig, configuredSecrets, statistics: this.statistics(id, bot.createdAt), ...runtime };
+    return { ...metadata, config: publicConfig, configuredSecrets, statistics: this.statistics(id, bot.createdAt), ...runtime, runControl: this.runControls.view(id) };
   }
 
   listPublicBots(): PublicBot[] { return this.listBots().map(bot => this.getPublicBot(bot.id)!); }
@@ -512,10 +515,12 @@ export class ConsoleDatabase {
       const bot = this.requireBot(id);
       if (!Number.isSafeInteger(heartbeat.revision) || heartbeat.revision < 1 || heartbeat.revision > bot.desiredRevision
         || typeof heartbeat.connected !== 'boolean' || typeof heartbeat.processing !== 'boolean' || typeof heartbeat.drained !== 'boolean'
+        || (heartbeat.supportsRunCancellation !== undefined && typeof heartbeat.supportsRunCancellation !== 'boolean')
         || (heartbeat.error !== undefined && (typeof heartbeat.error !== 'string' || heartbeat.error.length > 16000))
         || !Array.isArray(heartbeat.events) || heartbeat.events.length > 1000) throw new Error('Worker heartbeat 无效');
       if (heartbeat.conversationId !== undefined && (typeof heartbeat.conversationId !== 'string' || heartbeat.conversationId.length > 256)) throw new Error('会话 ID 无效');
       for (const event of heartbeat.events) this.ingestEvent(bot, event);
+      this.runControls.capability(id, heartbeat.supportsRunCancellation === true);
       const error = heartbeat.error ? this.sanitize(heartbeat.error, bot).slice(0, 2000) : null;
       this.db.prepare(`UPDATE runtime SET state=CASE WHEN state='stopping' THEN 'stopping' ELSE 'running' END,connected=?,processing=?,drained=?,last_heartbeat=?,error=?,conversation_id=COALESCE(conversation_id,?) WHERE bot_id=?`)
         .run(heartbeat.connected ? 1 : 0, heartbeat.processing ? 1 : 0, heartbeat.drained ? 1 : 0, Date.now(), error, heartbeat.conversationId ?? null, id);
@@ -739,6 +744,7 @@ export class ConsoleDatabase {
       .run(bot.id, event.seq, event.type, event.time, conversationId, event.runId ?? null, event.itemId ?? null, JSON.stringify(sanitized));
     if (!result.changes) return;
     this.plugins.observe(bot.id,{...event,conversationId:conversationId??undefined});
+    this.runControls.observe(bot.id,{...event,conversationId:conversationId??undefined});
     if (event.type.startsWith('schedule.')) this.tasks.ingest(bot.id, {...event, payload: sanitized});
     if (conversationId) {
       this.db.prepare('INSERT OR IGNORE INTO conversations(bot_id,id,started_at) VALUES (?,?,?)').run(bot.id, conversationId, event.time);

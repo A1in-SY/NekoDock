@@ -63,6 +63,22 @@ function view(
   };
 }
 
+test('operator cancellation settles thinking and unfinished tools without displaying a model failure',()=>{
+  const current=view([]);
+  current.items=[
+    {seq:1,type:'run.started',runId:'run-a',time:1,payload:{}},
+    {seq:2,type:'thinking.updated',runId:'run-a',itemId:'thought',time:2,payload:{text:'partial visible text',status:'in_progress'}},
+    {seq:3,type:'tool.started',runId:'run-a',itemId:'tool',time:3,payload:{tool:'web_search'}},
+    {seq:4,type:'run.cancelled',runId:'run-a',time:4,payload:{reason:'operator'}},
+  ];
+  const display=conversationDisplay(current);
+  assert.equal(display.find(item=>item.type==='thinking.updated')!.payload.status,'cancelled');
+  assert.equal(display.find(item=>item.type==='tool.completed')!.payload.status,'cancelled');
+  assert.equal(display.filter(item=>item.type==='run.cancelled').length,1);
+  assert.equal(display.filter(item=>item.type==='run.failed').length,0);
+  assert.equal(conversationActivity(current,true),null);
+});
+
 test("reconnect gap rebases to latest page and preserves its older-page cursor", () => {
   const old = view([1, 2, 3]);
   const next = view([104, 105, 106], 104);

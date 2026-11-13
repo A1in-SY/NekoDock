@@ -88,8 +88,16 @@ export function sendReply(call: ModelCall, response: ServerResponse, messages: u
 }
 export function assertAccepted(call: ModelCall): void {
   const result = call.results.at(-1); assert.ok(result, 'Pi must report the actual custom-tool result');
-  const text = String(result.output ?? result.content); assert.match(text, /"accepted":true/);
-  assert.doesNotMatch(text, /messageId|requestId|sent|failed/);
+  const body = JSON.parse(String(result.output ?? result.content));
+  assert.equal(body.accepted, true); assert.ok(body.notice);
+  if (body.messages === undefined) return;
+  assert.ok(body.messages.length > 0);
+  for (const message of body.messages) {
+    assert.match(message.messageRef, /^reply:.+:\d+$/);
+    assert.ok(['sent','pending','failed','unconfirmed','partial','cancelled'].includes(message.status));
+    const { total, sent, pending, failed, unconfirmed, cancelled } = message.parts;
+    assert.equal(total, sent + pending + failed + unconfirmed + cancelled);
+  }
 }
 export function deferred() {
   let resolve!: () => void; const promise = new Promise<void>(done => { resolve = done; }); return { promise, resolve };

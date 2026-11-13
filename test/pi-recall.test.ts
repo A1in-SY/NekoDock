@@ -8,6 +8,7 @@ import {SessionManager} from '@earendil-works/pi-coding-agent';
 import type {AgentMessage} from '@earendil-works/pi-agent-core';
 import {PiRunner} from '../src/pi.js';
 import {createPiTools} from '../src/pi-tools.js';
+import {replyMessageReceipt,replyToolReceipt} from '../src/reply-receipt.js';
 import {ReplyToolError,replyMessagesSchema,validateRecallRequest,validateReplyRequest} from '../src/reply-contract.js';
 import {appendRecallEvents,CHAT_RECALL_CUSTOM_TYPE,committedContext,modelContextMessages,prepareContextInput,recoverContextReceipts} from '../src/pi-context.js';
 import type {PiConfig} from '../src/pi-protocol.js';
@@ -80,12 +81,13 @@ test('reply arguments preserve independent real QQ quote targets and reject medi
 
 test('reply tools return stable references and actionable errors without accepting malformed sends',async()=>{
   let sends=0,recalls=0;
-  const tools=createPiTools(config,async()=>{sends++;return {accepted:true,messages:[{messageRef:'reply_example:0',status:'queued'}]};},undefined,undefined,{
+  const receipt=replyToolReceipt([replyMessageReceipt('reply_example:0',['acknowledged'])]);
+  const tools=createPiTools(config,async()=>{sends++;return receipt;},undefined,undefined,{
     recall:async request=>{recalls++;return {...request,status:'recalled',parts:[{messageId:'10003',partIndex:0,status:'recalled'}]};},
   });
   const send=tools.find(t=>t.name==='send_message')!,takeBack=tools.find(t=>t.name==='recall_message')!;
   const result=await send.execute('send-example',{messages:[{type:'text',text:'Example.',replyTo:'10001'}]},undefined,undefined,{} as never);
-  assert.deepEqual(toolBody(result),{accepted:true,messages:[{messageRef:'reply_example:0',status:'queued'}]});
+  assert.deepEqual(toolBody(result),receipt);
   assert.equal(toolBody(await takeBack.execute('recall-example',{messageRef:'reply_example:0'} ,undefined,undefined,{} as never)).status,'recalled');
   const invalid=toolBody(await send.execute('invalid-example',{messages:[{type:'image',path:'image.png',replyTo:'10001'}]},undefined,undefined,{} as never));
   assert.equal(invalid.accepted,false);assert.equal(invalid.error.code,'REPLY_INVALID_REQUEST');assert.equal(sends,1);assert.equal(recalls,1);
@@ -115,7 +117,7 @@ test('Pi returns a rejected quote as a correctable tool result and accepts only 
       respond(call,response,[{name:'send_message',arguments:{messages:[{type:'text',text:'Repaired answer.',replyTo:'10002'}]}}]);
     }else {assert.match(text(call.body.messages),/reply_repaired:0/);respond(call,response,'Internal completion.');}
   },{send:async request=>{attempts++;if(attempts===1)throw new ReplyToolError('QUOTE_TARGET_RECALLED','The quoted message was recalled.',0);
-    accepted.push(request);return {accepted:true,messages:[{messageRef:'reply_repaired:0',status:'queued'}]};}});
+    accepted.push(request);return replyToolReceipt([replyMessageReceipt('reply_repaired:0',['acknowledged'])]);}});
   await f.run(batch(submission('quote-repair',[human()])));
   assert.equal(attempts,2);assert.equal(accepted.length,1);assert.equal(f.requests.length,3);
   assert.ok(f.events.some(e=>e.type==='tool.completed'&&e.payload.tool==='send_message'));
@@ -136,7 +138,7 @@ test('Pi preserves recall results and durable status while filtering duplicate p
       if(index===5)respond(call,response,[{name:'send_message',arguments:{messages:[{type:'text',text:'A later answer.'}]}}]);
       else respond(call,response,'Internal completion.');
     }
-  },{send:async()=>({accepted:true,messages:[{messageRef:'reply_original:0',status:'queued'}]}),recall:async(request,meta)=>{
+  },{send:async()=>replyToolReceipt([replyMessageReceipt('reply_original:0',['acknowledged'])]),recall:async(request,meta)=>{
     recalled=request.messageRef;assert.ok(meta?.operationId);assert.ok(meta?.toolCallId);
     f.runner.notifyRecall(selfRecall);
     return {messageRef:request.messageRef,status:'recalled',parts:[{messageId:'10003',partIndex:0,status:'recalled'}],events:[selfRecall]};

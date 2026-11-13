@@ -1856,6 +1856,13 @@ svg.icon {
   margin: 10px 0;
   min-height: 16px;
 }
+.reply-cancel-status {
+  margin: 0;
+  padding: 10px 20px;
+  color: var(--text-muted, #66736b);
+  font-size: 13px;
+}
+
 .stopped-banner {
   padding: 10px 15px;
   background: #f3f4f5;
@@ -2411,6 +2418,8 @@ svg.icon {
 }
 .conversation-actions {
   display: flex;
+  flex-wrap: wrap;
+  max-width: 100%;
   align-items: center;
   gap: 14px;
   flex-shrink: 0;

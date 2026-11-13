@@ -106,6 +106,22 @@ test('appends ordered requests while ACK position and generation completion rema
   assert.throws(() => store.getBatch(batch.throughSeq), /does not match/);
 });
 
+test('delivery receipts use durable per-message outcomes and retain errors after restart and batch cleanup', t => {
+  const files=fixture(t),store=files.open();store.insert(message('1'));store.openOrCreateBatch(50);
+  store.appendReplyRequest(1,'receipt-example',[{type:'text',text:'first'},{type:'text',text:'second'}],['a','b','c'],[0,0,1]);
+  assert.deepEqual(store.replyReceipt('receipt-example').messages!.map(item=>item.status),['pending','pending']);
+  store.beginReplyAttempt(1,0);store.acknowledgeReply(1,0,'qq-example');
+  store.beginReplyAttempt(1,1);store.failReply(1,1,'unconfirmed','send','NAPCAT_TIMEOUT');
+  store.beginReplyAttempt(1,2);store.failReply(1,2,'failed','send','NAPCAT_API_REJECTED',1403);
+  const receipt=store.replyReceipt('receipt-example');
+  assert.deepEqual(receipt.messages!.map(item=>item.status),['partial','failed']);
+  assert.deepEqual(receipt.messages![0]!.parts,{total:2,sent:1,pending:0,failed:0,unconfirmed:1,cancelled:0});
+  assert.deepEqual(receipt.messages![0]!.errors,[{partIndex:1,code:'NAPCAT_TIMEOUT'}]);
+  assert.deepEqual(receipt.messages![1]!.errors,[{partIndex:2,code:'NAPCAT_API_REJECTED',retcode:1403}]);
+  store.finishGeneration(1);store.completeBatch(1);store.close();
+  assert.deepEqual(files.open().replyReceipt('receipt-example'),receipt);
+});
+
 test('reuses a request ID without redrawing prepared parts and rejects changed message contents', t => {
   const store = fixture(t).open();
   store.insert(message('1'));

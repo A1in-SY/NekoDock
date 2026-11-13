@@ -629,3 +629,23 @@ test('Pi cancellation retains visible partial thinking and marks it failed',asyn
    assert.equal(thoughts.at(-1)!.payload.status,'failed');assert.equal(new Set(thoughts.map(event=>event.itemId)).size,1);
  }finally{abort.abort();await f.close();}
 });
+
+test('Pi cancellation releases a stuck host task callback and resumes the same session without replay',async()=>{
+ let entered!:()=>void;const managing=new Promise<void>(resolve=>{entered=resolve;});
+ const f=await fixture((_input,response,count)=>completion(response,count===1
+   ?[{name:'list_scheduled_tasks',arguments:{sourceMessageId:'m1'}}]
+   :count===2?[{name:'send_message',arguments:{messages:[{type:'text',text:'new turn reply'}]}}]:'done'));
+ const abort=new AbortController();let session:string|null=null;
+ try {
+   const run=f.runner.run(batch(),null,id=>{session=id;},abort.signal,{send:async()=>({accepted:true})},undefined,
+     {manage:async()=>{entered();return new Promise(()=>{});}});
+   const rejected=assert.rejects(run,/PI_ABORTED/);await managing;assert.ok(session);
+   const started=Date.now();abort.abort();await rejected;assert.ok(Date.now()-started<3000);
+   const old=session;const next=batch('new input');next.messages[0]!.messageId='m2';let accepted=0;
+   await f.runner.run(next,session,id=>{session=id;},new AbortController().signal,{send:async()=>{accepted++;return {accepted:true};}},undefined,{manage:async()=>{throw new Error('must not replay');}});
+   assert.equal(session,old);assert.equal(accepted,1);assert.equal(f.requests.length,3);
+   const stored=(await readFile(session!,'utf8')).trim().split('\n').map(line=>JSON.parse(line));
+   const result=stored.find(entry=>entry.type==='message'&&entry.message.role==='toolResult'&&entry.message.toolName==='list_scheduled_tasks');
+   assert.ok(result);assert.equal(result.message.isError,true);
+ }finally{abort.abort();await f.close();}
+});

@@ -18,6 +18,7 @@ import { recoverContextReceipts, type PiContextStart, type ContextImage } from '
 import { workspacePath } from './pi-tools.js';
 import type { ContextCommit, ChatContextMessage, ChatRecallEvent } from './chat-context-contract.js';
 import { prepareModelImage } from './model-image.js';
+import { abortable } from './abortable.js';
 
 export interface PiRunnerOptions extends PiConfig {
   timeoutMs: number; logger: Logger; imageMaxBytes?: number; imageTimeoutMs?: number;
@@ -236,6 +237,7 @@ export class PiRunner implements AgentRunner {
         detached: process.platform !== 'win32', stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
       let failure: Error | undefined; let done = false; let accepted = 0; let ended = false; let staged = 0; let memoryCalls = 0;
       let queue: Promise<void> = Promise.resolve(); let killTimer: NodeJS.Timeout | undefined;
+      const operations=new AbortController();
       let stderrBytes = 0;
       const activeThinking=new Map<string,Record<string,unknown>>();
       child.stderr?.on('data', (chunk: Buffer) => { stderrBytes += chunk.length; });
@@ -255,6 +257,7 @@ export class PiRunner implements AgentRunner {
         ...(error.messageIndex===undefined?{}:{messageIndex:error.messageIndex})});
       const stop = (error: Error) => {
         failure ??= error;
+        operations.abort(error);
         if (ended) return;
         post({ type: 'abort' });
         killTimer ??= setTimeout(kill, GRACE_MS);
@@ -277,7 +280,7 @@ export class PiRunner implements AgentRunner {
             let allowed = false;
             if (!failure && !signal.aborted && replies && (operation === 'run'||operation==='scheduled')) {
               try {
-                const receipt=await replies.send(validateReplyRequest(message.request, config.targetType), message.toolCallId ? {toolCallId:message.toolCallId} : undefined);
+                const receipt=await abortable(()=>replies.send(validateReplyRequest(message.request, config.targetType), message.toolCallId ? {toolCallId:message.toolCallId} : undefined),operations.signal);
                 accepted++; allowed = true;post({type:'send-result',id:message.id,accepted:true,receipt});return;
               } catch(error) {
                 if(error instanceof ReplyToolError){post({type:'send-result',id:message.id,accepted:false,error:operationError(error)});return;}
@@ -290,7 +293,7 @@ export class PiRunner implements AgentRunner {
               post({type:'recall-result',id:message.id,ok:false,error:{code:'RECALL_UNAVAILABLE',message:'Recall is unavailable for this execution.'}});return;
             }
             try {
-              const result=await replies.recall(validateRecallRequest(message.request),{toolCallId:message.toolCallId,operationId:`${runId}:${message.toolCallId??message.id}`});
+              const result=await abortable(()=>replies.recall!(validateRecallRequest(message.request),{toolCallId:message.toolCallId,operationId:`${runId}:${message.toolCallId??message.id}`}),operations.signal);
               accepted++;post({type:'recall-result',id:message.id,ok:true,result});
             }catch(error){
               if(error instanceof ReplyToolError)post({type:'recall-result',id:message.id,ok:false,error:operationError(error)});
@@ -300,9 +303,9 @@ export class PiRunner implements AgentRunner {
             try {
               if(failure||signal.aborted)throw new Error('Task operation cancelled.');
               const result=message.type==='task-manage'&&tasks&&operation==='run'
-                ?await tasks.manage(message.request,`${runId}:${message.operationId}`)
+                ?await abortable(()=>tasks.manage(message.request,`${runId}:${message.operationId}`,signal),operations.signal)
                 :message.type==='task-state'&&state&&operation==='scheduled'
-                  ?await state.saveState(message.data,message.expectedVersion):await Promise.reject(new Error('Task operation unavailable.'));
+                  ?await abortable(()=>state.saveState(message.data,message.expectedVersion),operations.signal):await Promise.reject(new Error('Task operation unavailable.'));
               post({type:'task-result',id:message.id,ok:true,result});
             }catch(error){
               const detail=safeToolPayload(error instanceof Error?error.message:'Task operation unavailable.',[config.apiKey??'']) as string;
@@ -315,9 +318,9 @@ export class PiRunner implements AgentRunner {
               let result: unknown;
               if (message.type === 'memory-stage') {
                 if (operation !== 'memory' || !memoryTools || Buffer.byteLength(JSON.stringify(message.changes)) > 512 * 1024) throw new Error('Memory staging unavailable.');
-                await memoryTools.stage(message.changes); staged++; result = { staged: true };
+                await abortable(()=>memoryTools.stage(message.changes),operations.signal); staged++; result = { staged: true };
               } else {
-                result = message.operation === 'search' ? await reads.search(message.request) : await reads.history(message.request);
+                result = await abortable(()=>message.operation === 'search' ? reads.search(message.request) : reads.history(message.request),operations.signal);
                 if (operation === 'memory') result = memoryOrganizerResult(message.operation, result);
               }
               post({ type: 'memory-result', id: message.id, ok: true, result });

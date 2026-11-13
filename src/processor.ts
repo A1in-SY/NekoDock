@@ -13,6 +13,8 @@ import type { ContextCommit } from './chat-context-contract.js';
 import { saveChatAsset } from './chat-assets.js';
 import { modelErrorReply } from './model-error-reply.js';
 import { ReplyToolError } from './reply-contract.js';
+import type { ActiveReplyRun, RunCancelResult } from './run-control-contract.js';
+import { waitForReplyReceipt } from './reply-receipt.js';
 
 const commandReplies: Record<CommandResult, string> = {
   help: [
@@ -42,6 +44,23 @@ export class Processor {
   private drainCommand:number|null=null;
   private contextRecovery=true;
   private activeReply: {messageRef:string;done:Promise<void>} | undefined;
+  private currentRun: {view:ActiveReplyRun; controller:AbortController; done:Promise<RunCancelResult>; finish(result:RunCancelResult):void} | undefined;
+  get activeRun():ActiveReplyRun|null { return this.currentRun ? {...this.currentRun.view} : null; }
+  cancelRun(runId:string):Promise<RunCancelResult> {
+    const run=this.currentRun;
+    if(!run||run.view.runId!==runId)return Promise.resolve('already_finished');
+    if(!run.controller.signal.aborted) {
+      this.runPhase('cancelling');
+      run.controller.abort(new Error('RUN_CANCELLED_BY_OPERATOR'));
+    }
+    return run.done;
+  }
+  private runPhase(phase:ActiveReplyRun['phase']):void {
+    const run=this.currentRun;
+    if(!run||run.controller.signal.aborted||run.view.phase===phase)return;
+    run.view.phase=phase;
+    this.options.store.recorder.append('run.progress',{phase},`run:${run.view.runId}:${phase}`,{runId:run.view.runId});
+  }
   requestDrain():void { if(this.draining)return; this.draining=true; this.options.store.invalidateReplyDecisions('draining'); this.drainCommand=this.activeCommand; this.options.scheduler?.requestDrain();this.options.backgroundActions?.requestDrain?.();this.notify(); }
   get isProcessing():boolean { return this.active || this.options.store.peekPendingBatch()!==null; }
   get isDrained():boolean { return this.draining && !this.active && this.options.store.peekPendingBatch()===null && this.drainCommand===null && (!this.options.scheduler||this.options.scheduler.isDrained); }
@@ -52,6 +71,7 @@ export class Processor {
     workspace: string; imageMaxBytes: number; imageTimeoutMs: number; imageFetch?:typeof globalThis.fetch;
     speech?: SpeechProvider | null; voiceReplyEnabled?: boolean;
     voiceReplyProbability?: number; ttsMaxChars?: number; random?: () => number;
+    replyReceiptWaitMs?: number;
     scheduler?:Scheduler; taskTools?:TaskTools;
     helpText?:()=>string;
     backgroundActions?:{readonly hasPending:boolean;runNext(signal:AbortSignal):Promise<boolean>;requestDrain?():void};
@@ -108,6 +128,8 @@ export class Processor {
         let stage = 'agent';
         let replyIndex: number | undefined;
         let deliveries: ReturnType<Processor['replyTools']> | undefined;
+        const runController=new AbortController();
+        const runSignal=AbortSignal.any([signal,runController.signal]);
         try {
           if(this.contextRecovery&&agent.recoverContext) {
             const session=store.getSessionId(),pendingIds=store.pendingContextBatchIds();
@@ -125,27 +147,33 @@ export class Processor {
             });
             continue;
           }
-          await this.options.beforeContext?.(store.getBatch(batch.throughSeq),signal);
-          const context=store.prepareContext(store.getBatch(batch.throughSeq));
+          let finish!:(result:RunCancelResult)=>void;
+          this.currentRun={view:{runId,conversationId:store.recorder.conversationId,throughSeq:batch.throughSeq,startedAt:started,phase:'preparing'},
+            controller:runController,done:new Promise(resolve=>{finish=resolve;}),finish:result=>finish(result)};
           store.markGenerationStarted(batch.throughSeq);
           store.recorder.append('run.started', { throughSeq: batch.throughSeq, messageIds: batch.messages.map(message => message.messageId), replyAllowed: batch.replyAllowed }, `run:${runId}:start`, { runId });
+          await this.options.beforeContext?.(store.getBatch(batch.throughSeq),runSignal);
+          runSignal.throwIfAborted();
+          const context=store.prepareContext(store.getBatch(batch.throughSeq));
           logEvent(logger, 'info', 'processor.batch.started', {
             through_seq: batch.throughSeq, count: batch.messages.length, reply_allowed: batch.replyAllowed,
             next_reply_index: batch.nextReplyIndex,
           });
-          deliveries = this.replyTools(batch.throughSeq, signal, runId);
+          deliveries = this.replyTools(batch.throughSeq, runSignal, runId, signal);
+          this.runPhase('generating');
           let observedEvent = 0;
           const result = await agent.run({...store.getBatch(batch.throughSeq),context}, store.getSessionId(), id => {
             stage = 'session_save';
             store.setSessionId(id);
             stage = 'agent';
-          }, signal, deliveries.tools, event => {
+          }, runSignal, deliveries.tools, event => {
             if(event.type==='context.committed')store.commitContext(event.payload as unknown as ContextCommit);
             const sequence = ++observedEvent;
             store.recorder.append(event.type,
               { ...event.payload, ...(event.type === 'usage.recorded' ? { usageId: event.payload.usageId ?? `${runId}:${sequence}` } : {}) },
               `${runId}:${event.type}:${event.itemId ?? sequence}${event.type==='thinking.updated'?`:${sequence}`:''}`, { runId, ...(event.itemId ? { itemId: event.itemId } : {}) });
           },this.options.taskTools);
+          runSignal.throwIfAborted();
           // Non-persistent adapters have no Pi acknowledgement channel; their successful
           // return is the explicit context boundary. Pi always acknowledges its file entry.
           if(!agent.supportsContextCommits)store.commitContext({batchId:context.batchId,conversationId:context.conversationId,
@@ -164,12 +192,10 @@ export class Processor {
             reply_allowed: batch.replyAllowed, duration_ms: Date.now() - started,
           });
           stage = 'send';
+          this.runPhase('sending');
           await deliveries.flush();
-          await this.deliverPending(batch.throughSeq, signal, runId, (value, index) => { stage = value; replyIndex = index; });
-          if (signal.aborted) {
-            store.abandonBatch(batch.throughSeq, 'cancelled', runId);
-            break;
-          }
+          await this.deliverPending(batch.throughSeq, runSignal, runId, (value, index) => { stage = value; replyIndex = index; },signal);
+          runSignal.throwIfAborted();
           stage = 'batch_complete';
           const replyCount = store.getBatch(batch.throughSeq).replies?.length ?? 0;
           store.completeBatch(batch.throughSeq, { runId, durationMs: Math.max(0, Date.now() - (batch.messages.find(message => message.trigger)?.time ?? batch.messages[0]?.time ?? started / 1000) * 1000), replyAllowed: batch.replyAllowed });
@@ -185,14 +211,16 @@ export class Processor {
           const errorCode = typeof metadata?.code === 'string' && /^PI_[A-Z_]{1,60}$/.test(metadata.code) ? metadata.code : undefined;
           const httpStatus = typeof metadata?.providerStatus === 'number' && Number.isInteger(metadata.providerStatus)
             && metadata.providerStatus >= 400 && metadata.providerStatus <= 599 ? metadata.providerStatus : undefined;
-          store.recorder.append('run.failed', { throughSeq: batch.throughSeq, durationMs: Date.now() - started,
-            status: signal.aborted ? 'cancelled' : 'failed', ...(errorCode ? {errorCode,error:typeof metadata?.message==='string'?metadata.message.slice(0,600):errorCode}:{}),
+          const operatorCancelled=runController.signal.aborted;
+          store.recorder.append(operatorCancelled?'run.cancelled':'run.failed', { throughSeq: batch.throughSeq, durationMs: Date.now() - started,
+            ...(operatorCancelled?{reason:'operator'}:{}),
+            status: runSignal.aborted ? 'cancelled' : 'failed', ...(errorCode ? {errorCode,error:typeof metadata?.message==='string'?metadata.message.slice(0,600):errorCode}:{}),
             ...(httpStatus?{httpStatus}:{}) }, `run:${runId}:end`, { runId });
-          logEvent(logger, 'warn', 'processor.batch.failed', {
+          logEvent(logger, operatorCancelled?'info':'warn', operatorCancelled?'processor.batch.cancelled':'processor.batch.failed', {
             through_seq: batch.throughSeq, stage, reply_index: replyIndex, replayed: false, error_code:errorCode,
             http_status:httpStatus, duration_ms: Date.now() - started,
           });
-          if (metadata?.modelFailure === true && batch.replyAllowed && !signal.aborted) {
+          if (metadata?.modelFailure === true && batch.replyAllowed && !runSignal.aborted) {
             try {
               await this.options.sender.sendText(modelErrorReply(error), signal);
               logEvent(logger, 'info', 'processor.model_error_reply.sent', { through_seq: batch.throughSeq, run_ref: runId });
@@ -200,19 +228,24 @@ export class Processor {
               logEvent(logger, 'warn', 'processor.model_error_reply.failed', { through_seq: batch.throughSeq, run_ref: runId });
             }
           }
-          try { store.abandonBatch(batch.throughSeq, signal.aborted ? 'cancelled' : 'failed', runId); }
+          try { store.abandonBatch(batch.throughSeq, runSignal.aborted ? 'cancelled' : 'failed', runId); }
           catch {
             // A storage outage may delay cleanup, but model_started ensures the
             // next loop or process can only abandon this execution, never rerun it.
             if (!signal.aborted) try { await delay(retryMs, undefined, { signal }); } catch { break; }
           }
           if (signal.aborted) break;
-        } finally { this.active = false; }
+        } finally {
+          if(this.currentRun?.view.runId===runId) {
+            this.currentRun.finish(runController.signal.aborted?'cancelled':'already_finished');this.currentRun=undefined;
+          }
+          this.active = false;
+        }
       }
     } finally { signal.removeEventListener('abort', abort); this.wake = undefined; }
   }
 
-  private replyTools(throughSeq: number, signal: AbortSignal, runId: string): { tools: ReplyTools; flush(): Promise<void> } {
+  private replyTools(throughSeq: number, signal: AbortSignal, runId: string, deliverySignal:AbortSignal=signal): { tools: ReplyTools; flush(): Promise<void> } {
     const { store, logger } = this.options;
     let tail = Promise.resolve();
     let failed = false;
@@ -233,10 +266,20 @@ export class Processor {
         });
         tail = tail.then(async () => {
           if (failed) return;
-          try { await this.deliverPending(throughSeq, signal, runId); }
+          try { await this.deliverPending(throughSeq, signal, runId,undefined,deliverySignal); }
           catch (error) { failed = true; failure = error; }
         });
-        return { accepted: true, messages:store.replyLedger.references(requestId).map(messageRef=>({messageRef,status:'queued' as const})) };
+        return await waitForReplyReceipt({
+          read: () => {
+            // A storage failure cannot provide a trustworthy receipt. Stop the
+            // execution; the durable attempt markers still forbid replay.
+            const receipt = store.replyReceipt(requestId);
+            if (failed && receipt.messages!.some(message => message.status === 'pending')) throw failure;
+            return receipt;
+          },
+          subscribe: changed => store.recorder.subscribe(changed), settled: tail, signal,
+          timeoutMs: this.options.replyReceiptWaitMs,
+        });
       },
       recall: async (request, metadata) => {
         if(signal.aborted)throw new Error('Reply recall cancelled.');
@@ -249,6 +292,7 @@ export class Processor {
         if(existing)return existing;
         const active=this.activeReply;
         if(active?.messageRef===request.messageRef)await active.done;
+        signal.throwIfAborted();
         const parts=store.replyLedger.parts(request.messageRef,store.recorder.conversationId);
         const cancelledParts=parts.filter(part=>part.state==='cancelled').length;
         const sent=parts.filter(part=>['acknowledged','recalled','started','unconfirmed'].includes(part.state));
@@ -274,7 +318,7 @@ export class Processor {
   }
 
   private async deliverPending(throughSeq: number, signal: AbortSignal, runId: string,
-    progress: (stage: string, index: number) => void = () => {}): Promise<void> {
+    progress: (stage: string, index: number) => void = () => {}, deliverySignal:AbortSignal=signal): Promise<void> {
     const { store, sender, logger } = this.options;
     const imageOptions = { workspace: this.options.workspace, maxBytes: this.options.imageMaxBytes, timeoutMs: this.options.imageTimeoutMs, logger,fetch:this.options.imageFetch };
     while (!signal.aborted) {
@@ -340,7 +384,7 @@ export class Processor {
         }
         sendStarted = Date.now();
         logEvent(logger, 'info', 'processor.reply.send_started', fields);
-        receipt = await transmitReply(part,sender,signal,durable?.firstPart?durable.replyTo:undefined,durable?store.replyLedger.metadata(durable):undefined);
+        receipt = await transmitReply(part,sender,deliverySignal,durable?.firstPart?durable.replyTo:undefined,durable?{...store.replyLedger.metadata(durable),runId}:undefined);
         acknowledged = true;
         logEvent(logger, 'info', 'processor.reply.sent', { ...fields, duration_ms: Date.now() - sendStarted, ...(receipt?.messageId ? { message_ref: receipt.messageId } : {}) });
         stage = 'reply_ack'; progress(stage, index);
@@ -356,6 +400,10 @@ export class Processor {
         const retcode = deliveryRetcode(error);
         logEvent(logger, 'warn', 'processor.reply.failed', { ...fields, stage, status, error_code: errorCode, retcode, duration_ms: Date.now() - attemptedAt });
         if (acknowledged) throw error;
+        if(errorCode==='RUN_CANCELLED'||signal.aborted&&sendStarted===undefined) {
+          if(errorCode==='RUN_CANCELLED')void this.cancelRun(runId);
+          store.cancelPreparedReply(throughSeq,index);continue;
+        }
         store.failReply(throughSeq, index, sendStarted === undefined ? 'failed' : deliveryFailureStatus(error), stage, errorCode, retcode);
         if(durable&&/^QUOTE_TARGET_/.test(errorCode))store.cancelReply(durable.messageRef,errorCode);
       } finally {

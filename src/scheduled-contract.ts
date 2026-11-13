@@ -1,4 +1,4 @@
-import type { OutputMessage, RunObservation } from './types.js';
+import type { OutputMessage, ReplyToolReceipt, RunObservation } from './types.js';
 
 export type TaskSchedule = { kind: 'once'; at: string; timezone: string } | { kind: 'cron'; expression: string; timezone: string };
 export interface TaskContext {
@@ -31,9 +31,9 @@ export interface ScheduledInput {
 }
 export interface TaskRunDetail { run: ScheduledRun; events: Array<{type: string; time: number; payload: Record<string, unknown>; seq?:number}>; taskState?: TaskState; cursor?:number; hasMore?:boolean }
 export interface TaskToolRequest { operation: 'create' | 'list' | 'update' | 'delete'; sourceMessageId: string; taskId?: string; expectedRevision?: number; task?: unknown }
-export interface TaskTools { manage(request: TaskToolRequest, operationId: string): Promise<unknown> }
+export interface TaskTools { manage(request: TaskToolRequest, operationId: string, signal?:AbortSignal): Promise<unknown> }
 export interface ScheduledExecutionTools {
-  send(request: { messages: OutputMessage[] }): Promise<{ accepted: true }>;
+  send(request: { messages: OutputMessage[] }): Promise<ReplyToolReceipt>;
   saveState(data: Record<string, unknown>, expectedVersion: number): Promise<TaskState>;
 }
 export interface ScheduledAgent {

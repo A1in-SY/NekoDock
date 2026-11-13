@@ -139,7 +139,7 @@ test('recall waits for the active ACK, cancels remaining parts, and does not can
     const accepted=await tools!.send({messages:[{type:'text',text:'abcdef'},{type:'text',text:'XYZ'}]});
     await until(()=>sent.length===1);const pending=tools!.recall!({messageRef:accepted.messages![0]!.messageRef},{operationId:'recall-once'});ack.release();result=await pending;
     assert.deepEqual(await tools!.recall!({messageRef:accepted.messages![0]!.messageRef},{operationId:'recall-once'}),result);return {messages:[]};
-  }},{async sendText(text){sent.push(text);if(text==='abc')await ack.promise;return {messageId:`qq-${text}`};},async recallMessage(messageRef){recallCalls++;return {messageRef,status:'recalled',parts:[{messageId:'qq-abc',partIndex:0,status:'recalled'}],events:[recall('qq-abc')]};}},{replyMaxChars:3});
+  }},{async sendText(text){sent.push(text);if(text==='abc')await ack.promise;return {messageId:`qq-${text}`};},async recallMessage(messageRef){recallCalls++;return {messageRef,status:'recalled',parts:[{messageId:'qq-abc',partIndex:0,status:'recalled'}],events:[recall('qq-abc')]};}},{replyMaxChars:3,replyReceiptWaitMs:20});
   await until(()=>f.store.getCursor()===1);assert.deepEqual(sent,['abc','XYZ']);assert.equal(recallCalls,1);assert.equal(result!.cancelledParts,1);assert.equal(result!.status,'recalled');
   assert.equal(f.store.chatMessageForQQ('qq-abc')!.recalled,true);assert.equal(f.store.recorder.pending(100).filter(event=>event.type==='delivery.cancelled').length,1);
   const event=f.store.recorder.pending(100).find(event=>event.type==='message.recalled')!;
@@ -152,7 +152,7 @@ test('cancelling during preparation does not send the prepared voice or call rem
   f.start({async run(_batch,_session,_onSession,_signal,tools){
     const receipt=await tools!.send({messages:[{type:'text',text:'voice'}]});await until(()=>preparing);
     const pending=tools!.recall!({messageRef:receipt.messages![0]!.messageRef});synthesis.release();result=await pending;return {messages:[]};
-  }},{async sendVoice(){calls++;},async recallMessage(){throw new Error('Must not recall an unsent voice');}},{voiceReplyEnabled:true,voiceReplyProbability:1,
+  }},{async sendVoice(){calls++;},async recallMessage(){throw new Error('Must not recall an unsent voice');}},{voiceReplyEnabled:true,voiceReplyProbability:1,replyReceiptWaitMs:20,
     speech:{name:'mock',async synthesize(){preparing=true;await synthesis.promise;return {file:`base64://${Buffer.from([0xff,0xfb,0x90,0x64]).toString('base64')}`};}}});
   await until(()=>f.store.getCursor()===1);assert.equal(calls,0);assert.equal(result!.status,'cancelled');assert.equal(result!.cancelledParts,1);
 });
@@ -165,7 +165,7 @@ test('recalling one reply does not wait for unrelated voice preparation',async t
     synthesis.release();return {messages:[]};
   }},{async sendText(){return {messageId:'qq-a'};},async sendVoice(){return {messageId:'qq-b'};},
     async recallMessage(messageRef){recalled=true;return {messageRef,status:'recalled',parts:[{messageId:'qq-a',partIndex:0,status:'recalled'}],events:[recall('qq-a')]};}},
-    {voiceReplyEnabled:true,voiceReplyProbability:1,speech:{name:'mock',async synthesize(){preparing=true;await synthesis.promise;return {file:`base64://${Buffer.from([0xff,0xfb,0x90,0x64]).toString('base64')}`};}}});
+    {voiceReplyEnabled:true,voiceReplyProbability:1,replyReceiptWaitMs:20,speech:{name:'mock',async synthesize(){preparing=true;await synthesis.promise;return {file:`base64://${Buffer.from([0xff,0xfb,0x90,0x64]).toString('base64')}`};}}});
   await until(()=>f.store.getCursor()===1);assert.equal(recalled,true);
 });
 
@@ -208,7 +208,7 @@ test('one recall per agent run rejects later attempts before side effects, prese
     return {messages:[]};
   }},{async sendText(text){sent.push(text);if(text==='second')await ack.promise;return {messageId:'qq-'+text};},
     async recallMessage(messageRef){recalls++;const id=messageRef===secondRef?'qq-second':'qq-first';
-      return {messageRef,status:'recalled',parts:[{messageId:id,partIndex:0,status:'recalled'}],events:[recall(id)]};}});
+      return {messageRef,status:'recalled',parts:[{messageId:id,partIndex:0,status:'recalled'}],events:[recall(id)]};}},{replyReceiptWaitMs:20});
   await until(()=>f.store.getCursor()===1);assert.equal(checked,true);assert.equal(recalls,1);assert.deepEqual(sent,['first','second','after error']);
   assert.equal(f.store.replyLedger.parts(secondRef)[0]!.state,'acknowledged');
   f.store.insert(incoming('2'));processor.notify();await until(()=>f.store.getCursor()===2);

@@ -54,6 +54,7 @@ export interface ConsoleEvent {
 }
 export interface WorkerHeartbeat {
   revision: number; connected: boolean; processing: boolean; drained: boolean; error?: string;
+  supportsRunCancellation?: boolean;
   conversationId?: string; events: ConsoleEvent[];
 }
 export interface WorkerControl { desiredState: DesiredState; desiredRevision: number; acknowledgedSeq: number; }
@@ -70,4 +71,5 @@ export interface PublicBot extends Omit<BotRecord,'config'|'workerToken'> {
   config: Omit<BotSettings,SecretField | NapcatConnectionField>; configuredSecrets: Record<SecretField,boolean>; statistics: Statistics;
   state: RuntimeState; connected: boolean; lastHeartbeat: number | null; processing: boolean; error?: string;
   transportConnected?: boolean; upstreamConnected?: boolean; qqOnline?: boolean;
+  runControl?: import('../run-control-contract.js').RunControlView;
 }

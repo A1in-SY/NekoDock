@@ -20,6 +20,7 @@ import { NapcatGateway } from './napcat-gateway.js';
 import { NetworkProbes } from './network-probes.js';
 import { ConsoleImagePrefetch } from './incoming-images.js';
 import { ForwardInspectionCoordinator } from './inspection-coordinator.js';
+import { RunControlStreams } from './run-controls.js';
 import {isNapcatSendResult,NAPCAT_MEDIA_MAX_BYTES,type NapcatSendResult} from '../transport-protocol.js';
 import type {PluginRunnerResult} from '../plugin-contract.js';
 import { contentPlugin } from '../plugin-system/registry.js';
@@ -47,6 +48,7 @@ export async function createConsole(options:ConsoleOptions){
  }});
  const logs=new LogStreams(db,auth,options.docker,options.logPollMs);
  const conversations=new ConversationStreams(db,auth,options.conversationHeartbeatMs);
+ const runControls=new RunControlStreams(db.runControls);
  const networkProbes=new NetworkProbes();
  const incomingImages=new ConsoleImagePrefetch({store:db.images,root:resolve(options.dataDir,'incoming-images'),bot:id=>db.getBot(id),logger,fetch:options.incomingImageFetch});
  incomingImages.start(options.timers!==false);
@@ -89,7 +91,7 @@ export async function createConsole(options:ConsoleOptions){
  app.setErrorHandler((error,_req,reply)=>{
   // Validation errors are deliberately written by our validators; never serialize request bodies or credentials.
   const message=error instanceof Error?error.message:'';
-  const safe=/^(?:插件|内置插件|记忆|配置|实例|群聊|私聊|相同|同一|数据卷|管理员|密码|请求|会话|任务|时间|分页|模型|自定义|人格|未知配置|运行|Worker|生效|控制台|NapCat|连接|[a-zA-Z]+(?:[A-Z][a-z]+)* (?:必须|类型|内容|无效))/u.test(message)&&message.length<300;
+  const safe=/^(?:停止|该轮|更新实例|插件|内置插件|记忆|配置|实例|群聊|私聊|相同|同一|数据卷|管理员|密码|请求|会话|任务|时间|分页|模型|自定义|人格|未知配置|运行|Worker|生效|控制台|NapCat|连接|[a-zA-Z]+(?:[A-Z][a-z]+)* (?:必须|类型|内容|无效))/u.test(message)&&message.length<300;
   const status=message.includes('版本冲突')?409:(error as {statusCode?:number}).statusCode??400;
   reply.code(status>=400&&status<500?status:500).send({error:safe?message:'请求未完成，请检查配置或服务日志'});
  });
@@ -181,6 +183,10 @@ export async function createConsole(options:ConsoleOptions){
   logEvent(logger,'info','console.lifecycle_requested',{botId:req.params.id,action});return reply.code(202).send({accepted:true});
  });
  app.get<{Params:{id:string};Querystring:{before?:string;limit?:string}}>('/api/bots/:id/conversation',async(req)=>db.getConversation(req.params.id,req.query.before?numeric(req.query.before,0):undefined,numeric(req.query.limit,100)));
+ app.post<{Params:{id:string;runId:string}}>('/api/bots/:id/runs/:runId/cancel',async(req,reply)=>{
+  const result=db.runControls.request(req.params.id,req.params.runId,object(req.body).requestId);
+  changes();runControls.notify(req.params.id);return reply.code(202).send(result);
+ });
  app.get<{Params:{id:string};Querystring:{after?:string;limit?:string}}>('/api/bots/:id/conversation/events',async(req)=>db.getConversationUpdate(req.params.id,numeric(req.query.after,0),numeric(req.query.limit,100)));
  app.get<{Params:{id:string};Querystring:{after?:string}}>('/api/bots/:id/conversation/stream',async(req,reply)=>{
   if(!db.getBot(req.params.id))return reply.code(404).send({error:'实例不存在'});
@@ -304,6 +310,12 @@ export async function createConsole(options:ConsoleOptions){
  app.get<{Params:{id:string}}>('/internal/workers/:id/memory',async(req)=>{await worker(req);return db.memory.snapshot(req.params.id);});
  app.post<{Params:{id:string}}>('/internal/workers/:id/memory',async(req)=>{await worker(req);const result=db.memory.sync(req.params.id,req.body);changes();return result;});
  app.get<{Params:{id:string}}>('/internal/workers/:id/config',async(req)=>{await worker(req);return db.getWorkerSnapshot(req.params.id);});
+ app.get<{Params:{id:string}}>('/internal/workers/:id/run-controls/stream',async(req,reply)=>{
+  await worker(req);runControls.open(req.params.id,reply);
+ });
+ app.post<{Params:{id:string}}>('/internal/workers/:id/run-controls/ack',async(req)=>{
+  await worker(req);db.runControls.acknowledge(req.params.id,req.body);changes();return {ok:true};
+ });
  app.get<{Params:{id:string};Querystring:{after?:string}}>('/internal/workers/:id/incoming-images',async(req)=>{
   await worker(req);db.images.expire();const images=db.images.list(req.params.id,req.query.after);
   return {images,nextCursor:images.length===100?images.at(-1)!.id:null};
@@ -382,7 +394,7 @@ export async function createConsole(options:ConsoleOptions){
   every(15000,()=>void sample());every(3600000,()=>{try{metrics.compact();}catch{logEvent(logger,'warn','console.metrics_compact_failed');}});
   every(60000,()=>{void db.pluginAssets.cleanup(pluginAssetsRoot).catch(()=>logEvent(logger,'warn','plugin.assets.cleanup_failed'));});
  }
- app.addHook('preClose',async()=>{for(const timer of timers)clearInterval(timer);logs.close();conversations.close();for(const stream of streams)stream.response.end();await inspections.close();await gateway.close();await incomingImages.close();});
+ app.addHook('preClose',async()=>{for(const timer of timers)clearInterval(timer);logs.close();conversations.close();runControls.close();for(const stream of streams)stream.response.end();await inspections.close();await gateway.close();await incomingImages.close();});
  app.addHook('onClose',async()=>{for(const timer of timers)clearInterval(timer);for(const stream of streams)stream.response.end();db.close();metrics.close();});
  return {app,db,metrics,auth,lifecycle,gateway,sample,incomingImages,inspections};
 }

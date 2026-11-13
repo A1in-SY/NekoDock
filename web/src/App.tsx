@@ -573,7 +573,7 @@ export function App() {
                       {pending.has(bot.id)
                         ? "请求中…"
                         : bot.desiredState === "running"
-                          ? "停止"
+                          ? "停止实例"
                           : "启动"}
                     </button>
                   </div>
@@ -818,7 +818,7 @@ function BotCard({
           }
         >
           <Icon name={b.desiredState === "running" ? "square" : "play"} />
-          {pending ? "请求中" : b.desiredState === "running" ? "停止" : "启动"}
+          {pending ? "请求中" : b.desiredState === "running" ? "停止实例" : "启动"}
         </button>
       </div>
     </article>

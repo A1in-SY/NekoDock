@@ -278,6 +278,25 @@ test('a quoted message recalled while queued is blocked at the actual send bound
   assert.deepEqual(await quoted,{ok:false,code:'QUOTE_TARGET_RECALLED',deliveryStatus:'failed'});assert.equal(f.requests.length,1);
 });
 
+test('run cancellation fences new and queued sends but retains an already dispatched ACK and delivery idempotency',async t=>{
+  const f=await fixture(t);const botId=f.first.id;
+  f.db.ingestHeartbeat(botId,{revision:1,connected:true,processing:true,drained:false,events:[],supportsRunCancellation:true});
+  f.db.ingestEvents(botId,[{seq:1,type:'run.started',time:Date.now(),conversationId:'chat-example',runId:'run-a',payload:{throughSeq:1}}]);
+  const metadata={messageRef:'reply-example:0',conversationId:'chat-example',origin:'model' as const,logicalMessageIndex:0,partIndex:0,runId:'run-a'};
+  const request={deliveryId:'first-part',kind:'text' as const,text:'first',metadata,deadline:Date.now()+1500};
+  const active=f.gateway.send(botId,request);await waitFor(()=>f.requests.length===1);
+  const queued=f.gateway.send(botId,{...request,deliveryId:'second-part',text:'second'});
+  f.db.runControls.request(botId,'run-a','click-a');
+  f.answer(f.requests[0]!,{data:{message_id:'confirmed-first'}});
+  assert.deepEqual(await active,{ok:true,messageId:'confirmed-first'});
+  assert.deepEqual(await queued,{ok:false,code:'RUN_CANCELLED',deliveryStatus:'failed'});
+  assert.deepEqual(await f.gateway.send(botId,request),{ok:true,messageId:'confirmed-first'});
+  assert.deepEqual(await f.gateway.send(botId,{...request,deliveryId:'late-part'}),{ok:false,code:'RUN_CANCELLED',deliveryStatus:'failed'});
+  assert.equal(f.requests.length,1);
+  const next=f.gateway.send(botId,{...request,deliveryId:'next-run',metadata:{...metadata,runId:'run-b'}});
+  await waitFor(()=>f.requests.length===2);f.answer(f.requests[1]!);assert.equal((await next).ok,true);
+});
+
 test('confirmed model references recall actual QQ IDs once and merge the resulting notice',async t=>{
   const f=await fixture(t);const metadata={messageRef:'reply-example:0',conversationId:'chat-example',origin:'model' as const,logicalMessageIndex:0,partIndex:0};
   const sending=f.gateway.send(f.first.id,{deliveryId:'model-send',kind:'text',text:'correction needed',metadata,deadline:Date.now()+1500});

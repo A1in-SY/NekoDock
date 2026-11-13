@@ -11,6 +11,8 @@ import type { WorkerControl, WorkerHeartbeat, WorkerSnapshot } from './console/c
 import { logEvent } from './logging.js';
 import { directFetch } from './network.js';
 import type { NetworkProbeCommand, NetworkProbeResult } from './network-probe.js';
+import { TransportEventParser } from './console-transport.js';
+import { runIdentity, type RunCancellation, type RunCancelResult } from './run-control-contract.js';
 
 export interface ManagedIdentity {url:string;botId:string;token:string;dataDir:string;}
 export interface WorkerRuntime {
@@ -25,6 +27,7 @@ export interface WorkerRuntime {
   stop(beforeStoreClose?:()=>Promise<void>):Promise<void>;
   done:Promise<void>;
   probeNetwork?(signal:AbortSignal):Promise<NetworkProbeResult>;
+  cancelRun?(runId:string):Promise<RunCancelResult>;
 }
 export type RuntimeFactory=(config:Config,signal:AbortSignal)=>WorkerRuntime;
 
@@ -146,6 +149,7 @@ export async function runManagedWorker(identity:ManagedIdentity,env:NodeJS.Proce
   const probeController=new AbortController();
   const abortProbes=()=>probeController.abort();signal.addEventListener('abort',abortProbes,{once:true});
   const probes=runtime.probeNetwork?pollNetworkProbes(identity,()=>({revision:current.revision,runtime}),logger,probeController.signal):Promise.resolve();
+  const controls=runtime.cancelRun?receiveRunControls(identity,runId=>runtime.cancelRun?.(runId)??Promise.resolve('already_finished'),probeController.signal):Promise.resolve();
   let eventUpload=uploadWorkerEvents(identity,runtime.store.recorder,logger);
   let operation:WorkerControl|null=null;
   let runtimeError=false;
@@ -156,6 +160,7 @@ export async function runManagedWorker(identity:ManagedIdentity,env:NodeJS.Proce
     while(!signal.aborted) {
       try {
         const heartbeat:WorkerHeartbeat={revision:current.revision,connected:runtime.connected,processing:runtime.processing,
+          supportsRunCancellation:!!runtime.cancelRun,
           drained:runtime.drained,conversationId:runtime.store.recorder.conversationId,events:[],...(runtimeError?{error:'Worker runtime failed.'}:configError?{error:configError}:{})};
         const value=await workerRequest(identity,'heartbeat',heartbeat,signal) as WorkerControl;
         if(!value||!['running','stopped'].includes(value.desiredState)||!Number.isSafeInteger(value.desiredRevision)||
@@ -180,7 +185,46 @@ export async function runManagedWorker(identity:ManagedIdentity,env:NodeJS.Proce
       }
       try {await delay(5000,undefined,{signal});}catch{break;}
     }
-  }finally{probeController.abort();signal.removeEventListener('abort',abortProbes);await probes;try{await runtime.stop(()=>eventUpload.close());}finally{await eventUpload.close();}}
+  }finally{probeController.abort();signal.removeEventListener('abort',abortProbes);await Promise.all([probes,controls]);try{await runtime.stop(()=>eventUpload.close());}finally{await eventUpload.close();}}
+}
+
+/** Receipt delivery never waits for generation or the inbound chat event queue. */
+export async function receiveRunControls(identity:ManagedIdentity,cancel:(runId:string)=>Promise<RunCancelResult>,signal:AbortSignal):Promise<void> {
+  while(!signal.aborted) {
+    const attempt=new AbortController();
+    const connectionSignal=AbortSignal.any([signal,attempt.signal]);
+    let reader:ReadableStreamDefaultReader<Uint8Array>|undefined;
+    let idle:NodeJS.Timeout|undefined;
+    const touch=()=>{clearTimeout(idle);idle=setTimeout(()=>attempt.abort(),15000);};touch();
+    const flights=new Map<string,Promise<void>>();
+    try {
+      const response=await directFetch(`${identity.url}/internal/workers/${encodeURIComponent(identity.botId)}/run-controls/stream`,{
+        headers:{authorization:`Bearer ${identity.token}`,accept:'text/event-stream'},signal:connectionSignal,redirect:'error'});
+      if(!response.ok||!response.body||!response.headers.get('content-type')?.startsWith('text/event-stream'))throw new Error('Control connection unavailable.');
+      reader=response.body.getReader();
+      const decoder=new TextDecoder();
+      const parser=new TransportEventParser(async(type,data)=>{
+        if(type!=='cancel-run')throw new Error('Invalid run control.');
+        const command=JSON.parse(data) as RunCancellation;
+        if(!runIdentity(command.id)||!runIdentity(command.runId)||!['requested','received'].includes(command.status))throw new Error('Invalid run control.');
+        if(flights.has(command.id))return;
+        const result=cancel(command.runId); // Synchronously closes acceptance before any ACK request.
+        const flight=(async()=>{
+          await workerRequest(identity,'run-controls/ack',{id:command.id,runId:command.runId,status:'received'},connectionSignal);
+          const status=await result;
+          await workerRequest(identity,'run-controls/ack',{id:command.id,runId:command.runId,status},connectionSignal);
+        })();
+        flights.set(command.id,flight);
+        void flight.then(()=>flights.delete(command.id),()=>attempt.abort()); // Replay after a failed ACK.
+      },16*1024);
+      while(!connectionSignal.aborted) {
+        const next=await reader.read();if(next.done)break;
+        touch();await parser.push(decoder.decode(next.value,{stream:true}));
+      }
+    }catch{/* Console reconnects replay only the same durable run IDs. */}
+    finally{clearTimeout(idle);attempt.abort();await reader?.cancel().catch(()=>{});}
+    try{await delay(500,undefined,{signal});}catch{break;}
+  }
 }
 
 /** Diagnostics have a separate control channel and never enter the chat scheduler. */
