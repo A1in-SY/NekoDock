@@ -41,7 +41,7 @@ import { incomingRecall } from './incoming-recall.js';
 const logger = createLogger();
 
 function createRuntime(config:Config, signal:AbortSignal, identity?:ManagedIdentity):WorkerRuntime {
-  const secrets=[config.agentApiKey,config.replyDecision.apiKey,config.memory.apiKey,config.memory.embeddingApiKey,config.token,identity?.token,config.webSearch.provider==='tavily'?config.webSearch.apiKey:'',config.tts.provider==='mimo'?config.tts.apiKey:'',...proxySecrets(config.networkProxy)].filter((value):value is string=>!!value);
+  const secrets=[config.agentApiKey,config.replyDecision.apiKey,config.memory.apiKey,config.memory.embeddingApiKey,config.token,identity?.token,config.webSearch.provider!=='none'?config.webSearch.apiKey:'',config.tts.provider==='mimo'?config.tts.apiKey:'',...proxySecrets(config.networkProxy)].filter((value):value is string=>!!value);
   const logger=createLogger({secrets});
   const imageNetwork=createNetworkClient(config.networkProxy,logger,'images');
   const speechNetwork=createNetworkClient(config.networkProxy,logger,'tts');

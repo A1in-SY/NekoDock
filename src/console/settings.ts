@@ -49,7 +49,7 @@ export function defaultSettings(): BotSettings {
     allowCommands: false, allowFileWrites: true, taskCreatorOnly: true, persona: '', replyMode: 'random', replyProbability: 5,
     replyJudgeBaseUrl: 'https://api.typesafe.ai/v1', replyJudgeModel: 'jev-latest', replyJudgeThreshold: 0.7, replyJudgeTimeout: 3, replyJudgeInstructions: '',
     proxyEnabled: false, proxyUrl: '', proxyNoProxy: DEFAULT_NO_PROXY, proxyForTools: true,
-    searchProvider: 'none', searchBaseUrl: 'https://api.tavily.com', searchDepth: 'basic', searchResults: 8, searchTimeout: 30,
+    searchProvider: 'none', searchBaseUrl: 'https://api.tavily.com', searchDepth: 'basic', searchResults: 8, searchTimeout: 30, deepseekSearchBaseUrl: 'https://api.deepseek.com',
     voiceEnabled: false, voiceProbability: 20, ttsProvider: 'none',
     ttsBaseUrl: 'https://api.xiaomimimo.com/v1', ttsModel: 'mimo-v2.5-tts', ttsVoice: 'mimo_default', ttsStyle: '',
     edgeVoice: 'zh-CN-XiaoxiaoNeural', edgeRate: '+0%', edgePitch: '+0Hz', edgeVolume: '+0%',
@@ -98,10 +98,10 @@ export function validateSettings(input: unknown, existing?: BotSettings): BotSet
     if (typeof value === 'string' && value.length > (key === 'persona' ? 200_000 : 16_000)) throw new Error(`${key} 内容过长`);
     (config as unknown as Record<string, unknown>)[key] = value;
   }
-  for (const key of ['wsUrl', 'model', 'baseUrl', 'searchBaseUrl', 'ttsBaseUrl', 'ttsModel', 'ttsVoice', 'edgeVoice', 'replyJudgeBaseUrl', 'replyJudgeModel'] as const) config[key] = config[key].trim();
+  for (const key of ['wsUrl', 'model', 'baseUrl', 'searchBaseUrl', 'deepseekSearchBaseUrl', 'ttsBaseUrl', 'ttsModel', 'ttsVoice', 'edgeVoice', 'replyJudgeBaseUrl', 'replyJudgeModel'] as const) config[key] = config[key].trim();
   oneOf(config.modelApi, ['openai-responses', 'openai-completions'], 'modelApi');
   oneOf(config.reasoning, ['', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'], 'reasoning');
-  oneOf(config.searchProvider, ['none', 'tavily'], 'searchProvider');
+  oneOf(config.searchProvider, ['none', 'tavily', 'deepseek'], 'searchProvider');
   oneOf(config.ttsProvider, ['none', 'edge-tts', 'mimo'], 'ttsProvider');
   oneOf(config.replyMode, ['random', 'jev'], 'replyMode');
   if (config.replyJudgeThreshold < 0 || config.replyJudgeThreshold > 1) throw new Error('replyJudgeThreshold 必须为 0 至 1');
@@ -139,6 +139,7 @@ export function validateSettings(input: unknown, existing?: BotSettings): BotSet
   if (parsed.replyDecision.mode === 'jev') config.replyJudgeBaseUrl = parsed.replyDecision.baseUrl;
   if (parsed.agentBaseUrl) config.baseUrl = parsed.agentBaseUrl;
   if (parsed.webSearch.provider === 'tavily') config.searchBaseUrl = parsed.webSearch.baseUrl;
+  if (parsed.webSearch.provider === 'deepseek') config.deepseekSearchBaseUrl = parsed.webSearch.baseUrl;
   if (parsed.tts.provider === 'mimo') config.ttsBaseUrl = parsed.tts.baseUrl;
   return config;
 }
@@ -181,6 +182,10 @@ export function settingsToEnv(config: BotSettings, target: { type: 'group' | 'pr
     TAVILY_API_KEY: config.tavilyApiKey ?? '', TAVILY_SEARCH_BASE_URL: config.searchBaseUrl,
     TAVILY_SEARCH_DEPTH: config.searchDepth, TAVILY_MAX_RESULTS: String(config.searchResults), WEB_SEARCH_TIMEOUT_MS: String(config.searchTimeout * 1000),
   });
+  if (config.searchProvider === 'deepseek') Object.assign(env, {
+    DEEPSEEK_SEARCH_API_KEY: config.deepseekSearchApiKey ?? '', DEEPSEEK_SEARCH_BASE_URL: config.deepseekSearchBaseUrl,
+    DEEPSEEK_SEARCH_MAX_RESULTS: String(config.searchResults), WEB_SEARCH_TIMEOUT_MS: String(config.searchTimeout * 1000),
+  });
   if (config.ttsProvider !== 'none') Object.assign(env, {
     TTS_TIMEOUT_MS: String(config.ttsTimeout * 1000), TTS_MAX_CHARS: String(config.ttsMaxChars), TTS_MAX_BYTES: String(config.ttsMaxMiB * MiB),
   });
@@ -222,6 +227,9 @@ export function settingsFromEnv(env: Record<string, string | undefined>, persona
   config.searchProvider = search.provider;
   if (search.provider === 'tavily') Object.assign(config, {
     tavilyApiKey: search.apiKey, searchBaseUrl: search.baseUrl, searchDepth: search.searchDepth, searchResults: search.maxResults, searchTimeout: search.timeoutMs / 1000,
+  });
+  if (search.provider === 'deepseek') Object.assign(config, {
+    deepseekSearchApiKey: search.apiKey, deepseekSearchBaseUrl: search.baseUrl, searchResults: search.maxResults, searchTimeout: search.timeoutMs / 1000,
   });
   const tts = parsed.tts;
   config.ttsProvider = tts.provider;

@@ -756,7 +756,7 @@ function BotCard({
           }
         >
           <Icon name="globe" />
-          {b.config.searchProvider === "tavily" ? "Tavily 搜索" : "搜索已关闭"}
+          {b.config.searchProvider === "deepseek" ? "DeepSeek 搜索" : b.config.searchProvider === "tavily" ? "Tavily 搜索" : "搜索已关闭"}
         </span>
         <span
           className={"feature-chip " + (b.config.voiceEnabled ? "enabled" : "")}

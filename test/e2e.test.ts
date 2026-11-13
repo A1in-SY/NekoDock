@@ -125,11 +125,17 @@ test('首次升级 Pi 以切换水位开始新会话，旧待发与历史不导�
   assert.equal(f.outgoing.length, 2);
 });
 
-test('Pi 自定义搜索工具直接调用 Tavily，搜索与抓取结果返回模型后再回复', { timeout: dockerImage ? 45_000 : 25_000 }, async t => {
+for (const searchProvider of ['tavily', 'deepseek'] as const) test(`Pi 自定义搜索工具直接调用 ${searchProvider}，搜索与抓取结果返回模型后再回复`, { timeout: dockerImage ? 45_000 : 25_000 }, async t => {
   const f = await piFixture(t, (call, response) => {
     if (call.results.length === 0) {
       const names = call.body.tools.map((tool: any) => tool.name ?? tool.function?.name);
       assert.ok(names.includes('web_search')); assert.ok(names.includes('web_fetch'));
+      const definition = call.body.tools.find((tool: any) => (tool.name ?? tool.function?.name) === 'web_search');
+      const schema = definition.parameters ?? definition.function?.parameters;
+      if (searchProvider === 'deepseek') {
+        assert.equal(schema.properties.query.maxLength, 128);
+        assert.equal('topic' in schema.properties, false); assert.equal('days' in schema.properties, false);
+      } else assert.ok(schema.properties.topic && schema.properties.days);
       respond(call, response, [{ name: 'web_search', arguments: { query: 'isolated-private-search-query', maxResults: 2 } }]);
     } else if (call.results.length === 1) {
       assert.match(JSON.stringify(call.results), /SEARCH_MARKER/);
@@ -143,20 +149,31 @@ test('Pi 自定义搜索工具直接调用 Tavily，搜索与抓取结果返回�
     let raw = ''; for await (const chunk of request) raw += String(chunk);
     requests.push({ path: request.url, authorization: request.headers.authorization, body: JSON.parse(raw) });
     response.writeHead(200, { 'content-type': 'application/json' });
-    response.end(JSON.stringify(request.url?.endsWith('/search') ? { results: [{ url: 'https://example.com/source', title: 'Local source', content: 'SEARCH_MARKER' }] }
-      : { results: [{ url: 'https://example.com/source', raw_content: 'EXTRACT_MARKER' }] }));
+    response.end(JSON.stringify(request.url?.endsWith('/search')
+      ? { results: [{ url: 'https://example.com/source', title: 'Local source', ...(searchProvider === 'deepseek' ? { summary: 'SEARCH_MARKER' } : { content: 'SEARCH_MARKER' }) }] }
+      : searchProvider === 'deepseek' ? { title: 'Local source', content: 'EXTRACT_MARKER' }
+        : { results: [{ url: 'https://example.com/source', raw_content: 'EXTRACT_MARKER' }] }));
   })().catch(error => { f.failures.push(error); response.end('{}'); }); });
   await new Promise<void>(resolve => service.listen(0, bindHost, resolve));
   t.after(() => { service.closeAllConnections(); return new Promise<void>(resolve => service.close(() => resolve())); });
-  const bridge = await f.start('1001', { WEB_SEARCH_PROVIDER: 'tavily', TAVILY_API_KEY: 'isolated-private-tavily-key',
-    TAVILY_SEARCH_BASE_URL: `http://${requestHost}:${(service.address() as AddressInfo).port}/api/tavily`, WEB_SEARCH_TIMEOUT_MS: '2000' });
+  const searchBaseUrl = `http://${requestHost}:${(service.address() as AddressInfo).port}/api/${searchProvider}`;
+  const searchKey = `isolated-private-${searchProvider}-key`;
+  const bridge = await f.start('1001', { WEB_SEARCH_PROVIDER: searchProvider, WEB_SEARCH_TIMEOUT_MS: '2000',
+    ...(searchProvider === 'deepseek' ? { DEEPSEEK_SEARCH_API_KEY: searchKey, DEEPSEEK_SEARCH_BASE_URL: searchBaseUrl }
+      : { TAVILY_API_KEY: searchKey, TAVILY_SEARCH_BASE_URL: searchBaseUrl }) });
   await f.waitFor(() => f.napcat.clients.size === 1, 'Worker 应连接'); f.send('search');
   await f.waitFor(() => f.complete(1), '搜索、抓取、发送应形成一个完整真实 Pi 工具循环');
-  assert.deepEqual(requests.map(request => request.path), ['/api/tavily/search', '/api/tavily/extract']);
-  assert.ok(requests.every(request => request.authorization === 'Bearer isolated-private-tavily-key'));
-  assert.equal(requests[0]!.body.query, 'isolated-private-search-query'); assert.equal(requests[0]!.body.max_results, 2);
-  assert.deepEqual(requests[1]!.body.urls, ['https://example.com/source']);
+  assert.deepEqual(requests.map(request => request.path), searchProvider === 'deepseek' ? ['/api/deepseek/v1/tools/search', '/api/deepseek/v1/tools/fetch'] : ['/api/tavily/search', '/api/tavily/extract']);
+  assert.ok(requests.every(request => request.authorization === `Bearer ${searchKey}`));
+  assert.equal(requests[0]!.body.query, 'isolated-private-search-query');
+  if (searchProvider === 'deepseek') {
+    assert.equal(requests[0]!.body.count, 2); assert.equal(requests[0]!.body.need_content, false);
+    assert.deepEqual(requests[1]!.body, { url: 'https://example.com/source' });
+  } else {
+    assert.equal(requests[0]!.body.max_results, 2); assert.deepEqual(requests[1]!.body.urls, ['https://example.com/source']);
+  }
   assert.equal(f.calls.length, 4); assert.equal(f.outgoing.length, 1); assert.equal(f.outgoing[0]?.params.message[0]?.data.text, 'search-result-reply');
-  assert.doesNotMatch(JSON.stringify(f.calls.map(call => call.body)), /isolated-private-tavily-key/);
-  assert.doesNotMatch(bridge.logs.join('\n'), /isolated-private-tavily-key|isolated-private-search-query|SEARCH_MARKER|EXTRACT_MARKER/);
+  assert.equal(JSON.stringify(f.calls.map(call => call.body)).includes(searchKey), false);
+  assert.equal(bridge.logs.join('\n').includes(searchKey), false);
+  assert.doesNotMatch(bridge.logs.join('\n'), /isolated-private-search-query|SEARCH_MARKER|EXTRACT_MARKER/);
 });

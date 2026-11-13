@@ -343,7 +343,7 @@ export class PiRunner implements AgentRunner {
             const path = await validatePiSession(config.home, message.path);
             onSession(path); log('info', 'agent.session.established', { session_ref: fingerprint(path) });
           } else if (message.type === 'event') {
-            const secrets = [...presentationSecrets,...proxySecrets(config.networkProxy),config.apiKey, config.webSearch?.provider === 'tavily' ? config.webSearch.apiKey : undefined].filter((value): value is string => !!value);
+            const secrets = [...presentationSecrets,...proxySecrets(config.networkProxy),config.apiKey, config.webSearch && config.webSearch.provider !== 'none' ? config.webSearch.apiKey : undefined].filter((value): value is string => !!value);
             const payload=message.event.type.startsWith('tool.')||message.event.type==='thinking.updated'
               ? safeToolPayload(message.event.payload,secrets) as Record<string,unknown>:message.event.payload;
             if(message.event.type==='thinking.updated'&&message.event.itemId) {
@@ -354,7 +354,7 @@ export class PiRunner implements AgentRunner {
               tool: String(message.event.payload.tool ?? 'unknown'), item_ref: fingerprint(message.event.itemId ?? ''), status: String(message.event.payload.status ?? '') });
           } else if (message.type === 'failure') {
             // Provider messages may contain URLs or echoed input. Persist only bounded, redacted diagnostics.
-            const error = piFailure(message.code, message.message ?? '', [...proxySecrets(config.networkProxy),config.apiKey ?? '', config.webSearch?.provider === 'tavily' ? config.webSearch.apiKey : '']);
+            const error = piFailure(message.code, message.message ?? '', [...proxySecrets(config.networkProxy),config.apiKey ?? '', config.webSearch && config.webSearch.provider !== 'none' ? config.webSearch.apiKey : '']);
             if (message.modelFailure === true) Object.assign(error, {modelFailure:true});
             stop(error);
           } else if (message.type === 'done') { done = true; }

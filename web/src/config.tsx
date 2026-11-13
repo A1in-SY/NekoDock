@@ -531,21 +531,37 @@ export function Configuration({
           {providers("searchProvider", [
             ["none", "关闭", "不启用网络搜索", "globe"],
             ["tavily", "Tavily", "为模型提供搜索与网页读取", "search"],
+            ["deepseek", "DeepSeek", "使用 DeepSeek 搜索与网页读取 API", "search"],
           ])}
-          {draft.searchProvider === "tavily" ? (
+          {draft.searchProvider !== "none" ? (
             <div className="form-grid">
-              {secret("Tavily API Key", "tavilyApiKey")}
-              {field(
-                "服务地址",
-                "searchBaseUrl",
-                "默认 https://api.tavily.com，也可填写自定义代理地址。",
-                "url",
-                true,
+              {draft.searchProvider === "tavily" ? (
+                <>
+                  {secret("Tavily API Key", "tavilyApiKey")}
+                  {field(
+                    "服务地址",
+                    "searchBaseUrl",
+                    "默认 https://api.tavily.com，也可填写自定义代理地址。",
+                    "url",
+                    true,
+                  )}
+                  {select("搜索深度", "searchDepth", [
+                    ["basic", "Basic · 标准"],
+                    ["advanced", "Advanced · 深入"],
+                  ])}
+                </>
+              ) : (
+                <>
+                  {secret("DeepSeek 搜索 API Key", "deepseekSearchApiKey")}
+                  {field(
+                    "服务地址",
+                    "deepseekSearchBaseUrl",
+                    "默认 https://api.deepseek.com，自动追加 /v1/tools/search 或 /v1/tools/fetch。",
+                    "url",
+                    true,
+                  )}
+                </>
               )}
-              {select("搜索深度", "searchDepth", [
-                ["basic", "Basic · 标准"],
-                ["advanced", "Advanced · 深入"],
-              ])}
               {field(
                 "最多返回来源数",
                 "searchResults",
@@ -560,7 +576,7 @@ export function Configuration({
                 "超时后返回问题，不持续重复尝试。",
                 "number",
                 false,
-                { min: 1, max: 3600 },
+                { min: 1, max: 300 },
               )}
             </div>
           ) : (

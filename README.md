@@ -441,9 +441,20 @@ Console 本地计算并持久化结果，重复投递或重启不会对同一条
 
 ### 网络搜索
 
-同时只启用一个搜索供应商，目前为 `none` 或 `tavily`。选择 Tavily 后向 Pi 注册 `web_search`、`web_fetch`，直接调用现有 Provider，不启动搜索 MCP 子进程。
+同时只启用一个搜索供应商：`none`、`tavily` 或 `deepseek`。启用后向 Pi 注册 `web_search`、`web_fetch`，通过所选供应商的独立 HTTP API 获取资料。搜索供应商与主模型分别配置。
 
-配置 API Key、HTTP(S) 基础地址、`basic` / `advanced` 深度、默认结果数和超时。程序在基础地址后追加 `/search` 或 `/extract`；代理服务在宿主机时，将地址中的主机部分填写为 `host.docker.internal`，端口和路径按代理服务的实际配置填写。工具失败返回可诊断错误，不自动重试；调用额度按供应商规则计算。
+在实例「网络搜索」中配置所选供应商的 API Key 和 HTTP(S) 基础地址，两家服务分别保留地址和密钥。默认返回 8 条来源，可设置 1–20 条；默认超时 30 秒，最多 300 秒。设置保存在 Console 数据库，通过配置版本下发给 Worker。
+
+| 供应商 | 配置与行为 |
+| --- | --- |
+| Tavily | 默认地址 `https://api.tavily.com`，追加 `/search` 或 `/extract`；支持 `basic` / `advanced` 深度及 `topic`、`days` 参数 |
+| DeepSeek | 默认地址 `https://api.deepseek.com`，追加 `/v1/tools/search` 或 `/v1/tools/fetch`；单独填写搜索 API Key，可使用与 DeepSeek 模型相同的 Key，程序不自动继承模型密钥 |
+
+DeepSeek 搜索词最多 128 个 Unicode 字符，支持在查询中使用 `site:`、`-site:`、引号、`after:YYYY-MM-DD` 和 `before:YYYY-MM-DD`。其工具参数为 `query` 和可选的 `maxResults`，不接受 Tavily 的 `topic`、`days`。返回来源按上游排序，优先使用面向模型的 `summary`，为空时使用短摘要。
+
+`web_fetch` 接受 1–20 个 HTTP(S) URL。DeepSeek 按 URL 去重，以最多 3 个并发请求逐页读取，保留部分成功结果；整批读取共用一次超时预算，包含排队和响应正文。取消时停止后续请求并中止正在执行的读取；密钥无效或余额不足时终止整批。DeepSeek 对每次成功搜索、每个成功读取的页面分别按官方规则计费。
+
+搜索和读取沿用实例网络代理与绕过设置。代理服务在宿主机时，将地址中的主机部分填写为 `host.docker.internal`，端口和路径按代理服务的实际配置填写。工具失败返回可诊断错误，不自动重试；DeepSeek 错误区分密钥、余额、限流、网页不可读取、上游异常和超时。
 
 ### 图片
 

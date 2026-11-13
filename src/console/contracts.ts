@@ -13,14 +13,15 @@ export interface BotSettings {
   memoryModel: string; memoryBaseUrl: string; memoryApiKey?: string; memoryEmbeddingProvider: 'none' | 'openai-compatible'; memoryEmbeddingBaseUrl: string; memoryEmbeddingModel: string; memoryEmbeddingApiKey?: string;
   replyMode: 'random' | 'jev'; replyProbability: number;
   replyJudgeBaseUrl: string; replyJudgeModel: string; replyJudgeApiKey?: string; replyJudgeThreshold: number; replyJudgeTimeout: number; replyJudgeInstructions: string;
-  searchProvider: 'none' | 'tavily'; tavilyApiKey?: string; searchBaseUrl: string; searchDepth: 'basic' | 'advanced'; searchResults: number; searchTimeout: number;
+  searchProvider: 'none' | 'tavily' | 'deepseek'; tavilyApiKey?: string; searchBaseUrl: string; searchDepth: 'basic' | 'advanced'; searchResults: number; searchTimeout: number;
+  deepseekSearchApiKey?: string; deepseekSearchBaseUrl: string;
   voiceEnabled: boolean; voiceProbability: number; ttsProvider: 'none' | 'edge-tts' | 'mimo'; mimoApiKey?: string; ttsBaseUrl: string; ttsModel: string; ttsVoice: string; ttsStyle: string;
   edgeVoice: string; edgeRate: string; edgePitch: string; edgeVolume: string; ttsTimeout: number; ttsMaxChars: number; ttsMaxMiB: number;
   batchSize: number; replyMaxChars: number; modelTimeout: number; actionTimeout: number; retrySeconds: number; reconnectSeconds: number; imageMaxMiB: number; imageTimeout: number;
   /** Worker retention and Console transfer limits apply independently, per instance. */
   imageCacheDays: number; imageCacheMaxMiB: number; imageTransitHours: number; imageTransitMaxMiB: number;
 }
-export const SECRET_FIELDS = ['napcatToken','modelApiKey','tavilyApiKey','mimoApiKey','proxyUsername','proxyPassword','memoryApiKey','memoryEmbeddingApiKey','replyJudgeApiKey'] as const;
+export const SECRET_FIELDS = ['napcatToken','modelApiKey','tavilyApiKey','deepseekSearchApiKey','mimoApiKey','proxyUsername','proxyPassword','memoryApiKey','memoryEmbeddingApiKey','replyJudgeApiKey'] as const;
 export type SecretField = typeof SECRET_FIELDS[number];
 export type NapcatConnectionField = 'wsUrl' | 'napcatToken' | 'reconnectSeconds' | 'actionTimeout';
 export interface NapcatConnectionRecord {
