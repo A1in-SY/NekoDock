@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
+import { rmSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { createServer, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -200,13 +201,18 @@ export async function piFixture(t: TestContext, handler: ModelHandler) {
     let path = join(dataPath(target), 'bridge.sqlite3');
     if (dockerImage) {
       // macOS and Linux must not share a live SQLite WAL/SHM mapping. Read a
-      // container-created snapshot instead of opening the Worker's live DB.
+      // fresh snapshot each time: host-created SHM files may use another UID.
       const bridge = active.get(target); assert.ok(bridge?.name);
+      const snapshot = `e2e-read-${randomUUID()}.sqlite3`;
       execFileSync('docker', ['exec', bridge.name, 'node', '--input-type=module', '-e',
-        "import{DatabaseSync,backup}from'node:sqlite';const db=new DatabaseSync('/data/bridge.sqlite3',{readOnly:true});await backup(db,'/data/e2e-read.sqlite3');db.close();"], { stdio: 'ignore', timeout: 5000 });
-      path = join(dataPath(target), 'e2e-read.sqlite3');
+        "import{DatabaseSync,backup}from'node:sqlite';const db=new DatabaseSync('/data/bridge.sqlite3',{readOnly:true});await backup(db,process.argv[1]);db.close();", `/data/${snapshot}`], { stdio: 'ignore', timeout: 5000 });
+      path = join(dataPath(target), snapshot);
     }
-    const db = new DatabaseSync(path, { readOnly: true }); try { return fn(db); } finally { db.close(); }
+    const db = new DatabaseSync(path, { readOnly: true });
+    try { return fn(db); } finally {
+      db.close();
+      if (dockerImage) for (const suffix of ['', '-wal', '-shm']) rmSync(path + suffix, { force: true });
+    }
   };
   const complete = (cursor: number, target = '1001') => read(target, db => db.prepare('SELECT cursor FROM instance_state WHERE id=1').get()?.cursor === cursor && db.prepare('SELECT COUNT(*) AS n FROM pending_batch').get()?.n === 0);
   const event = (id: string, text = id, mention = true, target = '1001', sender = '501') => ({ post_type: 'message', message_type: 'group', group_id: target, self_id: '999', user_id: sender,
