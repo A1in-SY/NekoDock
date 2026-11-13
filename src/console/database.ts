@@ -16,6 +16,8 @@ import { ConsolePluginAssets } from './plugin-assets.js';
 import { ConsoleMessageState } from './message-state.js';
 import type { ChatRecallEvent } from '../chat-context-contract.js';
 import { RunControls } from './run-controls.js';
+import { ModelPresets } from './model-presets.js';
+import { modelSettings } from '../model-preset-contract.js';
 
 export interface RuntimeRecord {
   state: RuntimeState; connected: boolean; processing: boolean; drained: boolean; lastHeartbeat: number | null; error?: string;
@@ -45,6 +47,7 @@ export class ConsoleDatabase {
   readonly pluginAssets: ConsolePluginAssets;
   readonly messageState: ConsoleMessageState;
   readonly runControls: RunControls;
+  readonly modelPresets: ModelPresets;
 
   constructor(path: string, keyPath: string) {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
@@ -143,6 +146,7 @@ export class ConsoleDatabase {
       const botColumns = this.db.prepare('PRAGMA table_info(bots)').all() as Array<{name: string}>;
       if (!botColumns.some(column => column.name === 'connection_id')) this.db.exec('ALTER TABLE bots ADD COLUMN connection_id TEXT REFERENCES napcat_connections(id)');
       this.migrateNapcatConnections();
+      this.modelPresets = new ModelPresets(this.db, {requireBot:id=>this.requireBot(id), encrypt:value=>this.encrypt(value), decrypt:value=>this.decrypt(value), transaction:fn=>this.transaction(fn), change:(id,type)=>this.change(id,type)});
       this.messageState=new ConsoleMessageState(this.db,{requireBot:id=>this.requireBot(id),connection:id=>this.getNapcatConnection(id)});
       this.runControls=new RunControls(this.db,{requireBot:id=>this.requireBot(id),change:(id,type)=>this.change(id,type)});
       this.memory = new ConsoleMemory(this.db, {requireBot:id=>this.requireBot(id),encrypt:value=>this.encrypt(value),decrypt:value=>this.decrypt(value),transaction:fn=>this.transaction(fn),change:(id,type)=>this.change(id,type)});
@@ -205,6 +209,7 @@ export class ConsoleDatabase {
         for (const bot of this.listBots().filter(candidate => candidate.connectionId === id)) {
           const revision = bot.desiredRevision + 1; const now = Date.now();
           this.db.prepare('INSERT INTO config_revisions(bot_id,revision,config_cipher,created_at) VALUES (?,?,?,?)').run(bot.id, revision, this.encrypt(this.managedSettings(bot.config)), now);
+          this.modelPresets.bind(bot.id, revision, bot.modelPreset);
           this.db.prepare('UPDATE bots SET desired_revision=?,updated_at=? WHERE id=?').run(revision, now, bot.id);
           this.change(bot.id, 'bot.updated', {revision});
         }
@@ -412,14 +417,19 @@ export class ConsoleDatabase {
     return this.requireBot(id);
   }
 
-  updateBot(id: string, input: { name?: string; description?: string; connectionId?: string; config?: unknown; targetType?: string; targetId?: string; expectedRevision?: number }): BotRecord {
+  updateBot(id: string, input: { name?: string; description?: string; connectionId?: string; config?: unknown; modelPreset?: unknown; targetType?: string; targetId?: string; expectedRevision?: number }): BotRecord {
     return this.transaction(() => {
       const bot = this.requireBot(id);
       if ((input.targetType !== undefined && input.targetType !== bot.targetType) || (input.targetId !== undefined && input.targetId !== bot.targetId)) throw new Error('实例创建后不能修改群聊／私聊类型或目标号码');
       if (input.expectedRevision !== undefined && input.expectedRevision !== bot.desiredRevision) throw new Error('配置版本冲突，请刷新后重试');
       const name = input.name === undefined ? bot.name : validName(input.name);
       const description = input.description === undefined ? bot.description : validDescription(input.description);
-      const config = input.config === undefined ? bot.config : validateSettings(input.config, bot.config);
+      const preset = input.modelPreset === undefined || input.modelPreset === null ? undefined : this.modelPresets.resolve(input.modelPreset);
+      if (input.config !== undefined && !record(input.config)) throw new Error('配置必须为对象');
+      const config = preset ? validateSettings({...input.config as object, ...preset.config}, bot.config)
+        : input.config === undefined ? bot.config : validateSettings(input.config, bot.config);
+      const sameModel = JSON.stringify(modelSettings(config)) === JSON.stringify(modelSettings(bot.config));
+      const binding = preset?.binding ?? (input.modelPreset === null || !sameModel ? undefined : bot.modelPreset);
       let connectionId = bot.connectionId;
       const configPatch = input.config;
       if (input.connectionId !== undefined) connectionId = this.requireConnection(input.connectionId).id;
@@ -435,10 +445,11 @@ export class ConsoleDatabase {
         if (previous.accountId !== next.accountId) throw new Error('不能将现有实例切换到其他 QQ 账号，请新建实例');
       }
       if (this.botActive(bot)) this.assertNoActiveDuplicate(bot.id, bot.targetType, bot.targetId, connectionId);
-      const configChanged = connectionId !== bot.connectionId || JSON.stringify(this.managedSettings(config)) !== JSON.stringify(this.managedSettings(bot.config));
+      const configChanged = connectionId !== bot.connectionId || JSON.stringify(binding) !== JSON.stringify(bot.modelPreset) || JSON.stringify(this.managedSettings(config)) !== JSON.stringify(this.managedSettings(bot.config));
       const revision = bot.desiredRevision + (configChanged ? 1 : 0);
       const now = Date.now();
       if (configChanged) this.db.prepare('INSERT INTO config_revisions(bot_id,revision,config_cipher,created_at) VALUES (?,?,?,?)').run(id, revision, this.encrypt(this.managedSettings(config)), now);
+      if (configChanged) this.modelPresets.bind(id, revision, binding);
       this.db.prepare('UPDATE bots SET name=?,description=?,connection_id=?,desired_revision=?,updated_at=? WHERE id=?').run(name, description, connectionId, revision, now, id);
       this.change(id, 'bot.updated', { revision });
       return this.requireBot(id);
@@ -843,10 +854,11 @@ export class ConsoleDatabase {
     const connection = this.requireConnection(row.connection_id);
     const config = normalizeSettings(this.decrypt(row.config_cipher));
     config.wsUrl = connection.wsUrl; config.napcatToken = connection.token; config.reconnectSeconds = connection.reconnectSeconds; config.actionTimeout = connection.actionTimeout;
+    const binding = this.modelPresets?.binding(row.id, row.desired_revision);
     return { id: row.id, name: row.name, description: row.description, targetType: row.target_type, targetId: row.target_id, connectionId: row.connection_id,
       desiredRevision: row.desired_revision, appliedRevision: row.applied_revision, desiredState: row.desired_state,
       volume: row.volume, workerToken: this.decrypt(row.worker_token) as string, createdAt: row.created_at, updatedAt: row.updated_at,
-      imported: Boolean(row.imported), config };
+      imported: Boolean(row.imported), config, ...(binding ? {modelPreset: binding} : {}) };
   }
   private eventRecord(row: EventRow): ConsoleEvent {
     return { seq: row.worker_seq, type: row.type, time: row.time,

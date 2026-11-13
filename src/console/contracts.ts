@@ -43,6 +43,7 @@ export interface NapcatDeliveryRecord {
   botId: string; deliveryId: string; payloadHash: string; state: NapcatDeliveryState; result?: unknown; createdAt: number; updatedAt: number;
 }
 export interface BotRecord {
+  modelPreset?: import('../model-preset-contract.js').ModelPresetBinding;
   id: string; name: string; description: string; targetType: 'group' | 'private'; targetId: string; connectionId: string;
   config: BotSettings; desiredRevision: number; appliedRevision: number; desiredState: DesiredState;
   volume: string; workerToken: string; createdAt: number; updatedAt: number; imported: boolean;

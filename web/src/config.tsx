@@ -5,6 +5,11 @@ import type {
   SecretField,
 } from "../../src/console/contracts";
 import { api, errorText } from "./api";
+import type { ModelPresetSelection, PublicModelPreset } from "../../src/model-preset-contract";
+import { modelSettings } from "../../src/model-preset-contract";
+import { ModelFields } from "./model-fields";
+import { SecretInput } from "./secret-input";
+import { presetConfigPatch, presetStatus } from "./model-preset-state";
 import { Icon, Notice } from "./ui";
 import { canSelectConnection, canSwitchConnection, instanceSettings } from "./connections-state";
 import type { ConnectionView } from "./connections-state";
@@ -58,6 +63,11 @@ export function Configuration({
     config: bot.config,
     connectionId: bot.connectionId,
   });
+  const [presets, setPresets] = useState<PublicModelPreset[]>([]);
+  const [presetsError, setPresetsError] = useState("");
+  const [selection, setSelection] = useState<ModelPresetSelection | null | undefined>();
+  const [presetName, setPresetName] = useState("");
+  const [savingPreset, setSavingPreset] = useState(false);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState("");
   const [probe, setProbe] = useState<NetworkProbe | null>(null);
@@ -65,13 +75,17 @@ export function Configuration({
   const [probeError, setProbeError] = useState("");
   const selectedConnection = connections.find(connection => connection.id === connectionId);
   const connectionAllowed = connectionId === bot.connectionId || Boolean(selectedConnection && canSelectConnection(bot, selectedConnection, connections));
+  const presetSource = selection === undefined ? bot.modelPreset : selection;
+  const latestPreset = presets.find(item => item.id === presetSource?.id);
   const dirty =
+    selection !== undefined ||
     name !== saved.name ||
     connectionId !== saved.connectionId ||
     description !== saved.description ||
     JSON.stringify(draft) !== JSON.stringify(saved.config) ||
     Object.keys(secrets).length > 0;
   const reset = () => {
+    setSelection(undefined);
     setDraft({ ...bot.config });
     setName(bot.name);
     setConnectionId(bot.connectionId);
@@ -107,6 +121,26 @@ export function Configuration({
     window.addEventListener("beforeunload", warn);
     return () => window.removeEventListener("beforeunload", warn);
   }, [dirty]);
+  useEffect(() => {
+    if (section !== "model") return;
+    let active = true;
+    const load = () => void api<PublicModelPreset[]>("/api/model-presets").then(items => { if (active) {setPresets(items); setPresetsError("");} }).catch(error => {if (active) setPresetsError(errorText(error));});
+    load(); window.addEventListener("focus", load);
+    return () => {active = false; window.removeEventListener("focus", load);};
+  }, [section]);
+  const selectPreset = (id: string) => {
+    setSecrets(old => {const next = {...old}; delete next.modelApiKey; return next;});
+    if (!id) {setSelection(null); setDraft(old => ({...old, ...modelSettings(bot.config)})); return;}
+    const preset = presets.find(item => item.id === id);
+    if (preset) {setSelection({id: preset.id, revision: preset.revision}); setDraft(old => ({...old, ...preset.config})); setError("");}
+  };
+  const saveAsPreset = async () => {
+    setSavingPreset(true); setError("");
+    try {
+      const preset = await api<PublicModelPreset>(`/api/bots/${encodeURIComponent(bot.id)}/model-presets`, {method:"POST", body:JSON.stringify({name:presetName, expectedRevision:revision})});
+      setPresets(old => [...old, preset]); setPresetName(""); notify("当前模型配置已保存为预设");
+    } catch (error) {setError(errorText(error));} finally {setSavingPreset(false);}
+  };
   useEffect(() => {
     if (!probe || probe.status !== "pending") return;
     const controller = new AbortController();
@@ -281,7 +315,7 @@ export function Configuration({
     setPending(true);
     setError("");
     try {
-      const config = instanceSettings({ ...draft, ...secrets });
+      const config = presetConfigPatch(instanceSettings({ ...draft, ...secrets }), selection);
       const updated = await api<PublicBot>(
         "/api/bots/" + encodeURIComponent(bot.id),
         {
@@ -292,9 +326,11 @@ export function Configuration({
             connectionId,
             config,
             expectedRevision: revision,
+            ...(selection === undefined ? {} : {modelPreset: selection}),
           }),
         },
       );
+      setSelection(undefined);
       setDraft({ ...updated.config });
       setName(updated.name);
       setConnectionId(updated.connectionId);
@@ -413,52 +449,25 @@ export function Configuration({
           <p className="config-intro">
             选择模型服务，调整思考深度和会话的上下文容量。
           </p>
-          <div className="form-grid">
-            {select("API 协议", "modelApi", [
-              ["openai-responses", "Responses"],
-              ["openai-completions", "Chat Completions"],
-            ], "按服务商实际支持选择；执行失败时不会自动切换协议。", true)}
-            {field("API Base URL", "baseUrl", "填写服务地址，包含服务商要求的 /v1 等路径。", "url", true)}
-            {secret("API Key", "modelApiKey")}
-            {field(
-              "模型 ID",
-              "model",
-              "例如 cmd/deepseek-v4.1-flash-fast",
-              "text",
-              true,
-            )}
-            {draft.supportsReasoning && select(
-              "思考等级", "reasoning",
-              ["", "none", "minimal", "low", "medium", "high", "xhigh", "max"].map(value => [value, value || "default"] as const),
-              "仅发送所选等级；服务商与模型需实际支持。",
-            )}
-            {field("最大输出 · tokens", "maxOutputTokens", "包含模型的输出预算，须小于等于上下文预留量。", "number", false, { min: 1, step: 1 })}
+          <div className="preset-picker">
+            <div className="form-field full"><label htmlFor="model-preset">模型预设</label>
+              <select id="model-preset" disabled={pending || !!presetsError} value={selection === undefined ? bot.modelPreset?.id ?? "" : selection?.id ?? ""} onChange={event => selectPreset(event.target.value)}>
+                <option value="">自定义配置</option>
+                {bot.modelPreset && !presets.some(item => item.id === bot.modelPreset!.id) && <option value={bot.modelPreset.id} disabled>{bot.modelPreset.name} · 已删除</option>}
+                {presets.map(preset => <option key={preset.id} value={preset.id}>{preset.name} · v{preset.revision}</option>)}
+              </select>
+              <small className="field-hint">当前：{presetStatus(bot.modelPreset, presets)}。选择后保存，整套替换模型参数。</small>
+              {presetsError && <span className="field-error">{presetsError}</span>}
+            </div>
+            <a className="btn" href="#model-presets">管理预设</a>
+            {latestPreset && latestPreset.revision !== presetSource?.revision && <button className="btn" disabled={pending} onClick={() => selectPreset(latestPreset.id)}>应用新版 v{latestPreset.revision}</button>}
           </div>
+          {selection ? <>
+            <dl className="connection-facts preset-preview"><div><dt>模型</dt><dd>{draft.model}</dd></div><div><dt>服务地址</dt><dd className="preset-url">{draft.baseUrl}</dd></div><div><dt>API 协议</dt><dd>{draft.modelApi === 'openai-responses' ? 'Responses' : 'Chat Completions'}</dd></div><div><dt>API Key</dt><dd>{presets.find(item => item.id === selection.id)?.keyConfigured ? '使用预设中保存的密钥' : '预设未配置密钥，将清除原密钥'}</dd></div><div><dt>上下文窗口</dt><dd>{draft.contextWindow.toLocaleString()} tokens</dd></div><div><dt>思考等级</dt><dd>{draft.supportsReasoning ? draft.reasoning || 'default' : '不发送'}</dd></div></dl>
+            <Notice>保存后使用所选预设的完整配置。需要修改参数时，可先编辑预设，或应用后调整此实例。</Notice>
+          </> : <ModelFields value={draft} onChange={(key, value) => {setSelection(null); setDraft(old => ({...old, [key]:value})); setError("");}} secret={secret("API Key", "modelApiKey")} />}
           <hr className="form-divider" />
-          <h3 className="form-subtitle">模型能力</h3>
-          {toggle("支持图片输入", "supportsImages", "关闭时不向模型发送图片内容。")}
-          {toggle("支持思考参数", "supportsReasoning", "按模型能力开启；关闭后保留已选等级，但不发送思考参数。")}
-          <hr className="form-divider" />
-          <h3 className="form-subtitle">上下文管理</h3>
-          <div className="form-grid">
-            {field(
-              "上下文窗口 · tokens",
-              "contextWindow",
-              "默认 200000；不能超过服务商和模型的实际能力。",
-              "number",
-              false,
-              { min: 1, step: 1 },
-            )}
-            {field(
-              "自动压缩阈值 · tokens",
-              "compactLimit",
-              "默认 160000；窗口与阈值之间须留足最大输出空间。",
-              "number",
-              false,
-              { min: 1, step: 1 },
-            )}
-          </div>
-          <div className="form-grid">{field("压缩保留近期历史 · tokens", "compactKeepRecentTokens", "默认 20000；必须小于压缩阈值。", "number", false, {min:1,step:1})}{field("压缩摘要输出上限 · tokens", "compactSummaryMaxTokens", "默认 4000；不能超过模型最大输出量。", "number", false, {min:1,step:1})}</div>
+          <div className="form-field full"><label htmlFor="save-preset-name">将当前配置保存为预设</label><div className="preset-save-row"><input id="save-preset-name" maxLength={80} value={presetName} onChange={event => setPresetName(event.target.value)} placeholder="预设名称" disabled={savingPreset || pending} /><button className="btn" disabled={dirty || savingPreset || pending || !presetName.trim()} onClick={() => void saveAsPreset()}>{savingPreset ? '保存中…' : '保存为预设'}</button></div><small className="field-hint">{dirty ? '先保存实例更改，再将完整配置保存为预设。' : '包含当前已保存的 API Key，保存后所有实例均可选用。'}</small></div>
           <Notice>
             每个实例维护独立会话。模型与人格配置在当前轮结束后应用；需要空会话时使用 /new。
           </Notice>
@@ -916,71 +925,11 @@ export function Configuration({
               onClick={() => void save()}
             >
               <Icon name="check" />
-              保存配置
+              {selection ? "保存并切换" : "保存配置"}
             </button>
           </div>
         </div>
       </div>
-    </div>
-  );
-}
-function SecretInput({
-  label,
-  field,
-  configured,
-  value,
-  onChange,
-}: {
-  label: string;
-  field: SecretField;
-  configured: boolean;
-  value: string | null | undefined;
-  onChange: (v: string | null | undefined) => void;
-}) {
-  const [visible, setVisible] = useState(false);
-  return (
-    <div className="form-field full">
-      <label htmlFor={"f-" + field}>{label}</label>
-      <div className="secret-row">
-        <div className="password-field">
-          <input
-            id={"f-" + field}
-            type={visible ? "text" : "password"}
-            value={typeof value === "string" ? value : ""}
-            onChange={(e) => onChange(e.target.value || undefined)}
-            disabled={value === null}
-            autoComplete="new-password"
-            placeholder={
-              value === null
-                ? "保存后清除此凭据"
-                : configured
-                  ? "已配置，留空保留"
-                  : "输入凭据"
-            }
-          />
-          <button
-            type="button"
-            onClick={() => setVisible((v) => !v)}
-            aria-label={"显示或隐藏" + label}
-          >
-            <Icon name="eye" />
-          </button>
-        </div>
-        {configured && (
-          <button
-            type="button"
-            className={"btn " + (value === null ? "" : "danger")}
-            onClick={() => onChange(value === null ? undefined : null)}
-          >
-            {value === null ? "保留原凭据" : "清除"}
-          </button>
-        )}
-      </div>
-      <small className="field-hint">
-        {value === null
-          ? "已标记清除，保存配置后生效。"
-          : "凭据加密保存，保存后不回显原值。"}
-      </small>
     </div>
   );
 }

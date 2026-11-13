@@ -709,3 +709,13 @@
     width: 13px;
   }
 }
+.preset-fields { border: 0; padding: 0; margin: 0; min-width: 0; }
+.preset-picker { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
+.preset-picker .form-field { flex: 1; min-width: 0; }
+.preset-picker > .btn { flex-shrink: 0; }
+.preset-save-row { display: flex; gap: 10px; }
+.preset-save-row input { flex: 1; min-width: 0; }
+.preset-save-row .btn { flex-shrink: 0; }
+.preset-preview { margin-bottom: 20px; }
+.preset-url { overflow-wrap: anywhere; }
+@media (max-width: 600px) { .preset-picker { align-items: stretch; flex-direction: column; } }

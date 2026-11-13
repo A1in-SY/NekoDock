@@ -13,6 +13,7 @@ import { api, errorText, post } from "./api";
 import { Avatar, BotConnectivity, Empty, ErrorBox, fmt, Icon, Notice, Status } from "./ui";
 import { Configuration } from "./config";
 import { Connections } from "./connections";
+import { ModelPresets } from "./model-presets";
 import { instanceSettings } from "./connections-state";
 import type { ConnectionView } from "./connections-state";
 import { Conversation } from "./conversation";
@@ -45,7 +46,7 @@ class MonitorBoundary extends Component<
 }
 
 type Route = {
-  page: "overview" | "connections" | "plugins" | "monitor" | "logs" | "bot";
+  page: "overview" | "model-presets" | "connections" | "plugins" | "monitor" | "logs" | "bot";
   id?: string;
   tab: "chat" | "config" | "logs" | "tasks" | "memory" | "plugins";
 };
@@ -53,7 +54,7 @@ function route(): Route {
   const p = location.hash.slice(1).split("/");
   return {
     page:
-      p[0] === "plugins" ? "plugins" : p[0] === "connections"
+      p[0] === "model-presets" ? "model-presets" : p[0] === "plugins" ? "plugins" : p[0] === "connections"
         ? "connections"
         : p[0] === "monitor"
           ? "monitor"
@@ -268,6 +269,7 @@ export function App() {
             <span className="count">{bots.length}</span>
           </a>
           <a className={"nav-item " + (current.page === "connections" ? "active" : "")} href="#connections" title="NapCat 连接"><Icon name="network" /><span className="nav-label">NapCat 连接</span></a>
+          <a className={"nav-item " + (current.page === "model-presets" ? "active" : "")} href="#model-presets" title="模型预设"><Icon name="sliders" /><span className="nav-label">模型预设</span></a>
           <a className={"nav-item " + (current.page === "plugins" ? "active" : "")} href="#plugins" title="插件"><Icon name="spark" /><span className="nav-label">插件</span></a>
           <a
             className={
@@ -509,6 +511,7 @@ export function App() {
             </>
           )}
           {current.page === "connections" && <Connections connections={connections} bots={bots} error={connectionsError} reload={loadConnections} notify={notify} />}
+          {current.page === "model-presets" && <ModelPresets />}
           {current.page === "plugins" && <PluginCatalog />}
           {current.page === "monitor" && (
             <MonitorBoundary>

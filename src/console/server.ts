@@ -120,6 +120,11 @@ export async function createConsole(options:ConsoleOptions){
  app.post('/api/logout',async(req,reply)=>{const token=req.cookies.console_session;auth.logout(token);logs.closeSession(token);conversations.closeSession(token);for(const client of streams)if(client.token===token){client.response.end();streams.delete(client);}reply.clearCookie('console_session',{path:'/'});return {ok:true};});
  app.get('/api/defaults',async()=>{const {wsUrl:_url,napcatToken:_token,reconnectSeconds:_reconnect,actionTimeout:_timeout,...settings}=defaultSettings();return settings;});
  app.get('/api/bots',async()=>db.listBots().map(bot=>publicBot(bot.id)));
+ app.get('/api/model-presets',async()=>db.modelPresets.list());
+ app.post('/api/model-presets',async(req,reply)=>reply.code(201).send(db.modelPresets.create(req.body)));
+ app.put<{Params:{id:string}}>('/api/model-presets/:id',async(req)=>db.modelPresets.update(req.params.id,req.body));
+ app.delete<{Params:{id:string}}>('/api/model-presets/:id',async(req)=>{db.modelPresets.delete(req.params.id,object(req.body).expectedRevision);return {ok:true};});
+ app.post<{Params:{id:string}}>('/api/bots/:id/model-presets',async(req,reply)=>reply.code(201).send(db.modelPresets.fromBot(req.params.id,req.body)));
  app.get('/api/plugins',async()=>db.plugins.catalog());
  app.get<{Params:{id:string}}>('/api/bots/:id/plugins',async(req)=>db.plugins.list(req.params.id));
  app.get<{Params:{id:string};Querystring:{limit?:string}}>('/api/bots/:id/plugins/jobs',async(req)=>db.plugins.jobs(req.params.id,numeric(req.query.limit,50)));
@@ -174,6 +179,7 @@ export async function createConsole(options:ConsoleOptions){
  app.put<{Params:{id:string}}>('/api/bots/:id',async(req)=>{
   const body=object(req.body);if(!Number.isSafeInteger(body.expectedRevision))throw new Error('配置版本无效，请刷新后重试');
   const bot=db.updateBot(req.params.id,{name:body.name as string|undefined,description:body.description as string|undefined,config:body.config,
+   modelPreset:body.modelPreset,
    connectionId:body.connectionId as string|undefined,
    expectedRevision:body.expectedRevision as number,targetType:body.targetType as string|undefined,targetId:body.targetId as string|undefined});
   changes();logEvent(logger,'info','console.bot_updated',{botId:bot.id,revision:bot.desiredRevision});return publicBot(bot.id);
