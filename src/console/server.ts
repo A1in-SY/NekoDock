@@ -443,7 +443,11 @@ export async function createConsole(options:ConsoleOptions){
  if(options.timers!==false){
   const every=(ms:number,fn:()=>void)=>{const timer=setInterval(fn,ms);timer.unref();timers.push(timer);};
   every(2000,()=>void lifecycle.reconcile().then(()=>refreshGateway()).catch(()=>logEvent(logger,'warn','console.reconcile_failed')));
-  every(5000,()=>void sample());every(1000,projectActivities);every(3600000,()=>{try{metrics.compact();}catch{logEvent(logger,'warn','console.metrics_compact_failed');}});
+  every(5000,()=>void sample());every(1000,projectActivities);every(3600000,()=>{
+   const started=performance.now();
+   try{metrics.compact();logEvent(logger,'info','console.metrics_compacted',{duration_ms:Math.round((performance.now()-started)*1000)/1000});}
+   catch{logEvent(logger,'warn','console.metrics_compact_failed',{duration_ms:Math.round((performance.now()-started)*1000)/1000});}
+  });
   every(60000,()=>{void db.pluginAssets.cleanup(pluginAssetsRoot).catch(()=>logEvent(logger,'warn','plugin.assets.cleanup_failed'));});
  }
  app.addHook('preClose',async()=>{for(const timer of timers)clearInterval(timer);logs.close();conversations.close();runControls.close();for(const stream of streams)stream.response.end();await inspections.close();await gateway.close();await incomingImages.close();});

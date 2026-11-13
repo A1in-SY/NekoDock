@@ -5,15 +5,22 @@ import type { MetricSample } from './contracts.js';
 import type { DockerStats } from './docker.js';
 import { ActivitiesDatabase } from './activities.js';
 
-export interface ResourceCounters { time: number; rx: number | null; tx: number | null; cpuNs?: number | null }
+export interface ResourceCounters { time: number; rx: number | null; tx: number | null; cpuNs?: number | null; clock?: 'docker' | 'local' | 'invalid' }
 
 /** CPU is percent of one core, memory is MiB and throughput is KiB/s. */
 export function resourceSample(botId: string, stats: DockerStats, previous?: ResourceCounters, now = Date.now()): { sample: MetricSample; counters: ResourceCounters } {
+  const clock = stats.read === undefined ? 'local' : 'docker';
+  const collectedAt = stats.read === undefined ? now : Date.parse(stats.read);
+  const baseline = previous && (previous.clock ?? 'local') === clock ? previous : undefined;
+  // Docker may collect a response long before the Console gets to process it.
+  const usable = Number.isSafeInteger(collectedAt) && collectedAt >= 0 && (!baseline || collectedAt > baseline.time);
+  const time = usable ? collectedAt : now;
+  const seconds = usable && baseline ? (collectedAt - baseline.time) / 1000 : 0;
   const cpu = stats.cpu_stats; const before = stats.precpu_stats;
   const total = cpu?.cpu_usage?.total_usage; const priorTotal = before?.cpu_usage?.total_usage;
   const system = cpu?.system_cpu_usage; const priorSystem = before?.system_cpu_usage;
   let cpuPercent: number | null = null;
-  if (nonnegative(total) && nonnegative(priorTotal) && nonnegative(system) && nonnegative(priorSystem)
+  if (usable && (!previous || baseline) && nonnegative(total) && nonnegative(priorTotal) && nonnegative(system) && nonnegative(priorSystem)
     && positive(cpu?.online_cpus) && system > priorSystem && total >= priorTotal) {
     cpuPercent = (total - priorTotal) / (system - priorSystem) * cpu.online_cpus * 100;
   }
@@ -26,10 +33,10 @@ export function resourceSample(botId: string, stats: DockerStats, previous?: Res
     return interfaces.reduce((sum, value) => sum + value[direction]!, 0);
   };
   const rx = totalBytes('rx_bytes'); const tx = totalBytes('tx_bytes');
-  const seconds = previous ? (now - previous.time) / 1000 : 0;
   if(previous?.cpuNs!==undefined)cpuPercent=nonnegative(total)&&nonnegative(previous.cpuNs)&&seconds>0&&total>=previous.cpuNs?(total-previous.cpuNs)/(seconds*1e9)*100:null;
   const rate = (current: number | null, prior: number | null | undefined): number | null => nonnegative(current) && nonnegative(prior) && seconds > 0 && current >= prior ? (current - prior) / seconds / 1024 : null;
-  return { sample: { botId, time: now, cpu: cpuPercent, memory: memoryMiB, rx: rate(rx, previous?.rx), tx: rate(tx, previous?.tx), latency: null }, counters: { time: now, rx, tx, cpuNs:nonnegative(total)?total:null } };
+  return { sample: { botId, time, cpu: cpuPercent, memory: memoryMiB, rx: rate(rx, previous?.rx), tx: rate(tx, previous?.tx), latency: null },
+    counters: { time, rx: usable ? rx : null, tx: usable ? tx : null, cpuNs: usable && nonnegative(total) ? total : null, clock: usable ? clock : 'invalid' } };
 }
 
 type MetricName = 'cpu' | 'memory' | 'rx' | 'tx' | 'latency';
@@ -89,12 +96,15 @@ export class MetricsDatabase {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const expressions = metricNames.map(name => name === 'latency'
-        ? `MAX(latency) AS latency,SUM(latency_count) AS latency_count`
-        : `SUM(${name}*${name}_count)/NULLIF(SUM(${name}_count),0) AS ${name},SUM(${name}_count) AS ${name}_count,MAX(${name}_peak) AS ${name}_peak`).join(',');
-      const rows = this.db.prepare(`SELECT m.bot_id,CAST(m.time/60000 AS INTEGER)*60000 AS bucket,${expressions}
-        FROM metric_samples m WHERE m.time<? AND (m.resolution=15 OR (m.resolution=60 AND EXISTS
-          (SELECT 1 FROM metric_samples raw WHERE raw.bot_id=m.bot_id AND raw.resolution=15 AND CAST(raw.time/60000 AS INTEGER)=CAST(m.time/60000 AS INTEGER))))
-        GROUP BY m.bot_id,CAST(m.time/60000 AS INTEGER)`).all(cutoff) as unknown as AggregateRow[];
+        ? `MAX(m.latency) AS latency,SUM(m.latency_count) AS latency_count`
+        : `SUM(m.${name}*m.${name}_count)/NULLIF(SUM(m.${name}_count),0) AS ${name},SUM(m.${name}_count) AS ${name}_count,MAX(m.${name}_peak) AS ${name}_peak`).join(',');
+      // Start with new raw minutes, then merge only their existing aggregates through the (bot_id,time) index.
+      const rows = this.db.prepare(`WITH raw_buckets AS (
+          SELECT bot_id,CAST(time/60000 AS INTEGER)*60000 AS bucket FROM metric_samples
+          WHERE time<? AND resolution=15 GROUP BY bot_id,bucket)
+        SELECT b.bot_id,b.bucket,${expressions} FROM raw_buckets b JOIN metric_samples m
+          ON m.bot_id=b.bot_id AND m.time>=b.bucket AND m.time<b.bucket+60000 AND m.resolution IN (15,60)
+        GROUP BY b.bot_id,b.bucket`).all(cutoff) as unknown as AggregateRow[];
       const insert = this.db.prepare(`INSERT OR REPLACE INTO metric_samples(bot_id,time,resolution,cpu,memory,rx,tx,latency,cpu_count,memory_count,rx_count,tx_count,latency_count,cpu_peak,memory_peak,rx_peak,tx_peak) VALUES (?,?,60,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
       for (const row of rows) insert.run(row.bot_id, row.bucket, row.cpu!, row.memory!, row.rx!, row.tx!, row.latency!, ...metricNames.map(name => row[`${name}_count`]!), row.cpu_peak!, row.memory_peak!, row.rx_peak!, row.tx_peak!);
       this.db.prepare('DELETE FROM metric_samples WHERE (time<? AND resolution=15) OR time<?').run(cutoff, now - 30 * 86400000);

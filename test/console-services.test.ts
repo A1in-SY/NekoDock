@@ -7,7 +7,7 @@ import { ConsoleAuth } from '../src/console/auth.js';
 import { ConsoleDatabase } from '../src/console/database.js';
 import { MetricsDatabase, resourceSample } from '../src/console/metrics.js';
 import { Lifecycle } from '../src/console/lifecycle.js';
-import type { DockerClient, ContainerInfo } from '../src/console/docker.js';
+import type { DockerClient, ContainerInfo, DockerStats } from '../src/console/docker.js';
 import type { BotRecord, MetricSample } from '../src/console/contracts.js';
 
 class Settings {
@@ -74,6 +74,44 @@ test('Docker resource sampling converts CPU, memory and network units without re
   assert.equal(resourceSample('bot', { cpu_stats: { system_cpu_usage: 1000, online_cpus: 4 }, precpu_stats: { system_cpu_usage: 600 } }).sample.cpu, null);
 });
 
+function statsAt(time: number, read = new Date(time).toISOString()): DockerStats {
+  return { read, cpu_stats: { cpu_usage: { total_usage: time * 1e6 } }, memory_stats: { usage: 1048576 },
+    networks: { eth0: { rx_bytes: time / 1000 * 1024, tx_bytes: time / 1000 * 2048 } } };
+}
+
+test('resource rates and timestamps follow Docker collection time when responses are delayed', () => {
+  const first = resourceSample('bot', statsAt(1000), undefined, 121000);
+  assert.equal(first.sample.time, 1000);
+  const next = resourceSample('bot', statsAt(121000), first.counters, 123000);
+  assert.deepEqual(next.sample, { botId: 'bot', time: 121000, cpu: 100, memory: 1, rx: 1, tx: 2, latency: null });
+  assert.equal(next.counters.time, 121000); assert.equal(next.counters.clock, 'docker');
+});
+
+test('invalid, duplicate and backwards Docker timestamps reset rate baselines without overwriting the original time', () => {
+  for (const read of ['invalid', new Date(1000).toISOString(), new Date(500).toISOString()]) {
+    const first = resourceSample('bot', statsAt(1000), undefined, 1000);
+    const invalid = resourceSample('bot', statsAt(2000, read), first.counters, 2500);
+    assert.deepEqual(invalid.sample, { botId: 'bot', time: 2500, cpu: null, memory: 1, rx: null, tx: null, latency: null });
+    assert.equal(invalid.counters.clock, 'invalid');
+    assert.equal(invalid.counters.cpuNs, null); assert.equal(invalid.counters.rx, null); assert.equal(invalid.counters.tx, null);
+    const recovered = resourceSample('bot', statsAt(3000), invalid.counters, 3500);
+    assert.equal(recovered.sample.cpu, null); assert.equal(recovered.sample.rx, null); assert.equal(recovered.sample.tx, null);
+    const next = resourceSample('bot', statsAt(5000), recovered.counters, 5500);
+    assert.equal(next.sample.cpu, 100); assert.equal(next.sample.rx, 1); assert.equal(next.sample.tx, 2);
+  }
+});
+
+test('switching between Docker and local fallback timestamps starts a new rate baseline', () => {
+  const { read: _read, ...legacy } = statsAt(1000);
+  const first = resourceSample('bot', legacy, undefined, 120000);
+  const docker = resourceSample('bot', statsAt(3000), first.counters, 121000);
+  assert.equal(docker.sample.cpu, null); assert.equal(docker.sample.rx, null);
+  const next = resourceSample('bot', statsAt(5000), docker.counters, 122000);
+  assert.equal(next.sample.cpu, 100); assert.equal(next.sample.rx, 1);
+  const fallback = resourceSample('bot', legacy, next.counters, 123000);
+  assert.equal(fallback.sample.time, 123000); assert.equal(fallback.sample.cpu, null); assert.equal(fallback.sample.rx, null);
+});
+
 function sample(time: number, cpu: number | null, extra: Partial<MetricSample> = {}): MetricSample {
   return { botId: 'bot', time, cpu, memory: null, rx: null, tx: null, latency: null, ...extra };
 }
@@ -94,6 +132,29 @@ test('metrics compact complete minutes after seven days, preserve weighted avera
   assert.equal(queried.samples[0]!.memory, null);
   db.insert(sample(39 * day, null)); db.compact(40 * day);
   assert.equal(db.query(0, 40 * day).samples.length, 1); assert.equal(db.query(0, 40 * day).samples[0]!.cpu, null);
+});
+
+test('minute compaction merges late values per resource while preserving null weights and the next raw minute', t => {
+  const db = new MetricsDatabase(':memory:'); t.after(() => db.close());
+  const day = 86400000, minute = 3 * day, now = 10 * day + 61000;
+  db.insert(sample(minute + 1000, 10, { memory: 30, tx: 3, latency: 1 }));
+  db.insert(sample(minute + 2000, 50, { rx: 4, latency: 3 }));
+  db.insert(sample(minute + 1000, 80, { botId: 'other', memory: 12 }));
+  db.compact(now);
+  const unrelated = db.db.prepare("SELECT * FROM metric_samples WHERE bot_id='other'").get();
+  db.insert(sample(minute + 30000, 90, { memory: 60, rx: 8, tx: 7, latency: 2 }));
+  db.insert(sample(minute + 60000, 999));
+  db.compact(now);
+  const merged = db.db.prepare("SELECT * FROM metric_samples WHERE bot_id='bot' AND resolution=60").get()!;
+  for (const [name, average, count, peak] of [['cpu', 50, 3, 90], ['memory', 45, 2, 60], ['rx', 6, 2, 8], ['tx', 5, 2, 7]] as const) {
+    assert.equal(merged[name], average); assert.equal(merged[`${name}_count`], count); assert.equal(merged[`${name}_peak`], peak);
+  }
+  assert.equal(merged.latency, 3); assert.equal(merged.latency_count, 3);
+  assert.deepEqual(db.db.prepare("SELECT * FROM metric_samples WHERE bot_id='other'").get(), unrelated);
+  assert.equal(db.db.prepare('SELECT cpu FROM metric_samples WHERE resolution=15').get()!.cpu, 999);
+  const rows = db.db.prepare('SELECT * FROM metric_samples ORDER BY bot_id,time,resolution').all();
+  db.compact(now);
+  assert.deepEqual(db.db.prepare('SELECT * FROM metric_samples ORDER BY bot_id,time,resolution').all(), rows);
 });
 
 test('metrics query weights mixed resolutions and keeps missing provider fields null', t => {
