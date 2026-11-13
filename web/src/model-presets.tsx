@@ -48,6 +48,9 @@ function PresetEditor({preset, defaults, onClose, onSaved}: {preset?: PublicMode
   useEffect(() => {
     const previous = document.activeElement as HTMLElement | null;
     ref.current?.querySelector<HTMLInputElement>('input')?.focus();
+    return () => { previous?.focus(); };
+  }, []);
+  useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.key === 'Escape' && !pending) onClose();
       if (event.key !== 'Tab') return;
@@ -55,7 +58,7 @@ function PresetEditor({preset, defaults, onClose, onSaved}: {preset?: PublicMode
       if (event.shiftKey && document.activeElement === items[0]) { event.preventDefault(); items.at(-1)?.focus(); }
       else if (!event.shiftKey && document.activeElement === items.at(-1)) { event.preventDefault(); items[0]?.focus(); }
     };
-    document.addEventListener('keydown', onKey);return () => { document.removeEventListener('keydown', onKey); previous?.focus(); };
+    document.addEventListener('keydown', onKey);return () => { document.removeEventListener('keydown', onKey); };
   }, [pending, onClose]);
   const save = async () => {
     setPending(true); setError('');
