@@ -12,6 +12,7 @@ import type { PiConfig } from './pi-protocol.js';
 import type { TaskToolRequest } from './scheduled-contract.js';
 import { proxyEnvironment, type NetworkProxyConfig } from './network.js';
 import { REPLY_ACCEPTED_NOTICE } from './reply-receipt.js';
+import { observeChild } from './activity.js';
 
 function within(root: string, path: string): boolean {
   const child = relative(root, path); return !isAbsolute(child) && child !== '..' && !child.startsWith(`..${sep}`);
@@ -66,6 +67,7 @@ export function createPiTools(config: PiConfig, send: (request: unknown, signal?
     spawnHook: context => ({ ...context, env: shellEnvironment(process.env, config.networkProxy) }), operations: { exec: (command, cwd, options) => new Promise((resolveCommand, reject) => {
       options.signal?.throwIfAborted();
       const child = spawn('/bin/bash', ['-c', command], { cwd, env: shellEnvironment(process.env, config.networkProxy), stdio: ['ignore', 'pipe', 'pipe'] });
+      observeChild(child);
       let aborted = false; let timedOut = false;
       const cancel = () => { aborted = true; if (child.pid) killTree(child.pid); };
       const timer = options.timeout ? setTimeout(() => { timedOut = true; if (child.pid) killTree(child.pid); }, options.timeout * 1000) : undefined;

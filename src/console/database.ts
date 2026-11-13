@@ -565,7 +565,8 @@ export class ConsoleDatabase {
     if (!conversation) return null;
     const pageSize = Math.min(500, Math.max(1, Number.isSafeInteger(limit) ? limit : 100));
     if (before !== undefined && (!Number.isSafeInteger(before) || before < 1)) throw new Error('会话分页游标无效');
-    const rows = this.db.prepare('SELECT * FROM event_projection WHERE bot_id=? AND conversation_id=? AND worker_seq<? ORDER BY worker_seq DESC LIMIT ?')
+    const rows = this.db.prepare(`SELECT * FROM event_projection WHERE bot_id=? AND conversation_id=? AND worker_seq<?
+      AND type<>'activity.updated' AND NOT(type='schedule.run.event' AND COALESCE(json_extract(payload,'$.eventType'),'')='activity.updated') ORDER BY worker_seq DESC LIMIT ?`)
       .all(id, conversation.id, before ?? Number.MAX_SAFE_INTEGER, pageSize + 1) as unknown as EventRow[];
     let more = rows.length > pageSize;
     if (more) rows.pop();
@@ -705,7 +706,7 @@ export class ConsoleDatabase {
       items.push(item); bytes += size; cursor = item.seq;
     }
     const view = this.getConversation(id, undefined, 1);
-    return { cursor, reset: false, view: view ? { ...view, cursor, items: items.filter(item => item.conversationId === view.id), nextBefore: null } : null };
+    return { cursor, reset: false, view: view ? { ...view, cursor, items: items.filter(item => item.conversationId === view.id&&item.type!=='activity.updated'&&!(item.type==='schedule.run.event'&&item.payload.eventType==='activity.updated')), nextBefore: null } : null };
   }
 
   importIncomingCounts(id: string, rows: Array<{ time: number; count: number }>): void {
@@ -730,6 +731,19 @@ export class ConsoleDatabase {
     const samples = rows.map(row => (JSON.parse(row.payload) as Record<string, unknown>).durationMs)
       .filter((value): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0).sort((a, b) => a - b);
     return samples.length ? samples[Math.ceil(samples.length * 0.95) - 1]! / 1000 : null;
+  }
+  monitorEvents(id:string,after:number,limit=500):ConsoleEvent[] {
+    return (this.db.prepare(`SELECT * FROM event_projection WHERE bot_id=? AND worker_seq>? AND time>=? AND
+      (type IN ('activity.updated','runtime.activated','run.started','batch.completed','run.failed','run.cancelled','schedule.run.updated')
+        OR (type='schedule.run.event' AND json_extract(payload,'$.eventType')='activity.updated'))
+      ORDER BY worker_seq LIMIT ?`).all(id,after,Date.now()-7*86400000,limit) as unknown as EventRow[]).map(row=>this.eventRecord(row));
+  }
+  monitorPluginJobs():import('./activities.js').MonitorPluginJob[] {
+    return this.db.prepare(`SELECT id,root_job_id AS rootJobId,bot_id AS botId,plugin_id AS pluginId,source_message_id AS sourceMessageId,conversation_id AS conversationId,operation,state,attempts,lease_until AS leaseUntil,created_at AS createdAt,started_at AS startedAt,finished_at AS finishedAt
+      FROM plugin_jobs WHERE created_at>=? OR state IN ('queued','running','resolving') ORDER BY created_at DESC LIMIT 1000`).all(Date.now()-7*86400000) as unknown as import('./activities.js').MonitorPluginJob[];
+  }
+  monitorPluginJob(botId:string,id:string):import('./activities.js').MonitorPluginJob|undefined {
+    return this.db.prepare(`SELECT id,root_job_id AS rootJobId,bot_id AS botId,plugin_id AS pluginId,source_message_id AS sourceMessageId,conversation_id AS conversationId,operation,state,created_at AS createdAt FROM plugin_jobs WHERE bot_id=? AND id=?`).get(botId,id) as unknown as import('./activities.js').MonitorPluginJob|undefined;
   }
   getSetting(key: string): string | null {
     const row = this.db.prepare('SELECT value FROM settings WHERE key=?').get(key) as { value: string } | undefined;
@@ -756,7 +770,7 @@ export class ConsoleDatabase {
     if (!result.changes) return;
     this.plugins.observe(bot.id,{...event,conversationId:conversationId??undefined});
     this.runControls.observe(bot.id,{...event,conversationId:conversationId??undefined});
-    if (event.type.startsWith('schedule.')) this.tasks.ingest(bot.id, {...event, payload: sanitized});
+    if (event.type.startsWith('schedule.')&&!(event.type==='schedule.run.event'&&payload.eventType==='activity.updated')) this.tasks.ingest(bot.id, {...event, payload: sanitized});
     if (conversationId) {
       this.db.prepare('INSERT OR IGNORE INTO conversations(bot_id,id,started_at) VALUES (?,?,?)').run(bot.id, conversationId, event.time);
       if (event.type === 'conversation.started') this.db.prepare('UPDATE runtime SET conversation_id=? WHERE bot_id=?').run(conversationId, bot.id);

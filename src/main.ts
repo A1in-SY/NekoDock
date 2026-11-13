@@ -200,6 +200,7 @@ function createRuntime(config:Config, signal:AbortSignal, identity?:ManagedIdent
     maxOutputTokens: Math.min(config.agentMaxOutputTokens, 8192), timeoutMs: Math.min(config.agentTimeoutMs, 180_000),
     allowCommands: false, allowFileWrites: false, persona: '', targetType: config.target.type,
     networkProxy: config.networkProxy, logger, presentationSecrets: secrets,
+    onActivity:event=>{try{store.recorder.append(event.type,event.payload);}catch{}},
   });
   memory = new MemoryCoordinator({
     store: memoryStore, config: config.memory, runner: memoryRunner, logger, secrets,

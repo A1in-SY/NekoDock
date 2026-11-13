@@ -1,4 +1,5 @@
 import {spawn} from 'node:child_process';
+import { observeChild, observePluginRun } from '../../activity.js';
 import {mkdtemp,mkdir,readFile,readdir,rm,stat,writeFile} from 'node:fs/promises';
 import {join} from 'node:path';
 import {createNetworkClient,proxyEnvironment} from '../../network.js';
@@ -81,6 +82,7 @@ async function run(command:string,args:string[],options:{cwd:string;env:NodeJS.P
   options.signal.throwIfAborted();
   return await new Promise((resolve,reject)=>{
     const child=spawn(command,args,{cwd:options.cwd,env:options.env,stdio:['ignore','pipe','pipe'],detached:process.platform!=='win32'});
+    observeChild(child);
     const output:Buffer[]=[],errors:Buffer[]=[];let bytes=0,errorBytes=0,ended=false,timedOut=false;
     const kill=()=>{if(child.pid)try{process.platform==='win32'?child.kill('SIGKILL'):process.kill(-child.pid,'SIGKILL');}catch{}};
     const timer=setTimeout(()=>{timedOut=true;kill();},options.timeoutMs);
@@ -97,7 +99,7 @@ export async function executeBilibiliJob(input:PluginRunnerJob,root:string,signa
   const job:BilibiliJob={...input,config:validateBilibiliConfig(input.config),resource:{...safe,...(safe.kind==='video'?{part:input.resource.part??safe.part??1}:{})}};
   await mkdir(root,{recursive:true,mode:0o700});const directory=await mkdtemp(join(root,'job-'));
   const cleanup=()=>rm(directory,{recursive:true,force:true});
-  const network=createNetworkClient(job.networkProxy,silent,'plugins');const fetcher=tools.fetch??network.fetch,execute=tools.run??run;
+  const network=createNetworkClient(job.networkProxy,silent,'plugins');const fetcher=tools.fetch??network.fetch,execute=observePluginRun(tools.run??run);
   const timeout=AbortSignal.timeout(job.config.timeoutSeconds*1000),combined=AbortSignal.any([signal,timeout]);
   const env=childEnvironment(job,directory);
   const args=['--ignore-config','--no-cache-dir','--no-playlist','--no-progress','--socket-timeout','15','--retries','0','--fragment-retries','0'];

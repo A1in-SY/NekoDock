@@ -104,7 +104,7 @@ export class ConsoleForwardInspections {
       const config = this.config(row);
       if (!config || row.expires_at <= now) { this.cancel(row.id, config ? 'PLUGIN_JOB_EXPIRED' : 'PLUGIN_CONFIGURATION_CHANGED'); continue; }
       if (row.state !== 'queued' || excludedBots.has(row.bot_id)) continue;
-      if (!this.db.prepare("UPDATE plugin_jobs SET state='running',attempts=attempts+1 WHERE id=? AND state='queued'").run(row.id).changes) continue;
+      if (!this.db.prepare("UPDATE plugin_jobs SET state='running',started_at=COALESCE(started_at,?),attempts=attempts+1 WHERE id=? AND state='queued'").run(now,row.id).changes) continue;
       return {id: row.id, botId: row.bot_id, sourceMessageId: row.source_message_id, expiresAt: row.expires_at, config, samples: this.data(row).samples};
     }
     return null;

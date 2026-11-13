@@ -8,7 +8,7 @@ import type { NapcatSendResult } from '../transport-protocol.js';
 import { ConsoleForwardInspections } from './forward-inspections.js';
 
 interface Host {requireBot(id:string):BotRecord;encrypt(value:unknown):string;decrypt(value:string):unknown;transaction<T>(fn:()=>T):T;change(id:string,type:string):void;}
-interface JobRow {id:string;bot_id:string;plugin_id:PlatformPluginId;source_message_id:string;conversation_id:string|null;operation:'resolve'|'download'|'prepare'|'execute'|'inspect';resource_key:string;resource_cipher:string;content_cipher?:string|null;presentation_cipher?:string|null;command_execution_cipher?:string|null;finished_at?:number|null;config_revision:number;command_kind:string;automatic:number;state:string;attempts:number;lease:string|null;lease_until:number;created_at:number;expires_at:number;next_attempt:number;error:string|null;uploaded_asset_id?:string|null;}
+interface JobRow {id:string;root_job_id?:string|null;bot_id:string;plugin_id:PlatformPluginId;source_message_id:string;conversation_id:string|null;operation:'resolve'|'download'|'prepare'|'execute'|'inspect';resource_key:string;resource_cipher:string;content_cipher?:string|null;presentation_cipher?:string|null;command_execution_cipher?:string|null;finished_at?:number|null;config_revision:number;command_kind:string;automatic:number;state:string;attempts:number;lease:string|null;lease_until:number;created_at:number;expires_at:number;next_attempt:number;error:string|null;uploaded_asset_id?:string|null;}
 interface ResultRow {id:string;bot_id:string;plugin_id:PlatformPluginId;source_message_id:string;conversation_id:string|null;payload_cipher:string;acknowledged_at:number|null;created_at:number;}
 const object=(v:unknown):Record<string,unknown>|null=>v!==null&&typeof v==='object'&&!Array.isArray(v)?v as Record<string,unknown>:null;
 const identifier=(v:unknown)=>typeof v==='string'&&v.length>0&&v.length<=200?v:typeof v==='number'&&Number.isSafeInteger(v)?String(v):null;
@@ -42,7 +42,7 @@ export class ConsolePlugins {
     }
     else if(!columns.some(column=>column.name==='content_cipher'))db.exec('ALTER TABLE plugin_jobs ADD COLUMN content_cipher TEXT');
     const jobColumns=db.prepare('PRAGMA table_info(plugin_jobs)').all() as Array<{name:string}>;
-    for(const name of ['presentation_cipher','finished_at','command_execution_cipher'])if(!jobColumns.some(column=>column.name===name))db.exec(`ALTER TABLE plugin_jobs ADD COLUMN ${name} ${name==='finished_at'?'INTEGER':'TEXT'}`);
+    for(const name of ['presentation_cipher','finished_at','started_at','root_job_id','command_execution_cipher'])if(!jobColumns.some(column=>column.name===name))db.exec(`ALTER TABLE plugin_jobs ADD COLUMN ${name} ${name==='finished_at'||name==='started_at'?'INTEGER':'TEXT'}`);
     db.exec('CREATE TABLE IF NOT EXISTS plugin_job_assets(job_id TEXT NOT NULL REFERENCES plugin_jobs(id),asset_key TEXT NOT NULL,asset_id TEXT NOT NULL,type TEXT NOT NULL,role TEXT NOT NULL,lease TEXT NOT NULL,PRIMARY KEY(job_id,asset_key));');
     const resultColumns=db.prepare('PRAGMA table_info(plugin_results)').all() as Array<{name:string}>;
     if(!resultColumns.some(column=>column.name==='plugin_id'))db.exec("ALTER TABLE plugin_results ADD COLUMN plugin_id TEXT NOT NULL DEFAULT 'bilibili'");
@@ -261,7 +261,7 @@ export class ConsolePlugins {
         if(row.operation!=='resolve'&&!row.conversation_id)continue;
         if(row.expires_at<=now) {this.fail(row,'PLUGIN_JOB_EXPIRED',now);continue;}
         const lease=randomBytes(24).toString('hex'),leaseUntil=now+(contentPlugin(row.plugin_id).policy(conf.settings).timeoutSeconds+30)*1000;
-        this.db.prepare("UPDATE plugin_jobs SET state='running',lease=?,lease_until=?,attempts=attempts+1 WHERE id=? AND state='queued'").run(lease,leaseUntil,row.id);
+        this.db.prepare("UPDATE plugin_jobs SET state='running',lease=?,lease_until=?,started_at=COALESCE(started_at,?),attempts=attempts+1 WHERE id=? AND state='queued'").run(lease,leaseUntil,now,row.id);
         const previous=this.db.prepare("SELECT payload_cipher FROM plugin_results WHERE bot_id=? AND plugin_id=? AND source_message_id=? AND id LIKE 'enrichment:%' ORDER BY created_at DESC LIMIT 1").get(row.bot_id,row.plugin_id,row.source_message_id) as {payload_cipher:string}|undefined;
         const content=row.content_cipher?this.host.decrypt(row.content_cipher) as PluginContent:previous?(this.host.decrypt(previous.payload_cipher) as PluginResult).content:undefined;
         return {id:row.id,lease,botId:row.bot_id,pluginId:row.plugin_id,operation:row.operation,resource:this.host.decrypt(row.resource_cipher) as PluginResource,config:conf.settings,
@@ -353,8 +353,8 @@ export class ConsolePlugins {
           if(queue.count>=PLUGIN_QUEUE_LIMITS.jobs||queue.bytes+resourceCipher.length+contentCipher.length>PLUGIN_QUEUE_LIMITS.sourceBytes) {
             if(!row.automatic)this.result(row.bot_id,row.source_message_id,`reply:${row.id}`,{pluginId:row.plugin_id,kind:'reply',text:'当前插件处理队列已满，请稍后再试。',deliveryId:`plugin:${row.id}:reply`,automatic:false},now);
           } else {
-          this.db.prepare("INSERT OR IGNORE INTO plugin_jobs(id,bot_id,plugin_id,source_message_id,conversation_id,operation,resource_key,resource_cipher,content_cipher,config_revision,command_kind,automatic,state,created_at,expires_at,presentation_cipher) VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'queued',?,?,?)")
-            .run(randomUUID(),row.bot_id,row.plugin_id,row.source_message_id,row.conversation_id,followup.operation,followup.resource.id,resourceCipher,contentCipher,row.config_revision,row.command_kind,row.automatic,now,row.expires_at,followup.presentation?this.host.encrypt(followup.presentation):null);
+          this.db.prepare("INSERT OR IGNORE INTO plugin_jobs(id,bot_id,plugin_id,source_message_id,conversation_id,operation,resource_key,resource_cipher,content_cipher,config_revision,command_kind,automatic,state,created_at,expires_at,presentation_cipher,root_job_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'queued',?,?,?,?)")
+            .run(randomUUID(),row.bot_id,row.plugin_id,row.source_message_id,row.conversation_id,followup.operation,followup.resource.id,resourceCipher,contentCipher,row.config_revision,row.command_kind,row.automatic,now,row.expires_at,followup.presentation?this.host.encrypt(followup.presentation):null,row.root_job_id??row.id);
           }
         }
       } else if(row.operation==='download') {

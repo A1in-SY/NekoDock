@@ -3,8 +3,9 @@ import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { MetricSample } from './contracts.js';
 import type { DockerStats } from './docker.js';
+import { ActivitiesDatabase } from './activities.js';
 
-export interface ResourceCounters { time: number; rx: number | null; tx: number | null }
+export interface ResourceCounters { time: number; rx: number | null; tx: number | null; cpuNs?: number | null }
 
 /** CPU is percent of one core, memory is MiB and throughput is KiB/s. */
 export function resourceSample(botId: string, stats: DockerStats, previous?: ResourceCounters, now = Date.now()): { sample: MetricSample; counters: ResourceCounters } {
@@ -26,8 +27,9 @@ export function resourceSample(botId: string, stats: DockerStats, previous?: Res
   };
   const rx = totalBytes('rx_bytes'); const tx = totalBytes('tx_bytes');
   const seconds = previous ? (now - previous.time) / 1000 : 0;
+  if(previous?.cpuNs!==undefined)cpuPercent=nonnegative(total)&&nonnegative(previous.cpuNs)&&seconds>0&&total>=previous.cpuNs?(total-previous.cpuNs)/(seconds*1e9)*100:null;
   const rate = (current: number | null, prior: number | null | undefined): number | null => nonnegative(current) && nonnegative(prior) && seconds > 0 && current >= prior ? (current - prior) / seconds / 1024 : null;
-  return { sample: { botId, time: now, cpu: cpuPercent, memory: memoryMiB, rx: rate(rx, previous?.rx), tx: rate(tx, previous?.tx), latency: null }, counters: { time: now, rx, tx } };
+  return { sample: { botId, time: now, cpu: cpuPercent, memory: memoryMiB, rx: rate(rx, previous?.rx), tx: rate(tx, previous?.tx), latency: null }, counters: { time: now, rx, tx, cpuNs:nonnegative(total)?total:null } };
 }
 
 type MetricName = 'cpu' | 'memory' | 'rx' | 'tx' | 'latency';
@@ -38,6 +40,7 @@ export interface MetricQuery { samples: MetricSample[]; peaks: MetricSample[]; s
 
 export class MetricsDatabase {
   readonly db: DatabaseSync;
+  readonly activities: ActivitiesDatabase;
   constructor(path: string) {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
@@ -61,6 +64,7 @@ export class MetricsDatabase {
       }
     }
     if (path !== ':memory:') chmodSync(path, 0o600);
+    this.activities=new ActivitiesDatabase(this.db);
   }
   insert(sample: MetricSample): void {
     if (!sample.botId || !Number.isSafeInteger(sample.time)) throw new Error('监控采样标识或时间无效');
@@ -70,7 +74,7 @@ export class MetricsDatabase {
   }
   query(from: number, to: number): MetricQuery {
     if (!Number.isFinite(from) || !Number.isFinite(to) || from > to) throw new Error('监控时间范围无效');
-    const step = Math.max(15000, Math.ceil((to - from) / 300 / 15000) * 15000);
+    const step = Math.max(5000, Math.ceil((to - from) / 300 / 5000) * 5000);
     const averages = metricNames.filter(name => name !== 'latency').map(name => `SUM(${name}*${name}_count)/NULLIF(SUM(${name}_count),0) AS ${name}`).join(',');
     const peaks = ['cpu', 'memory', 'rx', 'tx'].map(name => `MAX(${name}_peak) AS ${name}_peak`).join(',');
     const rows = this.db.prepare(`SELECT bot_id,CAST(time/? AS INTEGER)*? AS bucket,${averages},MAX(latency) AS latency,${peaks} FROM metric_samples WHERE time>=? AND time<=? GROUP BY bot_id,bucket ORDER BY bucket`)
@@ -79,6 +83,7 @@ export class MetricsDatabase {
     return { step, samples, peaks: rows.map(row => ({ botId: row.bot_id, time: row.bucket, cpu: row.cpu_peak, memory: row.memory_peak, rx: row.rx_peak, tx: row.tx_peak, latency: row.latency })) };
   }
   compact(now = Date.now()): void {
+    this.activities.compact(now);
     // A complete minute is compacted at once, so the moving seven-day boundary cannot overwrite a partial bucket.
     const cutoff = Math.floor((now - 7 * 86400000) / 60000) * 60000;
     this.db.exec('BEGIN IMMEDIATE');

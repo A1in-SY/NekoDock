@@ -34,6 +34,7 @@ export type PiParentMessage = PiStart | { type: 'abort' }
   | {type:'task-result'; id:string; ok:boolean; result?:unknown; error?:string}
   | {type:'memory-result'; id:string; ok:boolean; result?:unknown; error?:string};
 export type PiChildMessage =
+  | { type: 'process-sample'; sample: import('./activity-contract.js').ProcessSample }
   | { type: 'network-log'; level: 'info' | 'warn' | 'error'; message: string }
   | { type: 'session'; path: string }
   | { type: 'event'; event: RunObservation }

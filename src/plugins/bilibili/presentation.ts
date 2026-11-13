@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { imageExtension } from '../../images.js';
 import { renderLimited } from '../../plugin-render.js';
+import { beginActivity } from '../../activity.js';
 import type { PluginContent, PluginContentImage, PluginExecution, PluginOutput, PluginRunnerJob } from '../../plugin-system/contracts.js';
 import { boundedBytes, imageUrl } from './api.js';
 import { contentText, validatePluginContent } from './content.js';
@@ -52,11 +53,13 @@ export async function preparePresentation(job:PluginRunnerJob&{config:BilibiliCo
     if(attempts>=BILIBILI_IMAGE_LIMITS.assets-(mode==='card'?BILIBILI_IMAGE_LIMITS.pages:0)||source&&sourceCount>=BILIBILI_IMAGE_LIMITS.sourceImages){for(const ref of target.references)if('role'in ref)Object.assign(ref,{status:'failed',error:'BILIBILI_IMAGE_LIMIT'});failed=true;continue;}
     attempts++;
     if(source)sourceCount++;
+    const download=beginActivity('download','image_download');
     try {
       const url=imageUrl(image.url);if(!url)throw new BilibiliError('BILIBILI_IMAGE_URL_REJECTED');
       const response=await fetcher(url,{signal,redirect:'error',headers:{'user-agent':'Mozilla/5.0',referer:content.type==='live'?'https://live.bilibili.com/':'https://www.bilibili.com/'}});
       const modified=response.headers.get('last-modified');
       const bytes=await boundedBytes(response,Math.min(BILIBILI_IMAGE_LIMITS.perImageBytes,job.config.maxMiB*1024*1024,job.imageMaxBytes??Infinity));
+      download.end();
       total+=bytes.length;if(total>BILIBILI_IMAGE_LIMITS.totalBytes)throw new BilibiliError('BILIBILI_IMAGE_LIMIT');
       const extension=imageExtension(bytes),key=`source-${files.length}`,path=join(directory,`${key}.${extension}`);
       await writeFile(path,bytes,{mode:0o600});
@@ -64,7 +67,7 @@ export async function preparePresentation(job:PluginRunnerJob&{config:BilibiliCo
       const fetchedAt=Date.now()/1000;
       for(const ref of target.references)Object.assign(ref,{assetKey:key,...('role'in ref?{status:'ready',width:inspected.width,height:inspected.height,fetchedAt,...(modified&&Number.isFinite(Date.parse(modified))?{imageLastModified:modified}:{})}:{})});
       image.fetchedAt=fetchedAt;seen.set(`${image.role}\n${url}`,{key,image});paths[key]=path;files.push({key,path,type:'image',role:image.role});
-    }catch(error){signal.throwIfAborted();failed=true;for(const ref of target.references)if('role'in ref)Object.assign(ref,{status:'failed',error:error instanceof BilibiliError?error.code:'BILIBILI_IMAGE_FAILED'});}
+    }catch(error){download.end(signal.aborted?'cancelled':'failed',error);signal.throwIfAborted();failed=true;for(const ref of target.references)if('role'in ref)Object.assign(ref,{status:'failed',error:error instanceof BilibiliError?error.code:'BILIBILI_IMAGE_FAILED'});}
   }
   if(failed)content.retrieval={status:'partial',error:'BILIBILI_IMAGES_PARTIAL'};
   const fallbackContent=content.type==='video'&&content.description&&Array.from(content.description).length>600

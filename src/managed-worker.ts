@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from 'node:crypto';
 import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -13,6 +13,21 @@ import { directFetch } from './network.js';
 import type { NetworkProbeCommand, NetworkProbeResult } from './network-probe.js';
 import { TransportEventParser } from './console-transport.js';
 import { runIdentity, type RunCancellation, type RunCancelResult } from './run-control-contract.js';
+import { subscribeProcessSamples } from './process-sample-channel.js';
+import type { ProcessSample } from './activity-contract.js';
+
+export function uploadProcessSamples(identity:ManagedIdentity):{close():Promise<void>} {
+  const queue:ProcessSample[]=[],source=randomUUID();let dropped=0,reported=0,flight:Promise<void>|undefined,closed=false;
+  const unsubscribe=subscribeProcessSamples(sample=>{if(queue.length>=200){queue.shift();dropped++;}queue.push(sample);});
+  const flush=()=>flight??=(async()=>{
+    if(!queue.length&&dropped===reported)return;
+    const samples=queue.splice(0,100),lost=dropped;
+    try{await workerRequest(identity,'process-samples',{samples,dropped:lost,source},AbortSignal.timeout(3000));reported=lost;}
+    catch{queue.unshift(...samples);while(queue.length>200){queue.shift();dropped++;}}
+  })().finally(()=>{flight=undefined;});
+  const timer=setInterval(()=>{if(!closed)void flush();},2000);timer.unref();
+  return {close:async()=>{closed=true;clearInterval(timer);unsubscribe();await flight;await flush();}};
+}
 
 export interface ManagedIdentity {url:string;botId:string;token:string;dataDir:string;}
 export interface WorkerRuntime {
@@ -151,6 +166,7 @@ export async function runManagedWorker(identity:ManagedIdentity,env:NodeJS.Proce
   const probes=runtime.probeNetwork?pollNetworkProbes(identity,()=>({revision:current.revision,runtime}),logger,probeController.signal):Promise.resolve();
   const controls=runtime.cancelRun?receiveRunControls(identity,runId=>runtime.cancelRun?.(runId)??Promise.resolve('already_finished'),probeController.signal):Promise.resolve();
   let eventUpload=uploadWorkerEvents(identity,runtime.store.recorder,logger);
+  const processUpload=uploadProcessSamples(identity);
   let operation:WorkerControl|null=null;
   let runtimeError=false;
   let configError:string|undefined;
@@ -185,7 +201,7 @@ export async function runManagedWorker(identity:ManagedIdentity,env:NodeJS.Proce
       }
       try {await delay(5000,undefined,{signal});}catch{break;}
     }
-  }finally{probeController.abort();signal.removeEventListener('abort',abortProbes);await Promise.all([probes,controls]);try{await runtime.stop(()=>eventUpload.close());}finally{await eventUpload.close();}}
+  }finally{probeController.abort();signal.removeEventListener('abort',abortProbes);await Promise.all([probes,controls]);try{await runtime.stop(()=>eventUpload.close());}finally{await eventUpload.close();await processUpload.close();}}
 }
 
 /** Receipt delivery never waits for generation or the inbound chat event queue. */

@@ -7,6 +7,8 @@ import { prepareIncomingImages } from './images.js';
 import { incomingMessageText } from './napcat.js';
 import { fingerprint, logEvent } from './logging.js';
 import { safeToolPayload } from './conversation-recorder.js';
+import { publishProcessSample } from './process-sample-channel.js';
+import { beginActivity, withActivityReporter } from './activity.js';
 import { ReplyToolError, validateRecallRequest, validateReplyRequest } from './reply-contract.js';
 import type { AgentResult, AgentRunner, Logger, PendingBatch, ReplyTools, RunObserver } from './types.js';
 import type { PiChildMessage, PiConfig, PiStart, PiParentMessage } from './pi-protocol.js';
@@ -33,6 +35,7 @@ export interface PiRunnerOptions extends PiConfig {
   onCompacted?: (info: { session: string; entryId: string }) => void;
   /** Host-controlled snapshots for confirmed outgoing media. */
   mediaRoot?: string;
+  onActivity?: RunObserver;
 }
 const CHILD = fileURLToPath(new URL('./pi-child.js', import.meta.url));
 export const BASE_INSTRUCTIONS_PATH = fileURLToPath(new URL('../../prompts/base-instructions.md', import.meta.url));
@@ -132,7 +135,11 @@ export class PiRunner implements AgentRunner {
   }
 
   async run(batch: PendingBatch, session: string | null, onSession: (id: string) => void, signal: AbortSignal, replies?: ReplyTools, observer?: RunObserver, tasks?:TaskTools, externalMessages?:TaskChatMessage[]): Promise<AgentResult> {
+    return withActivityReporter(event=>observer?.({type:'activity.updated',payload:{...event}}),publishProcessSample,()=>this.prepareAndRun(batch,session,onSession,signal,replies,observer,tasks,externalMessages));
+  }
+  private async prepareAndRun(batch: PendingBatch, session: string | null, onSession: (id: string) => void, signal: AbortSignal, replies?: ReplyTools, observer?: RunObserver, tasks?:TaskTools, externalMessages?:TaskChatMessage[]): Promise<AgentResult> {
     signal.throwIfAborted();
+    const preparation=beginActivity('prepare','prepare');
     const contextual = batch.context;
     const contextMessages = contextual ? [...contextual.messages, ...contextual.references, ...contextual.revisions.map(item => item.message)] : [];
     const releaseImages = this.options.retainImages?.([...new Set([...batch.messages.map(message => message.messageId),
@@ -196,10 +203,12 @@ export class PiRunner implements AgentRunner {
     }
     const legacy = externalMessages?.length && !contextual ? JSON.parse(prompt) as {messages: unknown[]} : undefined;
     if (legacy) legacy.messages.push(...externalMessages!);
+    preparation.end();
     await this.execute(batch.replyAllowed ? 'run' : 'append', session, legacy ? JSON.stringify(legacy) : prompt, attachments, onSession, signal,
       batch.replyAllowed ? replies : undefined, observer,scoped,undefined,undefined,undefined,recalled,context);
     return { messages: [] };
-    } finally { releaseImages?.(); }
+    } catch(error) {preparation.end(signal.aborted?'cancelled':'failed',error);throw error;}
+    finally { releaseImages?.(); }
   }
 
   async compact(session: string, signal: AbortSignal, observer?: RunObserver): Promise<void> {
@@ -226,7 +235,7 @@ export class PiRunner implements AgentRunner {
     const log = (level: 'info' | 'warn' | 'error', event: string, fields = {}) => logEvent(this.options.logger, level, event,
       { run_id: runId, operation, ...fields });
     const { logger: _logger, timeoutMs: _timeout, imageMaxBytes: _bytes, imageTimeoutMs: _imageTimeout, imageFetch: _imageFetch, prepareImages: _prepareImages, retainImages: _retainImages,
-      memoryRead, recall: _recall, onCompacted, mediaRoot: _mediaRoot, presentationSecrets=[], ...configured } = this.options;
+      memoryRead, recall: _recall, onCompacted, onActivity, mediaRoot: _mediaRoot, presentationSecrets=[], ...configured } = this.options;
     const config = operation === 'memory' ? { ...configured, persona: '', supportsImages: false, allowCommands: false, allowFileWrites: false, webSearch: undefined } : configured;
     const reads = operation === 'memory' ? memoryTools : operation === 'run' ? memoryRead : undefined;
     const system = operation === 'memory' ? await readFile(new URL('../../prompts/memory-consolidation.md', import.meta.url), 'utf8')
@@ -342,6 +351,8 @@ export class PiRunner implements AgentRunner {
           } else if (message.type === 'session') {
             const path = await validatePiSession(config.home, message.path);
             onSession(path); log('info', 'agent.session.established', { session_ref: fingerprint(path) });
+          } else if(message.type==='process-sample') {
+            publishProcessSample(message.sample);
           } else if (message.type === 'event') {
             const secrets = [...presentationSecrets,...proxySecrets(config.networkProxy),config.apiKey, config.webSearch && config.webSearch.provider !== 'none' ? config.webSearch.apiKey : undefined].filter((value): value is string => !!value);
             const payload=message.event.type.startsWith('tool.')||message.event.type==='thinking.updated'
@@ -349,7 +360,8 @@ export class PiRunner implements AgentRunner {
             if(message.event.type==='thinking.updated'&&message.event.itemId) {
               if(payload.status==='in_progress')activeThinking.set(message.event.itemId,payload);else activeThinking.delete(message.event.itemId);
             }
-            observer?.({ ...message.event,payload });
+            if(message.event.type==='activity.updated'&&onActivity)try{onActivity(message.event);}catch{}
+            else observer?.({ ...message.event,payload });
             if (message.event.type.startsWith('tool.')) log('info', `agent.${message.event.type}`, {
               tool: String(message.event.payload.tool ?? 'unknown'), item_ref: fingerprint(message.event.itemId ?? ''), status: String(message.event.payload.status ?? '') });
           } else if (message.type === 'failure') {

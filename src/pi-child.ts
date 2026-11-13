@@ -18,6 +18,7 @@ import type { ChatRecallEvent } from './chat-context-contract.js';
 import type { ReplyToolReceipt } from './types.js';
 import { ReplyToolError } from './reply-contract.js';
 import { MODEL_IMAGE_OPTIONS } from './model-image.js';
+import { activity, beginActivity, observeCurrentProcess, observeTool, withActivityReporter } from './activity.js';
 
 const send = (message: PiChildMessage) => {
   if(process.connected)try{process.send?.(message,()=>{});}catch{/* The parent can close between the connected check and send. */}
@@ -99,6 +100,12 @@ function terminateUnfinishedTools(manager: SessionManager): void {
 }
 
 async function execute(start: PiStart): Promise<void> {
+  return withActivityReporter(event => send({ type:'event',event:{type:'activity.updated',payload:{...event}} }),
+    sample => send({type:'process-sample',sample}), () => activity(start.operation==='memory'?'memory':start.operation==='scheduled'?'schedule':'run',start.operation,async()=>{
+      const stop=observeCurrentProcess();try{return await executeObserved(start);}finally{await stop();}
+    },{get aborted(){return cancelled;}}));
+}
+async function executeObserved(start: PiStart): Promise<void> {
   if (cancelled) throw new Error('Agent cancelled.');
   const config = start.config;
   const sessions = resolve(config.home, 'sessions'); await mkdir(sessions, { recursive: true, mode: 0o700 });
@@ -216,7 +223,7 @@ async function execute(start: PiStart): Promise<void> {
   const result = await createAgentSession({ cwd: config.workspace, agentDir: config.home, modelRuntime: runtime,
     model, thinkingLevel: (config.supportsReasoning && config.reasoning !== 'none' ? config.reasoning ?? 'off' : 'off') as ThinkingLevel,
     settingsManager: settings, sessionManager: manager, resourceLoader: loader(start.system, () => !!failure || cancelled || start.operation === 'memory', async event => {
-      try { return { compaction: await createChatCheckpoint(event, config, model) }; }
+      try { return { compaction: await activity('compact','compact',()=>createChatCheckpoint(event, config, model)) }; }
       catch (error) {
         // Extension errors are swallowed by Pi; explicitly cancel so it cannot fall back and issue a second request.
         if (!cancelled && !failure && (error as {modelFailure?:unknown})?.modelFailure === true) modelFailure = true;
@@ -234,30 +241,41 @@ async function execute(start: PiStart): Promise<void> {
         start.prompt, start.recalledMemory, config, start.system, tools.map(tool => ({name:tool.name,description:tool.description,parameters:tool.parameters}))).messages;
       return { messages: modelContextMessages(recalled) };
     } : undefined),
-    tools: start.operation === 'compact' ? [] : tools.map(tool => tool.name), customTools: tools, noTools: 'builtin' });
+    tools: start.operation === 'compact' ? [] : tools.map(tool => tool.name), customTools: tools.map(observeTool), noTools: 'builtin' });
   session = result.session; session.setAutoRetryEnabled(false);
   const streamFunction = session.agent.streamFunction;
+  let requestIndex=0;
   // Only failures from the provider stream qualify; SDK lifecycle errors can
   // also appear as assistant errors after local persistence or context failures.
   session.agent.streamFunction = async (requestedModel, context, options) => {
+    const request=beginActivity('model','model_request',{requestIndex:++requestIndex});const requestedAt=performance.now();let first=false;
+    const firstEvent=()=>{if(!first){first=true;request.progress({firstEventMs:performance.now()-requestedAt});}};
     const markFailure = () => { if (!cancelled && !failure && !options?.signal?.aborted) modelFailure = true; };
     try {
-      const stream = await streamFunction(requestedModel, context, options);
+      const stream = await request.run(()=>streamFunction(requestedModel, context, options));
       const result = stream.result.bind(stream);
       stream.result = async () => {
         try {
           const message = await result();
           if (message.stopReason === 'error') markFailure();
+          request.end(message.stopReason==='error'?'failed':message.stopReason==='aborted'?'cancelled':'completed');
           return message;
-        } catch (error) { markFailure(); throw error; }
+        } catch (error) { markFailure(); request.end(options?.signal?.aborted?'cancelled':'failed',error); throw error; }
       };
       const iterate = stream[Symbol.asyncIterator].bind(stream);
       stream[Symbol.asyncIterator] = async function* () {
-        try { yield* { [Symbol.asyncIterator]: iterate }; }
-        catch (error) { markFailure(); throw error; }
+        try {
+          for await (const event of { [Symbol.asyncIterator]: iterate }) {
+            if(event.type!=='start'&&event.type!=='error')firstEvent();
+            if(event.type==='done'||event.type==='error')request.end(event.type==='error'?options?.signal?.aborted?'cancelled':'failed':'completed');
+            yield event;
+          }
+          request.end(options?.signal?.aborted?'cancelled':'completed');
+        }
+        catch (error) { markFailure(); request.end(options?.signal?.aborted?'cancelled':'failed',error); throw error; }
       };
       return stream;
-    } catch (error) { markFailure(); throw error; }
+    } catch (error) { markFailure(); request.end(options?.signal?.aborted?'cancelled':'failed',error); throw error; }
   };
   if (start.operation === 'memory') {
     const previousFinishTurn = session.agent.finishTurn;

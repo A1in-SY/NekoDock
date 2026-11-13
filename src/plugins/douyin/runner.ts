@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { observeChild, observePluginRun } from '../../activity.js';
 import { mkdtemp, mkdir, open, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createNetworkClient, proxyEnvironment } from '../../network.js';
@@ -27,6 +28,7 @@ async function run(command: string, args: string[], options: { cwd: string; env:
   options.signal.throwIfAborted();
   return new Promise((resolve,reject) => {
     const child = spawn(command,args,{ cwd: options.cwd, env: options.env, stdio: ['ignore','pipe','ignore'], detached: process.platform !== 'win32' });
+    observeChild(child);
     let size = 0, timedOut = false; const chunks: Buffer[] = [];
     const kill = () => { if (child.pid) try { process.platform === 'win32' ? child.kill('SIGKILL') : process.kill(-child.pid,'SIGKILL'); } catch {} };
     const timer = setTimeout(() => { timedOut = true; kill(); },options.timeoutMs);
@@ -75,7 +77,7 @@ export async function executeDouyinJob(job: PluginRunnerJob, root: string, signa
   if (!['resolve','download','prepare'].includes(job.operation)) return fail('DOUYIN_OPERATION_UNSUPPORTED');
   await mkdir(root,{ recursive: true, mode: 0o700 }); const directory = await mkdtemp(join(root,'job-'));
   const cleanup = () => rm(directory,{ recursive: true, force: true });
-  const network = createNetworkClient(job.networkProxy,silent,'plugins'); const fetcher = tools.fetch ?? network.fetch, execute = tools.run ?? run;
+  const network = createNetworkClient(job.networkProxy,silent,'plugins'); const fetcher = tools.fetch ?? network.fetch, execute = observePluginRun(tools.run ?? run);
   const timeout = Math.min(config.timeoutSeconds * 1000,Math.max(1,job.expiresAt - Date.now()));
   const combined = AbortSignal.any([signal,AbortSignal.timeout(timeout)]), env = environment(job,directory);
   // Shared visitor registration owns its pool so cancelling this job cannot close

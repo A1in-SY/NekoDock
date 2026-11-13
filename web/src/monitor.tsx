@@ -8,12 +8,15 @@ import {
   DataZoomComponent,
   ToolboxComponent,
   BrushComponent,
+  MarkLineComponent,
 } from "echarts/components";
 import { CanvasRenderer } from "echarts/renderers";
 import type { EChartsType } from "echarts/core";
 import type { MetricSample, PublicBot } from "../../src/console/contracts";
 import { api, errorText } from "./api";
 import { date, ErrorBox, Icon } from "./ui";
+import type { MonitorResource } from '../../src/activity-contract';
+import { ActivityTimelineView, activityColors } from './activity-timeline';
 echarts.use([
   LineChart,
   GridComponent,
@@ -22,6 +25,7 @@ echarts.use([
   DataZoomComponent,
   ToolboxComponent,
   BrushComponent,
+  MarkLineComponent,
   CanvasRenderer,
 ]);
 
@@ -45,14 +49,7 @@ const metrics: [Metric, string, string][] = [
   ["network", "网络吞吐量", "接收与发送速率"],
   ["latency", "消息处理耗时 · P95", "从触发消息收到，到最后一次发送确认"],
 ];
-const colors = [
-  "#629b86",
-  "#9882bd",
-  "#cc9b6c",
-  "#7e9db7",
-  "#b87e89",
-  "#98aa67",
-];
+const colors = activityColors;
 function relativeRange(minutes: number): Range {
   const to = Date.now();
   return { from: to - minutes * 60000, to, relative: minutes };
@@ -61,9 +58,9 @@ function rangeLabel(range: Range) {
   return range.relative != null
     ? quick.find(([n]) => n === range.relative)?.[1] ||
         "Last " + range.relative + " minutes"
-    : date(range.from, { year: undefined }) +
+    : date(range.from, { year: undefined,...(range.to-range.from<300000?{second:'2-digit' as const}:{}) }) +
         " — " +
-        date(range.to, { year: undefined });
+        date(range.to, { year: undefined,...(range.to-range.from<300000?{second:'2-digit' as const,month:undefined,day:undefined}:{}) });
 }
 function parseTime(value: string, now: number): number {
   if (value === "now") return now;
@@ -88,15 +85,18 @@ export function Monitor({ bots }: { bots: PublicBot[] }) {
   const [range, setRange] = useState<Range>(() => relativeRange(60));
   const [samples, setSamples] = useState<MetricSample[]>([]);
   const [peaks, setPeaks] = useState<MetricSample[]>([]);
+  const [resources,setResources]=useState<MonitorResource[]>(()=>bots.map(bot=>({id:bot.id,name:bot.name+' · Worker',kind:'worker',botId:bot.id})));
+  const [selectedAt,setSelectedAt]=useState<number|null>(null),[botFilter,setBotFilter]=useState(''),[resourceFilter,setResourceFilter]=useState('');
+  const visibleResources=resources.map((resource,index)=>({...resource,color:colors[index%colors.length]!})).filter(resource=>(!botFilter||!resource.botId||resource.botId===botFilter)&&(!resourceFilter||resource.id===resourceFilter));
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [picker, setPicker] = useState(false);
   const [ratesOpen, setRatesOpen] = useState(false);
-  const [rate, setRate] = useState(15);
+  const [rate, setRate] = useState(5);
   const [updated, setUpdated] = useState<number | null>(null);
   const [expanded, setExpanded] = useState<Metric | null>(null);
   const [refreshNonce, setRefreshNonce] = useState(0);
-  const [step, setStep] = useState(15000);
+  const [step, setStep] = useState(5000);
   const request = useRef(0);
   const load = useCallback(async () => {
     const seq = ++request.current;
@@ -105,6 +105,7 @@ export function Monitor({ bots }: { bots: PublicBot[] }) {
         samples: MetricSample[];
         peaks?: MetricSample[];
         step: number;
+        resources?:MonitorResource[];
       }>(
         "/api/metrics?from=" +
           Math.round(range.from) +
@@ -114,6 +115,7 @@ export function Monitor({ bots }: { bots: PublicBot[] }) {
       if (seq !== request.current) return;
       setSamples(result.samples);
       setPeaks(result.peaks ?? []);
+      setResources(result.resources??bots.map(bot=>({id:bot.id,name:bot.name+' · Worker',kind:'worker',botId:bot.id})));
       setStep(result.step);
       setError("");
       setUpdated(Date.now());
@@ -162,7 +164,7 @@ export function Monitor({ bots }: { bots: PublicBot[] }) {
       <header className="mon-heading">
         <div>
           <h1>监控</h1>
-          <p>在同一个时间范围内查看实例的资源与消息处理情况。</p>
+          <p>对照资源曲线、执行阶段和进程采样，查看当时正在运行的工作。</p>
         </div>
       </header>
       <section className="mon-controls">
@@ -245,7 +247,7 @@ export function Monitor({ bots }: { bots: PublicBot[] }) {
       </section>
       {error && <ErrorBox error={error} retry={() => void load()} />}
       <div className="mon-chart-toolbar">
-        <span>拖动图表可缩放时间范围，悬停可对照同一时刻。</span>
+        <span>点击曲线查看同期活动，拖动图表缩放时间范围。</span>
         <div>
           <span className="mon-refreshed">
             {updated
@@ -284,11 +286,13 @@ export function Monitor({ bots }: { bots: PublicBot[] }) {
             </header>
             <Chart
               metric={key}
-              bots={bots}
+              resources={visibleResources}
               samples={samples}
               peaks={peaks}
               range={range}
               onZoom={zoom}
+              selectedAt={selectedAt}
+              onInspect={time=>setSelectedAt(Math.floor(time/step)*step)}
             />
           </section>
         ))}
@@ -301,6 +305,8 @@ export function Monitor({ bots }: { bots: PublicBot[] }) {
             : `当前查询分辨率 ${Math.round(step / 1000)} 秒。`}
         停止、断连或采集失败的时段显示为空缺。
       </p>
+      <ActivityTimelineView bots={bots} resources={resources} range={range} at={selectedAt} onInspect={setSelectedAt} onZoom={zoom} step={step} refreshNonce={updated??0}
+        botFilter={botFilter} resourceFilter={resourceFilter} onBotFilter={setBotFilter} onResourceFilter={setResourceFilter}/>
       {expanded && (
         <div
           className="mon-modal-backdrop"
@@ -336,12 +342,14 @@ export function Monitor({ bots }: { bots: PublicBot[] }) {
             <div className="mon-panel mon-expanded-panel">
               <Chart
                 metric={expanded}
-                bots={bots}
+                resources={visibleResources}
                 samples={samples}
                 peaks={peaks}
                 range={range}
                 expanded
                 onZoom={zoom}
+                selectedAt={selectedAt}
+                onInspect={time=>setSelectedAt(Math.floor(time/step)*step)}
               />
             </div>
             <footer>点击图例隐藏或显示曲线，拖动图表缩放时间范围。</footer>
@@ -490,26 +498,31 @@ function TimeField({
 }
 function Chart({
   metric,
-  bots,
+  resources,
   samples,
   peaks,
   range,
   expanded = false,
   onZoom,
+  onInspect,
+  selectedAt,
 }: {
   metric: Metric;
-  bots: PublicBot[];
+  resources: Array<MonitorResource&{color?:string}>;
   samples: MetricSample[];
   peaks: MetricSample[];
   range: Range;
   expanded?: boolean;
   onZoom: (from: number, to: number) => void;
+  onInspect:(at:number)=>void;
+  selectedAt:number|null;
 }) {
   const element = useRef<HTMLDivElement>(null);
   const chart = useRef<EChartsType | null>(null);
   const selected = useRef<Record<string, boolean>>({});
   const zoom = useRef(onZoom);
   zoom.current = onZoom;
+  const inspect=useRef(onInspect);inspect.current=onInspect;
   const bounds = useRef(range);
   bounds.current = range;
   const series = useMemo(() => {
@@ -519,12 +532,13 @@ function Chart({
       data: Array<[number, number | null]>;
       peaks: Map<number, number | null>;
     }> = [];
-    for (let index = 0; index < bots.length; index++) {
-      const bot = bots[index]!;
+    for (let index = 0; index < resources.length; index++) {
+      const bot = resources[index]!;
+      if(metric==='latency'&&bot.kind!=='worker')continue;
       const rows = samples
         .filter((s) => s.botId === bot.id)
         .sort((a, b) => a.time - b.time);
-      const color = colors[index % colors.length]!;
+      const color = bot.color??colors[index % colors.length]!;
       const peakRows = peaks.filter((s) => s.botId === bot.id);
       if (metric === "network") {
         all.push(
@@ -550,7 +564,7 @@ function Chart({
         });
     }
     return all;
-  }, [bots, samples, peaks, metric]);
+  }, [resources, samples, peaks, metric]);
   useEffect(() => {
     if (!element.current) return;
     const instance = echarts.init(element.current, undefined, {
@@ -561,6 +575,12 @@ function Chart({
     echarts.connect("napcat-metrics");
     const resize = new ResizeObserver(() => instance.resize());
     resize.observe(element.current);
+    instance.getZr().on('click',(event)=>{
+      const point=[event.offsetX,event.offsetY];
+      if(!instance.containPixel({gridIndex:0},point))return;
+      const value=instance.convertFromPixel({xAxisIndex:0},event.offsetX);
+      if(typeof value==='number'&&Number.isFinite(value))inspect.current(Math.round(value));
+    });
     instance.on("legendselectchanged", (event: unknown) => {
       selected.current = (
         event as { selected: Record<string, boolean> }
@@ -640,7 +660,7 @@ function Chart({
             }>;
             if (!params.length) return "";
             return [
-              date(params[0]!.data[0]),
+              date(params[0]!.data[0],{second:'2-digit'}),
               ...params.map((p) => {
                 const peak = series[p.seriesIndex]?.peaks.get(p.data[0]);
                 const label = metric === "latency" ? "P95" : "平均";
@@ -671,6 +691,7 @@ function Chart({
                 timeZone: "Asia/Shanghai",
                 hour: "2-digit",
                 minute: "2-digit",
+                ...(range.to-range.from<300000?{second:'2-digit' as const}:{}),
                 hour12: false,
               }).format(v),
             hideOverlap: true,
@@ -716,6 +737,7 @@ function Chart({
           },
           itemStyle: { color: s.color },
           emphasis: { focus: "series" },
+          ...(index===0&&selectedAt!==null?{markLine:{silent:true,symbol:'none',label:{show:false},lineStyle:{color:'#687b70',type:'dashed'},data:[{xAxis:selectedAt}]}}:{}),
         })),
         graphic: series.some((s) => s.data.some(([, v]) => v != null))
           ? []
@@ -735,7 +757,7 @@ function Chart({
       key: "dataZoomSelect",
       dataZoomSelectActive: true,
     });
-  }, [series, range.from, range.to, metric]);
+  }, [series, range.from, range.to, metric,selectedAt]);
   return (
     <div
       ref={element}

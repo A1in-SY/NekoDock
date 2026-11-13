@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { imageExtension } from '../../images.js';
 import { renderLimited } from '../../plugin-render.js';
+import { beginActivity } from '../../activity.js';
 import type { PluginContentImage, PluginExecution, PluginOutput, PluginRunnerJob } from '../../plugin-system/contracts.js';
 import { boundedBytes, HeyboxError } from './api.js';
 import { POST_LIMITS, postContentText, postImageUrl, validatePostContent } from './post-content.js';
@@ -25,11 +26,13 @@ export async function preparePost(input: PluginRunnerJob, source: HeyboxPostReso
   const cache = new Map<string, PluginContentImage>();
   for (const image of targets) {
     signal.throwIfAborted(); delete image.assetId; delete image.assetKey;
+    let download:ReturnType<typeof beginActivity>|undefined;
     try {
       const initial = postImageUrl(image.url); if (!initial) throw new HeyboxError('HEYBOX_IMAGE_URL_REJECTED');
       let target: string = initial;
       const previous = cache.get(`${image.role}\n${target}`);
       if (previous) { Object.assign(image, { assetKey: previous.assetKey, status: 'ready', width: previous.width, height: previous.height, fetchedAt: previous.fetchedAt }); continue; }
+      download=beginActivity('download','image_download');
       let response: Response | undefined;
       for (let hop = 0; hop < 4; hop++) {
         response = await fetcher(target, { signal, redirect: 'manual', headers: { 'user-agent': 'Mozilla/5.0', referer: 'https://www.xiaoheihe.cn/' } });
@@ -39,13 +42,15 @@ export async function preparePost(input: PluginRunnerJob, source: HeyboxPostReso
         target = next; if (hop === 3) throw new HeyboxError('HEYBOX_REDIRECT_LIMIT');
       }
       const bytes = await boundedBytes(response!, Math.min(limit, Math.max(0, POST_LIMITS.totalBytes - total))); total += bytes.length;
+      download.end();
       const key = `source-${files.length}`, path = join(directory, `${key}.${imageExtension(bytes)}`);
       await writeFile(path, bytes, { mode: 0o600 });
       const info = JSON.parse(await execute('python3', [script, 'inspect', path, String(POST_LIMITS.pixels)], { cwd: directory, env, signal, timeoutMs: 10000 })) as { width: number; height: number };
       if (!Number.isSafeInteger(info.width) || !Number.isSafeInteger(info.height) || info.width <= 0 || info.height <= 0 || info.width * info.height > POST_LIMITS.pixels) throw new HeyboxError('HEYBOX_IMAGE_LIMIT');
       Object.assign(image, { assetKey: key, status: 'ready', width: info.width, height: info.height, fetchedAt: Date.now() / 1000 });
       delete image.error; cache.set(`${image.role}\n${image.url}`, image); paths[key] = path; files.push({ key, path, type: 'image', role: image.role });
-    } catch {
+    } catch(error) {
+      download?.end(signal.aborted?'cancelled':'failed',error);
       signal.throwIfAborted(); image.status = 'failed'; image.error = 'HEYBOX_IMAGE_UNAVAILABLE';
       if (image.role === 'content') content.retrieval = { status: 'partial', error: 'HEYBOX_POST_IMAGES_PARTIAL' };
     }

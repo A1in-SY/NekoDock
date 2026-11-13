@@ -9,6 +9,8 @@ import type { NapcatGateway } from './napcat-gateway.js';
 import type { InspectionJob, InspectionNotification } from './forward-inspections.js';
 import { isNapcatSendResult } from '../transport-protocol.js';
 import { InspectionRequestLimiter } from './inspection-request-limiter.js';
+import { activity, withActivityReporter } from '../activity.js';
+import type { ActivityEvent } from '../activity-contract.js';
 
 /** This queue never uses the chat agent's busy flag or Worker context path. */
 export class ForwardInspectionCoordinator {
@@ -18,7 +20,7 @@ export class ForwardInspectionCoordinator {
   private readonly requests = new InspectionRequestLimiter(2);
   private timer?: ReturnType<typeof setInterval>;
   private ticking = false;
-  constructor(private readonly options: {db: ConsoleDatabase; images: ConsoleImagePrefetch; gateway: NapcatGateway; logger: Logger; fetch?: typeof globalThis.fetch}) {
+  constructor(private readonly options: {db: ConsoleDatabase; images: ConsoleImagePrefetch; gateway: NapcatGateway; logger: Logger; fetch?: typeof globalThis.fetch; observe?:(job:InspectionJob,event:ActivityEvent)=>void}) {
     options.db.plugins.inspections.recover();
   }
   start(timers = true): void {
@@ -50,6 +52,9 @@ export class ForwardInspectionCoordinator {
     } finally { this.ticking = false; }
   }
   private async run(job: InspectionJob, signal: AbortSignal): Promise<void> {
+    return withActivityReporter(event=>this.options.observe?.(job,event),undefined,()=>activity('plugin','inspect',()=>this.runObserved(job,signal),signal));
+  }
+  private async runObserved(job: InspectionJob, signal: AbortSignal): Promise<void> {
     const {db, images, logger} = this.options, started = Date.now();
     const bot = db.getBot(job.botId); if (!bot) return;
     const client = createNetworkClient({enabled: bot.config.proxyEnabled, url: bot.config.proxyUrl, username: bot.config.proxyUsername,
@@ -83,8 +88,8 @@ export class ForwardInspectionCoordinator {
         ? [{sourceKey: sample.sourceKey, sha256: db.images.get(job.botId, sample.attachmentId).sha256,
           read: () => images.contentForConsumer(job.botId, sample.attachmentId!, job.id)}] : []);
       if (!candidates.length) throw new ForwardNsfwError('NSFW_NO_VALID_IMAGES');
-      const result = await classifyImages(job.config, candidates, this.options.fetch ?? client.fetch, signal,
-        db.plugins.inspections.classificationCache(job.botId), {acquireRequest: signal => this.requests.acquire(signal)});
+      const result = await activity('model','model_request',()=>classifyImages(job.config, candidates, this.options.fetch ?? client.fetch, signal,
+        db.plugins.inspections.classificationCache(job.botId), {acquireRequest: signal => this.requests.acquire(signal)}),signal);
       const failures = [...unavailable, ...result.failures];
       logFailures(failures);
       db.plugins.inspections.finish(job.id, result.scores, result.scores.length < job.samples.length ? 'PARTIAL_IMAGE_COVERAGE' : undefined,

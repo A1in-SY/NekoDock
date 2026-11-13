@@ -24,6 +24,9 @@ import { RunControlStreams } from './run-controls.js';
 import {isNapcatSendResult,NAPCAT_MEDIA_MAX_BYTES,type NapcatSendResult} from '../transport-protocol.js';
 import type {PluginRunnerResult} from '../plugin-contract.js';
 import { contentPlugin } from '../plugin-system/registry.js';
+import type { MonitorResource } from '../activity-contract.js';
+import type { ActivityOwner } from './activities.js';
+import { beginActivity, withActivityReporter } from '../activity.js';
 
 export interface ConsoleOptions {
  dataDir:string; docker:DockerClient; staticDir?:string; timers?:boolean; logPollMs?:number; conversationHeartbeatMs?:number;
@@ -52,7 +55,8 @@ export async function createConsole(options:ConsoleOptions){
  const networkProbes=new NetworkProbes();
  const incomingImages=new ConsoleImagePrefetch({store:db.images,root:resolve(options.dataDir,'incoming-images'),bot:id=>db.getBot(id),logger,fetch:options.incomingImageFetch});
  incomingImages.start(options.timers!==false);
- const inspections=new ForwardInspectionCoordinator({db,images:incomingImages,gateway,logger,fetch:options.inspectionFetch});
+ const inspections=new ForwardInspectionCoordinator({db,images:incomingImages,gateway,logger,fetch:options.inspectionFetch,
+  observe:(job,event)=>{const record=db.monitorPluginJob(job.botId,job.id);metrics.activities.ingest({resourceId:'service:console',botId:job.botId,jobId:job.id,traceId:`job:${record?.rootJobId??job.id}`,pluginId:'forward-nsfw',sourceMessageId:job.sourceMessageId,...(record?.conversationId?{conversationId:record.conversationId}:{})},event);}});
  inspections.start(options.timers!==false);
  const pluginAssetsRoot=resolve(options.dataDir,'plugin-assets');
  const pluginRunnerToken=options.pluginRunnerToken??process.env.CONSOLE_PLUGIN_RUNNER_TOKEN??db.pluginRunnerToken();
@@ -63,6 +67,19 @@ export async function createConsole(options:ConsoleOptions){
  const streams=new Set<{response:ServerResponse;token:unknown}>();const timers:NodeJS.Timeout[]=[];
  let lastCursor=db.getEventCursor();let sampling=false;let lastGatewayState='';
  const networkCounters=new Map<string,ResourceCounters>();
+ const generations=new Map<string,string>();
+ const monitorResources=():MonitorResource[]=>[...db.listBots().map(bot=>({id:bot.id,name:bot.name+' · Worker',kind:'worker' as const,botId:bot.id})),
+  {id:'service:console',name:'Console · 共享',kind:'console'},{id:'service:plugin-runner',name:'plugin-runner · 共享',kind:'plugin-runner'}];
+ const projectActivities=()=>{
+  try{for(const bot of db.listBots())for(let batch=0;batch<4;batch++){
+    const events=db.monitorEvents(bot.id,metrics.activities.cursor(bot.id));if(!events.length)break;
+    metrics.activities.project(bot.id,events);if(events.length<500)break;
+  }metrics.activities.syncPlugins(db.monitorPluginJobs());}catch{logEvent(logger,'warn','console.activities_projection_failed');}
+ };
+ const observeSend=(owner:ActivityOwner,action:()=>Promise<NapcatSendResult>)=>withActivityReporter(event=>metrics.activities.ingest(owner,event),undefined,async()=>{
+  const span=beginActivity('send','send');try{const result=await span.run(action);span.end(result.ok?'completed':result.code==='RUN_CANCELLED'?'cancelled':'failed');return result;}
+  catch(error){span.end('failed',error);throw error;}
+ });
  const changes=(force=false)=>{
   const cursor=db.getEventCursor();if(cursor===lastCursor&&!force)return;
   const botIds=new Set<string>();
@@ -235,7 +252,14 @@ export async function createConsole(options:ConsoleOptions){
  });
  app.get<{Querystring:{from?:string;to?:string}}>('/api/metrics',async(req)=>{
   const from=numeric(req.query.from,Date.now()-3600000),to=numeric(req.query.to,Date.now());
-  if(to<=from||to-from>31*86400000)throw new Error('时间范围须在 31 天以内');return metrics.query(from,to);
+  if(to<=from||to-from>31*86400000)throw new Error('时间范围须在 31 天以内');return {...metrics.query(from,to),resources:monitorResources()};
+ });
+ app.get<{Querystring:{from?:string;to?:string;at?:string;window?:string;botId?:string;resourceId?:string;traceId?:string}}>('/api/monitor/timeline',async(req)=>{
+  const from=numeric(req.query.from,Date.now()-3600000),to=numeric(req.query.to,Date.now());
+  if(to<=from||to-from>31*86400000)throw new Error('时间范围须在 31 天以内');
+  for(const value of [req.query.botId,req.query.resourceId,req.query.traceId])if(value!==undefined&&!/^[a-zA-Z0-9_.:-]{1,240}$/u.test(value))throw new Error('请求监控标识无效');
+  const windowMs=numeric(req.query.window,5000);if(windowMs<1000||windowMs>31*86400000)throw new Error('时间范围须在 31 天以内');
+  projectActivities();return metrics.activities.query(from,to,{...req.query,windowMs,at:req.query.at===undefined?undefined:numeric(req.query.at,to)});
  });
  app.get<{Params:{id:string}}>('/api/bots/:id/memory',async(req)=>db.memory.view(req.params.id));
  app.post<{Params:{id:string}}>('/api/bots/:id/memory/controls',async(req,reply)=>{const result=db.memory.request(req.params.id,req.body);changes();return reply.code(202).send(result);});
@@ -252,10 +276,22 @@ export async function createConsole(options:ConsoleOptions){
   const value=req.headers.authorization;if(!value?.startsWith('Bearer ')||!db.verifyWorkerToken(req.params.id,value.slice(7)))throw Object.assign(new Error('Worker 身份验证失败'),{statusCode:401});
  }
  const runner=(req:FastifyRequest)=>{const given=req.headers.authorization?.replace(/^Bearer /u,'')??'';if(given.length!==pluginRunnerToken.length||!timingSafeEqual(Buffer.from(given),Buffer.from(pluginRunnerToken)))throw Object.assign(new Error('插件运行器身份验证失败'),{statusCode:401});};
- app.post('/internal/plugin-runner/claim',async(req)=>{runner(req);return {job:db.plugins.claim()};});
+ const runnerObservations=(jobId:string,lease:string,input:unknown)=>{
+  const {row}=db.plugins.leased(jobId,lease),body=object(input);
+  if(!Array.isArray(body.events)||body.events.length>1000)throw new Error('请求监控事件无效');
+  const owner={resourceId:'service:plugin-runner',botId:row.bot_id,traceId:`job:${row.root_job_id??row.id}`,jobId:row.id,pluginId:row.plugin_id,sourceMessageId:row.source_message_id,...(row.conversation_id?{conversationId:row.conversation_id}:{})};
+  for(const event of body.events)metrics.activities.ingest(owner,event);
+  metrics.activities.processSamples(owner,body.samples,body.dropped??0,body.source??'legacy');
+ };
+ app.post<{Params:{jobId:string}}>('/internal/plugin-runner/jobs/:jobId/observations',async(req)=>{
+  runner(req);const body=object(req.body);runnerObservations(req.params.jobId,String(body.lease??''),body);return {ok:true};
+ });
+ app.post('/internal/plugin-runner/claim',async(req)=>{runner(req);const job=db.plugins.claim();projectActivities();return {job};});
  app.get<{Params:{jobId:string};Querystring:{lease?:string}}>('/internal/plugin-runner/jobs/:jobId/status',async(req)=>{runner(req);try{db.plugins.leased(req.params.jobId,req.query.lease??'');return {active:true};}catch{return {active:false};}});
  app.post<{Params:{jobId:string}}>('/internal/plugin-runner/jobs/:jobId/result',async(req)=>{
-   runner(req);const body=object(req.body);const result=db.plugins.complete(req.params.jobId,String(body.lease??''),object(body.result) as PluginRunnerResult);changes();return result;
+   runner(req);const body=object(req.body);
+   if(body.observations)try{runnerObservations(req.params.jobId,String(body.lease??''),body.observations);}catch{logEvent(logger,'warn','console.plugin_observations_incomplete');}
+   const result=db.plugins.complete(req.params.jobId,String(body.lease??''),object(body.result) as PluginRunnerResult);projectActivities();changes();return result;
  });
  app.post<{Params:{jobId:string}}>('/internal/plugin-runner/jobs/:jobId/asset',{bodyLimit:256*1024*1024,config:{rawBody:true}},async(req)=>{
    runner(req);const lease=String(req.headers['x-plugin-lease']??'');const {job}=db.plugins.leased(req.params.jobId,lease);
@@ -307,7 +343,9 @@ export async function createConsole(options:ConsoleOptions){
        const message=result.kind==='video'?{kind:'video' as const,file:db.pluginAssets.signedUrl(botId,result.assetId!,db.getNapcatConnection(bot.connectionId)?.mediaBaseUrl??'',(result.expiresAt??Date.now())+600_000)}
          :result.kind==='image'?{kind:'image' as const,file:await db.pluginAssets.imageSnapshot(botId,result.assetId!,Math.min(bot.config.imageMaxMiB*1024*1024,NAPCAT_MEDIA_MAX_BYTES))}
          :{kind:'text' as const,text:result.text??'',replyTo:result.sourceMessageId};
-       delivery=await gateway.send(botId,{...message,deliveryId:result.deliveryId,deadline:Date.now()+(result.kind==='video'?120_000:bot.config.actionTimeout*1000)});
+       const jobId=result.groupId??/^plugin:([a-f0-9-]{36}):/u.exec(result.deliveryId??'')?.[1],job=jobId?db.monitorPluginJob(botId,jobId):undefined;
+       const deliveryId=result.deliveryId,kind=result.kind;
+       delivery=await observeSend({resourceId:'service:console',botId,conversationId:result.conversationId,pluginId:result.pluginId,sourceMessageId:result.sourceMessageId,...(job?{jobId:job.id,traceId:`job:${job.rootJobId??job.id}`}:{})},()=>gateway.send(botId,{...message,deliveryId,deadline:Date.now()+(kind==='video'?120_000:bot.config.actionTimeout*1000)}));
      }catch{delivery={ok:false,code:'PLUGIN_MEDIA_OR_SEND_UNAVAILABLE',deliveryStatus:'failed'};}
      db.plugins.finishSend(botId,result.id,delivery);changes();
    }
@@ -378,6 +416,9 @@ export async function createConsole(options:ConsoleOptions){
   await worker(req);const body=object(req.body);const acknowledgedSeq=db.ingestEvents(req.params.id,body.events as WorkerHeartbeat['events']);
   changes();conversations.notify(req.params.id);return {acknowledgedSeq};
  });
+ app.post<{Params:{id:string}}>('/internal/workers/:id/process-samples',async(req)=>{
+  await worker(req);const body=object(req.body);metrics.activities.processSamples({botId:req.params.id,resourceId:req.params.id},body.samples,body.dropped??0,body.source??'legacy');return {ok:true};
+ });
  const staticDir=options.staticDir??resolve('dist/web');
  if(existsSync(resolve(staticDir,'index.html'))){
   await app.register(staticFiles,{root:resolve(staticDir),wildcard:false});
@@ -385,19 +426,24 @@ export async function createConsole(options:ConsoleOptions){
  }
  const sample=async()=>{
   if(sampling)return;sampling=true;
-  try{await Promise.allSettled(db.listBots().map(async(bot)=>{
-   const time=Date.now();try{
-    const container=await options.docker.inspect(bot.id);
-    if(!container?.State.Running)throw new Error('unavailable');
-    const {sample,counters}=resourceSample(bot.id,await options.docker.stats(bot.id),networkCounters.get(bot.id),time);
-    networkCounters.set(bot.id,counters);sample.latency=db.getLatencyP95(bot.id,time-5*60000);metrics.insert(sample);
-   }catch{networkCounters.delete(bot.id);metrics.insert({botId:bot.id,time,cpu:null,memory:null,rx:null,tx:null,latency:null});}
-  }));}finally{sampling=false;}
+  try{await Promise.allSettled(monitorResources().map(async(resource)=>{
+   try{
+    const shared=resource.kind==='worker'?null:await options.docker.serviceStats(resource.kind);
+    const container=shared?.container??(resource.kind==='worker'?await options.docker.inspect(resource.id):null);
+    if(!container?.State.Running){metrics.activities.interrupt(resource.id);throw new Error('unavailable');}
+    const stats=shared?.stats??await options.docker.stats(resource.id),time=Date.now();
+    if(generations.get(resource.id)!==container.Id){networkCounters.delete(resource.id);generations.set(resource.id,container.Id);}
+    metrics.activities.resource(resource.id,container.Id,Date.parse(container.State.StartedAt??'')||time);
+    const previous=networkCounters.get(resource.id)??{time,rx:null,tx:null,cpuNs:null};
+    const {sample,counters}=resourceSample(resource.id,stats,previous,time);
+    networkCounters.set(resource.id,counters);sample.latency=resource.botId?db.getLatencyP95(resource.botId,time-5*60000):null;metrics.insert(sample);
+   }catch{networkCounters.delete(resource.id);metrics.insert({botId:resource.id,time:Date.now(),cpu:null,memory:null,rx:null,tx:null,latency:null});}
+  }));projectActivities();}finally{sampling=false;}
  };
  if(options.timers!==false){
   const every=(ms:number,fn:()=>void)=>{const timer=setInterval(fn,ms);timer.unref();timers.push(timer);};
   every(2000,()=>void lifecycle.reconcile().then(()=>refreshGateway()).catch(()=>logEvent(logger,'warn','console.reconcile_failed')));
-  every(15000,()=>void sample());every(3600000,()=>{try{metrics.compact();}catch{logEvent(logger,'warn','console.metrics_compact_failed');}});
+  every(5000,()=>void sample());every(1000,projectActivities);every(3600000,()=>{try{metrics.compact();}catch{logEvent(logger,'warn','console.metrics_compact_failed');}});
   every(60000,()=>{void db.pluginAssets.cleanup(pluginAssetsRoot).catch(()=>logEvent(logger,'warn','plugin.assets.cleanup_failed'));});
  }
  app.addHook('preClose',async()=>{for(const timer of timers)clearInterval(timer);logs.close();conversations.close();runControls.close();for(const stream of streams)stream.response.end();await inspections.close();await gateway.close();await incomingImages.close();});

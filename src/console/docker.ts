@@ -4,7 +4,7 @@ import type { BotRecord } from './contracts.js';
 import { DockerLogDecoder, type DockerLogSnapshot } from './logs.js';
 import { NAPCAT_MEDIA_MAX_BYTES } from '../transport-protocol.js';
 
-export interface ContainerInfo { Id: string; State: {Running:boolean;Status:string;Error?:string}; Config:{Labels:Record<string,string>}; Mounts?:Array<{Name?:string;Destination:string}>; }
+export interface ContainerInfo { Id: string; State: {Running:boolean;Status:string;Error?:string;StartedAt?:string}; Config:{Labels:Record<string,string>}; Mounts?:Array<{Name?:string;Destination:string}>; }
 export interface DockerStats { cpu_stats?:{cpu_usage?:{total_usage?:number};system_cpu_usage?:number;online_cpus?:number;throttling_data?:unknown};precpu_stats?:{cpu_usage?:{total_usage?:number};system_cpu_usage?:number};memory_stats?:{usage?:number;stats?:{inactive_file?:number;total_inactive_file?:number}};networks?:Record<string,{rx_bytes?:number;tx_bytes?:number}>;read?:string; }
 export class DockerError extends Error { constructor(public readonly status:number,message='Docker 操作失败'){super(message);} }
 export class DockerClient {
@@ -61,6 +61,18 @@ export class DockerClient {
   async stop(id:string):Promise<void>{const c=await this.inspect(id);if(c?.State.Running)await this.request('POST',`/containers/${this.name(id)}/stop?t=10`);}
   async remove(id:string):Promise<void>{const c=await this.inspect(id);if(c?.State.Running)throw new Error('请先停止实例');if(c)await this.request('DELETE',`/containers/${this.name(id)}`);}
   async stats(id:string):Promise<DockerStats>{await this.inspect(id);return this.request('GET',`/containers/${this.name(id)}/stats?stream=false`);}
+  /** Shared services are resolved from this Console's Compose project, never a caller-supplied container name. */
+  async serviceStats(service:'console'|'plugin-runner'):Promise<{container:ContainerInfo;stats:DockerStats}|null>{
+    const self=await this.request<ContainerInfo>('GET',`/containers/${encodeURIComponent(hostname())}/json`);
+    const project=self.Config.Labels?.['com.docker.compose.project'];
+    if(self.Config.Labels?.['com.docker.compose.service']!=='console'||!project)throw new DockerError(403,'容器不是控制台服务');
+    const filters=encodeURIComponent(JSON.stringify({label:[`com.docker.compose.project=${project}`,`com.docker.compose.service=${service}`]}));
+    const list=await this.request<Array<{Id:string}>>('GET',`/containers/json?filters=${filters}`);
+    if(list.length!==1)return null;
+    const container=await this.request<ContainerInfo>('GET',`/containers/${encodeURIComponent(list[0]!.Id)}/json`);
+    if(container.Config.Labels?.['com.docker.compose.project']!==project||container.Config.Labels?.['com.docker.compose.service']!==service||!container.State.Running)return null;
+    return {container,stats:await this.request<DockerStats>('GET',`/containers/${encodeURIComponent(container.Id)}/stats?stream=false`)};
+  }
   async media(id:string,path:string):Promise<{bytes:Buffer;mime:string}>{
     if(!/^\/data\/(?:console-media\/[a-f0-9]{64}\.(?:png|jpg|gif|webp|mp3)|workspace\/\.qq-images\/[a-f0-9]{64}\.(?:png|jpg|gif|webp))$/.test(path))throw new Error('请求的媒体路径无效');
     if(!await this.inspect(id))throw new Error('实例容器不存在');

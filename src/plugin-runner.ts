@@ -8,6 +8,9 @@ import {createLogger,logEvent} from './logging.js';
 import { PluginExecutionError, type PluginExecution, type PluginRunnerDefinition } from './plugin-system/contracts.js';
 import { pluginRunner } from './plugin-system/runner-registry.js';
 import type {PluginRunnerJob,PluginRunnerResult} from './plugin-contract.js';
+import { activity, withActivityReporter } from './activity.js';
+import type { ActivityEvent, ProcessSample } from './activity-contract.js';
+import { randomUUID } from 'node:crypto';
 
 export function resolvePluginAssetKeys(value:unknown,assets:ReadonlyMap<string,string>,depth=0):unknown {
   if(depth>20)throw new PluginExecutionError('PLUGIN_ASSET_REFERENCE_INVALID');
@@ -36,13 +39,24 @@ export async function runPluginRunner(options:{url:string;token:string;workspace
     const controller=new AbortController();const signal=AbortSignal.any([options.signal,controller.signal]);
     const monitor=setInterval(()=>{void request(`/internal/plugin-runner/jobs/${encodeURIComponent(job!.id)}/status?lease=${encodeURIComponent(job!.lease)}`,undefined,signal).then(r=>{if(!r.active)controller.abort();}).catch(()=>controller.abort());},1000);monitor.unref();
     let execution:PluginExecution|undefined,result:PluginRunnerResult;
+    const events:ActivityEvent[]=[],samples:ProcessSample[]=[],source=randomUUID();let dropped=0,reported=0,flushing:Promise<void>|undefined;
+    const take=()=>({events:events.splice(0,1000),samples:samples.splice(0,200),dropped,source});
+    const flush=()=>flushing??=(async()=>{
+      if(!events.length&&!samples.length&&dropped===reported)return;
+      const batch=take();try{await request(`/internal/plugin-runner/jobs/${encodeURIComponent(job!.id)}/observations`,{lease:job!.lease,...batch},AbortSignal.timeout(1500));reported=batch.dropped;}
+      catch{events.unshift(...batch.events);samples.unshift(...batch.samples);
+        if(events.length>1000)events.splice(1000);while(samples.length>200){samples.shift();dropped++;}}
+    })().finally(()=>{flushing=undefined;});
+    const telemetry=setInterval(()=>void flush(),1000);telemetry.unref();
     try {
+      await withActivityReporter(event=>{if(events.length<1000)events.push(event);},sample=>{if(samples.length>=200){samples.shift();dropped++;}samples.push(sample);},()=>
+      activity('plugin',job!.operation==='prepare'?'plugin_prepare':job!.operation==='download'?'plugin_download':'plugin_resolve',async()=>{
       execution=await (options.execute??pluginRunner(job.pluginId).execute)(job,options.workspace,signal);
       const uploaded=new Map<string,string>();
       const upload=async(path:string,key?:string,type:'image'|'video'='video',role?:string)=>{
         const info=await lstat(path);if(!info.isFile()||info.isSymbolicLink())throw new PluginExecutionError('PLUGIN_ASSET_FILE_INVALID');
         const size=info.size;
-        const response=await fetcher(`${url}/internal/plugin-runner/jobs/${encodeURIComponent(job.id)}/asset`,{method:'POST',headers:{authorization:`Bearer ${options.token}`,'x-plugin-lease':job.lease,'content-type':'application/octet-stream','content-length':String(size),...(key?{'x-plugin-asset-key':key,'x-plugin-asset-type':type,...(role?{'x-plugin-asset-role':role}:{})}:{})},body:createReadStream(path) as unknown as BodyInit,duplex:'half',signal,redirect:'error'} as RequestInit);
+        const response=await activity('upload','asset_upload',()=>fetcher(`${url}/internal/plugin-runner/jobs/${encodeURIComponent(job!.id)}/asset`,{method:'POST',headers:{authorization:`Bearer ${options.token}`,'x-plugin-lease':job!.lease,'content-type':'application/octet-stream','content-length':String(size),...(key?{'x-plugin-asset-key':key,'x-plugin-asset-type':type,...(role?{'x-plugin-asset-role':role}:{})}:{})},body:createReadStream(path) as unknown as BodyInit,duplex:'half',signal,redirect:'error'} as RequestInit));
         if(!response.ok)throw new PluginExecutionError('PLUGIN_ASSET_UPLOAD_FAILED',true);
         const data=await response.json() as {assetId:string};if(typeof data.assetId!=='string'||!data.assetId)throw new PluginExecutionError('PLUGIN_ASSET_UPLOAD_FAILED');return data.assetId;
       };
@@ -62,9 +76,10 @@ export async function runPluginRunner(options:{url:string;token:string;workspace
         });
         result=resolvePluginAssetKeys({...(execution.content?{content:execution.content}:{}),...(outputs?{outputs}:{})},uploaded) as PluginRunnerResult;
       }
+      },signal));
     }catch(error){result={error:error instanceof PluginExecutionError?error.code:'PLUGIN_OPERATION_FAILED',retryable:error instanceof PluginExecutionError&&error.retryable};}
-    finally {clearInterval(monitor);await execution?.cleanup();}
-    try {await request(`/internal/plugin-runner/jobs/${encodeURIComponent(job.id)}/result`,{lease:job.lease,result});logEvent(logger,'info','plugin.runner.job_finished',{job_id:job.id,status:result.error?'failed':'completed',code:result.error});}
+    finally {clearInterval(monitor);clearInterval(telemetry);await execution?.cleanup();await flushing;}
+    try {await request(`/internal/plugin-runner/jobs/${encodeURIComponent(job.id)}/result`,{lease:job.lease,result:result!,observations:take()});logEvent(logger,'info','plugin.runner.job_finished',{job_id:job.id,status:result!.error?'failed':'completed',code:result!.error});}
     catch {if(!options.signal.aborted)logEvent(logger,'warn','plugin.runner.result_unconfirmed',{job_id:job.id});}
   }
 }

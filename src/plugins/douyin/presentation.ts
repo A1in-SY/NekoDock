@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { imageExtension } from '../../images.js';
 import { renderLimited } from '../../plugin-render.js';
+import { beginActivity } from '../../activity.js';
 import { PluginExecutionError, type PluginContent, type PluginContentImage, type PluginExecution, type PluginRunnerJob } from '../../plugin-system/contracts.js';
 import { boundedBytes, mediaResponse, type DouyinInfo } from './api.js';
 import type { DouyinConfig } from './config.js';
@@ -38,11 +39,13 @@ export async function prepareDouyinCard(
   for (const { image, urls } of targets) {
     signal.throwIfAborted();
     delete image.assetId; delete image.assetKey;
+    const download=beginActivity('download','image_download');
     try {
       const url = urls.find(value => publicImageUrl(value) === image.url) ?? urls[0] ?? image.url;
       const publicUrl = publicImageUrl(url);
       if (!publicUrl) throw new PluginExecutionError('DOUYIN_IMAGE_URL_REJECTED');
       const bytes = await boundedBytes(await mediaResponse(url, fetcher, signal, true), maxBytes);
+      download.end();
       total += bytes.length;
       if (total > DOUYIN_IMAGE_LIMITS.totalBytes) throw new PluginExecutionError('DOUYIN_IMAGE_LIMIT');
       const key = image.role, path = join(directory, `${key}.${imageExtension(bytes)}`);
@@ -57,6 +60,7 @@ export async function prepareDouyinCard(
       delete image.error;
       paths[key] = path; files.push({ key, path, type: 'image', role: image.role });
     } catch (error) {
+      download.end(signal.aborted?'cancelled':'failed',error);
       signal.throwIfAborted(); failed = true;
       image.status = 'failed'; image.error = error instanceof PluginExecutionError ? error.code : 'DOUYIN_IMAGE_FAILED';
     }

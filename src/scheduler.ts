@@ -1,5 +1,7 @@
 import { ScheduledStore, type TaskTicket } from './scheduled-store.js';
 import { runTaskScript } from './task-script.js';
+import { activity, withActivityReporter } from './activity.js';
+import { publishProcessSample } from './process-sample-channel.js';
 import { validateReplyRequest } from './reply-contract.js';
 import { logEvent } from './logging.js';
 import type { Logger, ReplyToolRequest, RunObservation, TargetType } from './types.js';
@@ -100,8 +102,8 @@ export class Scheduler {
    const context:ScheduledInput['context']={...(await this.options.history?.(task,run.scheduledAt)??{}),...(task.context.taskState?{taskState:this.options.store.readState(task.id)}:{})};
    const input:ScheduledInput={kind:'scheduled_task',task:{id:task.id,name:task.name,instructions:task.instructions},context,
     invocation:{runId:run.id,scheduledAt:new Date(run.scheduledAt).toISOString(),startedAt:new Date(run.startedAt!).toISOString(),timezone:task.schedule.timezone}};
-   if(task.kind==='script')await runTaskScript({task,input,workspace:this.options.workspace,tools,signal:controller.signal,targetType:this.options.targetType,networkProxy:this.options.networkProxy,
-    onOutput:(stream,text)=>observer({type:'script.output',payload:{stream,text}})});
+   if(task.kind==='script')await withActivityReporter(event=>observer({type:'activity.updated',payload:{...event}}),publishProcessSample,()=>activity('schedule','scheduled',()=>runTaskScript({task,input,workspace:this.options.workspace,tools,signal:controller.signal,targetType:this.options.targetType,networkProxy:this.options.networkProxy,
+    onOutput:(stream,text)=>observer({type:'script.output',payload:{stream,text}})})));
    else await this.options.executeModel(input,task,tools,controller.signal,observer);
    if(!this.options.store.run(run.id)!.acceptedMessages)throw new Error('TASK_NO_REPLY');
   }catch(error){failure=error;}

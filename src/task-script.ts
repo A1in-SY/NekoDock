@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { observeChild } from './activity.js';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -77,6 +78,7 @@ export async function runTaskScript(options:TaskScriptOptions):Promise<void> {
  const command=task.script.runtime==='python'?options.pythonCommand??'python3':options.nodeCommand??process.execPath;
  await new Promise<void>((resolve,reject)=>{
   const child=spawn(command,[join(directory,filename)],{cwd:directory,env:{...shellEnvironment(process.env,options.networkProxy),PYTHONUNBUFFERED:'1'},detached:process.platform!=='win32',stdio:['ignore','pipe','pipe','pipe','pipe']});
+  observeChild(child);
   let settled=false;let failure:Error|undefined;let outputBytes=0;let rpcBytes=0;let state=input.context.taskState;let tail=Promise.resolve();
   const output=(stream:'stdout'|'stderr',bytes:Buffer)=>{
    outputBytes+=bytes.length;

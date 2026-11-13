@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { activity, beginActivity, observeChild, observePluginRun, recordRenderedCount } from '../../activity.js';
 import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
@@ -17,12 +18,13 @@ export type HeyboxRun = (command: string, args: string[], options: { cwd: string
 export interface HeyboxTools { fetch?: typeof fetch; run?: HeyboxRun; }
 let rendering = false;
 async function renderLimited<T>(operation: () => Promise<T>, signal: AbortSignal): Promise<T> {
-  while (rendering) await delay(25, undefined, { signal }); signal.throwIfAborted(); rendering = true;
-  try { return await operation(); } finally { rendering = false; }
+  await activity('render_wait','render_wait',async()=>{while (rendering) await delay(25, undefined, { signal });signal.throwIfAborted();rendering=true;});
+  try { return await activity('render','image_render',async()=>{const result=await operation();recordRenderedCount(result);return result;},signal); } finally { rendering = false; }
 }
 const run: HeyboxRun = async (command, args, options) => new Promise((resolve, reject) => {
   options.signal.throwIfAborted();
   const child = spawn(command, args, { cwd: options.cwd, env: options.env, stdio: ['ignore', 'pipe', 'pipe'], detached: process.platform !== 'win32' });
+  observeChild(child);
   let done = false, size = 0; const chunks: Buffer[] = [];
   const kill = () => { if (child.pid) try { process.platform === 'win32' ? child.kill('SIGKILL') : process.kill(-child.pid, 'SIGKILL'); } catch {} };
   const timeout = setTimeout(kill, options.timeoutMs), abort = () => kill(); options.signal.addEventListener('abort', abort, { once: true });
@@ -44,7 +46,7 @@ export async function executeHeyboxJob(input: PluginRunnerJob, root: string, sig
   requestSignal.throwIfAborted();
   await mkdir(root, { recursive: true, mode: 0o700 }); const directory = await mkdtemp(join(root, 'job-heybox-'));
   const network = tools.fetch ? undefined : createNetworkClient(input.networkProxy), fetcher = tools.fetch ?? network!.fetch;
-  const execute = tools.run ?? run;
+  const execute = observePluginRun(tools.run ?? run);
   const env: NodeJS.ProcessEnv = { HOME: directory, TMPDIR: directory };
   for (const key of ['PATH', 'LANG', 'LC_ALL']) if (process.env[key] !== undefined) env[key] = process.env[key];
   let handedOff = false;
@@ -66,6 +68,7 @@ export async function executeHeyboxJob(input: PluginRunnerJob, root: string, sig
     const script = await scriptPath(), limit = Math.min(config.maxMiB * 1024 * 1024, input.imageMaxBytes ?? Infinity);
     const url = heyboxImageUrl(content.coverUrl);
     if (url) {
+      const download=beginActivity('download','image_download');
       try {
         let target = url, response: Response | undefined;
         for (let hop = 0; hop < 4; hop++) {
@@ -76,12 +79,13 @@ export async function executeHeyboxJob(input: PluginRunnerJob, root: string, sig
           if (hop === 3) throw new HeyboxError('HEYBOX_REDIRECT_LIMIT');
         }
         const bytes = await boundedBytes(response!, Math.min(limit, 10 * 1024 * 1024));
+        download.end();
         const extension = imageExtension(bytes); cover = join(directory, `cover.${extension}`); await writeFile(cover, bytes, { mode: 0o600 });
         const inspected = JSON.parse(await execute('python3', [script, 'inspect', cover], { cwd: directory, env, signal: requestSignal, timeoutMs: 10000 })) as { width: number; height: number };
         if (!Number.isSafeInteger(inspected.width) || !Number.isSafeInteger(inspected.height) || inspected.width <= 0 || inspected.height <= 0 || inspected.width * inspected.height > 24_000_000) throw new HeyboxError('HEYBOX_IMAGE_LIMIT');
         const image: PluginContentImage = { id: `${content.resourceId}:cover`, url, role: 'cover', assetKey: 'cover', status: 'ready', width: inspected.width, height: inspected.height, fetchedAt: Date.now() / 1000 };
         content.blocks = [{ type: 'image', image }]; files.push({ key: 'cover', path: cover, type: 'image', role: 'cover' });
-      } catch { requestSignal.throwIfAborted(); cover = undefined; content.retrieval = { status: 'partial', error: 'HEYBOX_COVER_UNAVAILABLE' }; }
+      } catch(error) { download.end(requestSignal.aborted?'cancelled':'failed',error);requestSignal.throwIfAborted(); cover = undefined; content.retrieval = { status: 'partial', error: 'HEYBOX_COVER_UNAVAILABLE' }; }
     }
     try {
       const request = join(directory, 'render.json');

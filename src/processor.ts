@@ -15,6 +15,9 @@ import { modelErrorReply } from './model-error-reply.js';
 import { ReplyToolError } from './reply-contract.js';
 import type { ActiveReplyRun, RunCancelResult } from './run-control-contract.js';
 import { waitForReplyReceipt } from './reply-receipt.js';
+import { activity, withActivityReporter } from './activity.js';
+import { publishProcessSample } from './process-sample-channel.js';
+import type { ActivityKind, ActivityName } from './activity-contract.js';
 
 const commandReplies: Record<CommandResult, string> = {
   help: [
@@ -152,7 +155,7 @@ export class Processor {
             controller:runController,done:new Promise(resolve=>{finish=resolve;}),finish:result=>finish(result)};
           store.markGenerationStarted(batch.throughSeq);
           store.recorder.append('run.started', { throughSeq: batch.throughSeq, messageIds: batch.messages.map(message => message.messageId), replyAllowed: batch.replyAllowed }, `run:${runId}:start`, { runId });
-          await this.options.beforeContext?.(store.getBatch(batch.throughSeq),runSignal);
+          await this.observeActivity(runId,'prepare','prepare',async()=>this.options.beforeContext?.(store.getBatch(batch.throughSeq),runSignal));
           runSignal.throwIfAborted();
           const context=store.prepareContext(store.getBatch(batch.throughSeq));
           logEvent(logger, 'info', 'processor.batch.started', {
@@ -317,6 +320,10 @@ export class Processor {
     return { tools, async flush() { await tail; if (failed) throw failure; } };
   }
 
+  private observeActivity<T>(runId:string,kind:ActivityKind,name:ActivityName,action:()=>Promise<T>):Promise<T> {
+    return withActivityReporter(event=>{try{this.options.store.recorder.append('activity.updated',{...event},undefined,{runId});}catch{}},publishProcessSample,()=>activity(kind,name,action));
+  }
+
   private async deliverPending(throughSeq: number, signal: AbortSignal, runId: string,
     progress: (stage: string, index: number) => void = () => {}, deliverySignal:AbortSignal=signal): Promise<void> {
     const { store, sender, logger } = this.options;
@@ -346,7 +353,8 @@ export class Processor {
         if (typeof part !== 'string' && part.type === 'image' && !part.file.startsWith('base64://')) {
           stage = 'image_prepare'; progress(stage, index);
           logEvent(logger, 'info', 'processor.image.prepare_started', fields);
-          const prepared = await prepareImageReply(part.file, imageOptions, signal);
+          const imageFile=part.file;
+          const prepared = await this.observeActivity(runId,'prepare','prepare',()=>prepareImageReply(imageFile, imageOptions, signal));
           stage = 'image_save'; progress(stage, index);
           store.saveImage(throughSeq, index, prepared.file);
           part.file = prepared.file;
@@ -358,7 +366,8 @@ export class Processor {
           let preparedFile: string | undefined;
           try {
             if (!this.options.voiceReplyEnabled || !this.options.speech || !sender.sendVoice) throw new Error('Voice tools unavailable');
-            const prepared = await this.options.speech.synthesize(part.text, signal);
+            const voiceText=part.text;
+            const prepared = await this.observeActivity(runId,'prepare','voice',()=>this.options.speech!.synthesize(voiceText, signal));
             if (!isMp3Snapshot(prepared.file)) throw new Error('Invalid voice snapshot');
             preparedFile = prepared.file;
           } catch {
@@ -384,7 +393,8 @@ export class Processor {
         }
         sendStarted = Date.now();
         logEvent(logger, 'info', 'processor.reply.send_started', fields);
-        receipt = await transmitReply(part,sender,deliverySignal,durable?.firstPart?durable.replyTo:undefined,durable?{...store.replyLedger.metadata(durable),runId}:undefined);
+        const sendPart=part;
+        receipt = await this.observeActivity(runId,'send','send',()=>transmitReply(sendPart,sender,deliverySignal,durable?.firstPart?durable.replyTo:undefined,durable?{...store.replyLedger.metadata(durable),runId}:undefined));
         acknowledged = true;
         logEvent(logger, 'info', 'processor.reply.sent', { ...fields, duration_ms: Date.now() - sendStarted, ...(receipt?.messageId ? { message_ref: receipt.messageId } : {}) });
         stage = 'reply_ack'; progress(stage, index);
