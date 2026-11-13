@@ -733,10 +733,11 @@ export class ConsoleDatabase {
     return samples.length ? samples[Math.ceil(samples.length * 0.95) - 1]! / 1000 : null;
   }
   monitorEvents(id:string,after:number,limit=500):ConsoleEvent[] {
-    return (this.db.prepare(`SELECT * FROM event_projection WHERE bot_id=? AND worker_seq>? AND time>=? AND
-      (type IN ('activity.updated','runtime.activated','run.started','batch.completed','run.failed','run.cancelled','schedule.run.updated')
-        OR (type='schedule.run.event' AND json_extract(payload,'$.eventType')='activity.updated'))
-      ORDER BY worker_seq LIMIT ?`).all(id,after,Date.now()-7*86400000,limit) as unknown as EventRow[]).map(row=>this.eventRecord(row));
+    const now=Date.now();
+    return (this.db.prepare(`SELECT * FROM event_projection WHERE bot_id=? AND worker_seq>? AND
+      ((time>=? AND type IN ('runtime.activated','run.started','run.completed','batch.completed','run.failed','run.cancelled','schedule.run.updated'))
+        OR (time>=? AND (type='activity.updated' OR (type='schedule.run.event' AND json_extract(payload,'$.eventType')='activity.updated'))))
+      ORDER BY worker_seq LIMIT ?`).all(id,after,now-30*86400000,now-7*86400000,limit) as unknown as EventRow[]).map(row=>this.eventRecord(row));
   }
   monitorPluginJobs():import('./activities.js').MonitorPluginJob[] {
     return this.db.prepare(`SELECT id,root_job_id AS rootJobId,bot_id AS botId,plugin_id AS pluginId,source_message_id AS sourceMessageId,conversation_id AS conversationId,operation,state,attempts,lease_until AS leaseUntil,created_at AS createdAt,started_at AS startedAt,finished_at AS finishedAt

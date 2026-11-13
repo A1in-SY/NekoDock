@@ -24,17 +24,26 @@ export class ActivitiesDatabase {
       CREATE INDEX IF NOT EXISTS activity_time ON activity_spans(started_at,ended_at);
       CREATE INDEX IF NOT EXISTS activity_end ON activity_spans(ended_at,started_at);
       CREATE INDEX IF NOT EXISTS activity_trace ON activity_spans(trace_id,bot_id);
-      CREATE TABLE IF NOT EXISTS activity_cursors(bot_id TEXT PRIMARY KEY,seq INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS activity_cursors(bot_id TEXT PRIMARY KEY,seq INTEGER NOT NULL,version INTEGER NOT NULL DEFAULT 1);
       CREATE TABLE IF NOT EXISTS activity_process_samples (
         owner TEXT NOT NULL,id TEXT NOT NULL,span_id TEXT NOT NULL,time INTEGER NOT NULL,data TEXT NOT NULL,PRIMARY KEY(owner,id));
       CREATE INDEX IF NOT EXISTS activity_process_time ON activity_process_samples(time);
       CREATE INDEX IF NOT EXISTS activity_process_span ON activity_process_samples(owner,span_id,time);
       CREATE TABLE IF NOT EXISTS activity_resources(id TEXT PRIMARY KEY,generation TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS activity_sample_drops(owner TEXT NOT NULL,source TEXT NOT NULL,count INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(owner,source));`);
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const columns=db.prepare('PRAGMA table_info(activity_cursors)').all();
+      if(!columns.some(column=>column.name==='version'))db.exec('ALTER TABLE activity_cursors ADD COLUMN version INTEGER NOT NULL DEFAULT 0');
+      // Replay durable boundaries once to repair summaries inferred before run.completed was projected.
+      db.exec('UPDATE activity_cursors SET seq=0,version=1 WHERE version<1');
+      db.exec('COMMIT');
+    } catch(error) { db.exec('ROLLBACK');throw error; }
   }
   private owner(value: Owner): string { return `${value.resourceId}/${value.botId ?? ''}`; }
   cursor(botId: string): number { return Number(this.db.prepare('SELECT seq FROM activity_cursors WHERE bot_id=?').get(botId)?.seq ?? 0); }
-  ingest(owner: Owner, input: unknown): void {
+  ingest(owner: Owner, input: unknown): void { this.upsert(owner,input); }
+  private upsert(owner: Owner, input: unknown, terminalRun=false): void {
     if (!input || typeof input !== 'object') throw new Error('监控事件无效');
     const e = input as ActivityEvent;
     if (!id(e.id) || !id(e.traceId) || e.parentId !== undefined && !id(e.parentId) || !kinds.has(e.kind) || !Object.hasOwn(ACTIVITY_NAMES,e.name)
@@ -49,7 +58,9 @@ export class ActivitiesDatabase {
     const previous = this.db.prepare('SELECT data,ended_at FROM activity_spans WHERE owner=? AND id=?').get(this.owner(owner),e.id) as unknown as SpanRow | undefined;
     if (previous) {
       const old=JSON.parse(previous.data) as ActivitySpan;
-      if (old.startedAt!==e.startedAt || old.traceId!==traceId || old.kind!==e.kind || old.name!==e.name || old.time>e.time || old.endedAt!==null) return;
+      const authoritative=terminalRun&&e.id===`run:${owner.runId}`&&e.kind==='run'&&e.status!=='running';
+      if (old.startedAt!==e.startedAt || old.traceId!==traceId || old.kind!==e.kind
+        || !authoritative&&(old.name!==e.name || old.time>e.time || old.endedAt!==null)) return;
       Object.assign(value,{...old,...value});
       if(value.firstEventMs===undefined&&old.firstEventMs!==undefined)value.firstEventMs=old.firstEventMs;
     }
@@ -66,10 +77,12 @@ export class ActivitiesDatabase {
           const observed=event.type==='activity.updated'?event.payload:event.type==='schedule.run.event'&&event.payload.eventType==='activity.updated'?event.payload.eventPayload:undefined;
           if(observed){this.ingest(owner,observed);const value=observed as ActivityEvent;if(value.status!=='running')this.endChildren(owner,value.id,value.time,value.status==='cancelled'?'cancelled':'interrupted');}
           if(event.type==='runtime.activated')this.interrupt(botId,event.time);
-          if(event.runId && ['run.started','batch.completed','run.failed','run.cancelled'].includes(event.type)) {
+          if(event.runId && ['run.started','run.completed','batch.completed','run.failed','run.cancelled'].includes(event.type)) {
             const spanId=`run:${event.runId}`,old=this.get(owner,spanId);
-            this.ingest(owner,{id:spanId,traceId:event.runId,kind:'run',name:'reply',startedAt:old?.startedAt??event.time,time:event.time,
-              status:event.type==='run.started'?'running':event.type==='batch.completed'?'completed':event.type==='run.cancelled'?'cancelled':'failed'});
+            const name=event.payload.replyAllowed===false?'append':event.payload.replyAllowed===true?'reply':old?.name??'reply';
+            this.upsert(owner,{id:spanId,traceId:event.runId,kind:'run',name,startedAt:old?.startedAt??event.time,time:event.time,
+              status:event.type==='run.started'?'running':event.type==='run.completed'||event.type==='batch.completed'?'completed':event.type==='run.cancelled'?'cancelled':'failed'},
+              event.type!=='run.started'&&event.type!=='batch.completed');
             if(event.type!=='run.started')this.endTrace(botId,event.runId,event.time,event.type==='run.cancelled'?'cancelled':'interrupted');
           }
           if(event.type==='schedule.run.updated'&&event.runId){
@@ -80,7 +93,7 @@ export class ActivitiesDatabase {
             }
           }
         } catch { /* Invalid optional telemetry cannot poison the durable event cursor. */ }
-        this.db.prepare('INSERT INTO activity_cursors(bot_id,seq) VALUES(?,?) ON CONFLICT(bot_id) DO UPDATE SET seq=MAX(seq,excluded.seq)').run(botId,event.seq);
+        this.db.prepare('INSERT INTO activity_cursors(bot_id,seq,version) VALUES(?,?,1) ON CONFLICT(bot_id) DO UPDATE SET seq=MAX(seq,excluded.seq),version=excluded.version').run(botId,event.seq);
       }
       this.db.exec('COMMIT');
     } catch(error) { this.db.exec('ROLLBACK'); throw error; }

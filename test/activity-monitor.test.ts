@@ -72,6 +72,70 @@ test('projection is replayable, rejects secret fields and closes interrupted mod
   assert.equal(new ActivitiesDatabase(db).cursor('worker-a'),5);
 });
 
+test('context-only executions finish at run.completed and stay out of a later timeline window',t=>{
+  const {activities}=fixture(t),now=Date.now(),started=now-6*86400000;
+  activities.project('worker-a',[observation(1,'run.started',{replyAllowed:false},started),
+    observation(2,'run.completed',{replyAllowed:false},started+6400)]);
+  activities.interrupt('worker-a',now);
+  const spans=activities.query(started-1,now).spans;
+  assert.equal(spans.length,1);assert.equal(spans[0]!.name,'append');assert.equal(spans[0]!.status,'completed');
+  assert.equal(spans[0]!.endedAt!-spans[0]!.startedAt,6400);
+  assert.equal(activities.query(now-3600000,now).spans.length,0);
+});
+
+test('run.completed finishes a reply once and remains compatible with batch.completed',t=>{
+  const {activities}=fixture(t),time=Date.now();
+  activities.project('worker-a',[observation(1,'run.started',{replyAllowed:true},time),
+    observation(2,'run.completed',{replyAllowed:true},time+100),observation(3,'batch.completed',{},time+100)]);
+  const spans=activities.query(time-1,time+1000).spans;
+  assert.equal(spans.length,1);assert.equal(spans[0]!.name,'reply');assert.equal(spans[0]!.status,'completed');assert.equal(spans[0]!.endedAt,time+100);
+  activities.project('worker-b',[{...observation(1,'run.started',{},time),runId:'legacy'},
+    {...observation(2,'batch.completed',{},time+200),runId:'legacy'}]);
+  assert.equal(activities.query(time-1,time+1000,{botId:'worker-b'}).spans[0]!.status,'completed');
+});
+
+test('upgrading the projection repairs inferred interruptions without losing details or replaying every restart',t=>{
+  const {db,activities}=fixture(t),now=Date.now(),started=now-8*86400000;
+  // Simulate the previous schema and its checkpoint beyond an ignored run.completed.
+  activities.project('worker-a',[observation(1,'run.started',{},started)]);
+  activities.interrupt('worker-a',now-1000);
+  activities.ingest(owner,event('detail',{time:now,startedAt:now}));activities.processSamples(owner,[point('detail',{time:now})]);
+  db.exec('ALTER TABLE activity_cursors DROP COLUMN version;UPDATE activity_cursors SET seq=20');
+  const upgraded=new ActivitiesDatabase(db);
+  assert.equal(upgraded.cursor('worker-a'),0);
+  const events=[observation(1,'run.started',{replyAllowed:false},started),observation(2,'run.completed',{replyAllowed:false},started+6400)];
+  upgraded.project('worker-a',events);upgraded.project('worker-a',events);
+  const summary=upgraded.query(started-1,now).spans.find(span=>span.id==='run:reply-a')!;
+  assert.equal(summary.name,'append');assert.equal(summary.status,'completed');assert.equal(summary.endedAt,started+6400);
+  assert.equal(upgraded.query(now-3600000,now).spans.some(span=>span.id==='run:reply-a'),false);
+  assert.equal(upgraded.query(now-3600000,now).processes.length,1);
+  upgraded.project('worker-b',[observation(1,'run.started',{replyAllowed:false},now)]);
+  const reopened=new ActivitiesDatabase(db);
+  assert.equal(reopened.cursor('worker-a'),2);assert.equal(reopened.cursor('worker-b'),1);
+});
+
+test('durable cancellation corrects an inferred interruption and replay cannot reopen it',t=>{
+  const {activities}=fixture(t),now=Date.now(),started=now-10000;
+  const start=observation(1,'run.started',{replyAllowed:false},started);
+  activities.project('worker-a',[start]);activities.interrupt('worker-a',now);
+  activities.project('worker-a',[observation(2,'run.cancelled',{},started+1000),start]);
+  const span=activities.query(started-1,now).spans[0]!;
+  assert.equal(span.name,'append');assert.equal(span.status,'cancelled');assert.equal(span.endedAt,started+1000);
+});
+
+test('monitor event replay includes thirty-day lifecycle boundaries and seven-day detail',t=>{
+  const dir=mkdtempSync(join(tmpdir(),'activity-replay-')),db=new ConsoleDatabase(join(dir,'console.sqlite3'),join(dir,'master.key'));
+  t.after(()=>{db.close();rmSync(dir,{recursive:true,force:true});});
+  const bot=db.createBot({name:'Synthetic',targetType:'group',targetId:'10001',config:{}}),now=Date.now(),old=now-8*86400000;
+  db.ingestEvents(bot.id,[observation(1,'run.started',{replyAllowed:false},old),observation(2,'run.completed',{replyAllowed:false},old+6400),
+    observation(3,'activity.updated',{...event('expired-detail',{time:old,startedAt:old})},old),
+    observation(4,'activity.updated',{...event('recent-detail')},now),
+    observation(5,'run.started',{},now-31*86400000)]);
+  const replay=db.monitorEvents(bot.id,0);
+  assert.deepEqual(replay.map(e=>e.seq),[1,2,4]);
+  assert.deepEqual(db.monitorEvents(bot.id,1,1).map(e=>e.type),['run.completed']);
+});
+
 test('malformed optional observations cannot poison later durable observations',t=>{
   const {activities}=fixture(t);
   activities.project('worker-a',[observation(1,'activity.updated',{id:'bad'}),observation(2,'activity.updated',{...event()})]);

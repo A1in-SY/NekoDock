@@ -7,6 +7,7 @@ export function activeActivities(spans:ActivitySpan[],at:number,to=at):ActivityS
   return active.filter(span=>!parents.has(`${span.traceId}/${span.botId??''}/${span.id}`));
 }
 export function activityLane(span:ActivitySpan):string {
+  if(span.kind==='run'&&span.name==='append')return '上下文';
   if(span.kind==='model')return '模型';
   if(span.kind==='render'||span.kind==='render_wait')return '渲染';
   if(span.kind==='command')return '命令';
@@ -20,12 +21,12 @@ export function activityTracks(spans:ActivitySpan[],from:number,to:number,now=Da
   const groups=new Map<string,ActivitySpan[]>();
   for(const span of spans){
     if(span.startedAt>to||(span.endedAt??now)<from)continue;
-    // The reply root already represents the enclosing agent execution.
-    if(span.kind==='run'&&span.name==='run'&&span.runId)continue;
+    // The execution root already represents the enclosing agent activity.
+    if(span.kind==='run'&&span.runId&&(span.name==='run'||span.name==='append'&&span.id!==`run:${span.runId}`))continue;
     const lane=activityLane(span);groups.set(lane,[...(groups.get(lane)??[]),span]);
   }
   const result:ActivityTrack[]=[];
-  for(const lane of ['回复','模型','插件','渲染','命令','发送','工具 / 准备','后台']){
+  for(const lane of ['回复','上下文','模型','插件','渲染','命令','发送','工具 / 准备','后台']){
     const tracks:Array<{end:number;row:ActivityTrack}>=[];
     for(const span of (groups.get(lane)??[]).sort((a,b)=>a.startedAt-b.startedAt)){
       const start=Math.max(from,span.startedAt),end=Math.max(start+Math.max(50,(to-from)*.006),Math.min(to,span.endedAt??now));

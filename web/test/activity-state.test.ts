@@ -7,6 +7,14 @@ test('parallel work receives separate tracks while sequential stages share a tra
   const rows=activityTracks([span('a'),span('b',{startedAt:1200,endedAt:1800}),span('c',{startedAt:2200,endedAt:2500})],0,3000,3000);
   assert.equal(rows.length,2);assert.deepEqual(rows[0]!.spans.map(s=>s.id),['a','c']);assert.deepEqual(rows[1]!.spans.map(s=>s.id),['b']);
 });
+test('context updates have their own track and their nested agent is represented by the execution root',()=>{
+  const rows=activityTracks([span('run:context-a',{kind:'run',name:'append',runId:'context-a'}),
+    span('agent-a',{kind:'run',name:'append',runId:'context-a',parentId:'run:context-a'}),
+    span('run:reply-b',{kind:'run',name:'reply',runId:'reply-b'})],0,3000,3000);
+  assert.deepEqual(rows.map(row=>({lane:row.lane,ids:row.spans.map(s=>s.id)})),[
+    {lane:'回复',ids:['run:reply-b']},{lane:'上下文',ids:['run:context-a']},
+  ]);
+});
 test('evidence matches instance and resource and selects the closest sample without inventing a zero',()=>{
   const sample=(id:string,time:number,botId='first'):ObservedProcessSample=>({id,spanId:'a',resourceId:'runner',botId,time,intervalMs:1000,cpu:null,coverage:'partial',processes:[]});
   const rows=nearbyProcesses([sample('old',1000),sample('closest',1900),sample('another-instance',2000,'second'),sample('too-old',-10000)],2000,[span('a')]);
